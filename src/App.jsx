@@ -403,7 +403,19 @@ function getRoadLayout(rt) {
 // Returns null for <3 lane roads (legacy single-offset roads), matching previous behavior.
 function laneOffsetGroups(rt) {
   const layout = getRoadLayout(rt);
-  if (layout.legacy) return null;
+  if (layout.legacy) {
+    // Prompt 20F Part B/D — the ONE guarded addition this block makes to a shared function: fires
+    // only for the new highway_ramp_2 id (a 2-lane one-way ramp), so every pre-existing <3-lane
+    // type (small/two/dirt/highway_ramp_1/highway_connector) still returns null here exactly as
+    // before. Gives the ramp two real parallel lane centers instead of the single fixed CAR_LANE a
+    // legacy type normally gets, using the same STANDARD_LANE_WIDTH every other lane in the game
+    // is built from.
+    if (rt.id === 'highway_ramp_2') {
+      const laneW = Math.min(STANDARD_LANE_WIDTH, layout.rhw);
+      return { spacing: laneW, offsets: [CAR_LANE - laneW / 2, CAR_LANE + laneW / 2], medianHalfWidth: 0 };
+    }
+    return null;
+  }
   return { spacing: layout.laneWidth, offsets: layout.laneCenters, medianHalfWidth: layout.medianHalfWidth };
 }
 // Picks a lane offset (a signed-by-direction scalar, see segPoint) for an entity about to drive
@@ -456,8 +468,22 @@ const ROAD_TYPES = {
   // maxSpeed 100 vs the 'two' road's 50 baseline is exactly the "2x" the spec calls for, and this
   // number is what actually drives vehicle speed now — see speedForRoadType() below.
   highway: { id: 'highway', label: '高速道路', cost: 60, lanes: 4, maxSpeed: 100, hubMul: 1.76, unpaved: false, median: true, edgeWalk: false, color: '#262b30', shoulder: '#1a1e22', highway: true },
+  // -- Prompt 20F Part A — additive highway variants (Free Road Network only; deliberately NOT
+  // added to ROAD_TYPE_KEYS below, so the Tile-grid road system/UI is completely untouched — see
+  // block header comment near buildFreeRoadJunctionGeometry for how these plug into the existing
+  // getRoadLayout()/drawRoadPaint()/makeAsphaltRibbonTexture() machinery with ZERO changes there:
+  // highway_6/highway_8 are ordinary `lanes>=3, median:true` types (the existing symmetric N-lane
+  // split already produces a correct 3+3 / 4+4 layout for them); highway_ramp_1/highway_connector
+  // are ordinary `lanes:1` types (existing <3-lane path already draws them as a one-way arrow-
+  // marked lane, matching `oneWay:true`'s real meaning here); only highway_ramp_2 needs the single
+  // small guarded addition documented at laneOffsetGroups() below. --
+  highway_6: { id: 'highway_6', label: '高速道路(6車線)', cost: 78, lanes: 6, maxSpeed: 100, hubMul: 2.647, unpaved: false, median: true, edgeWalk: false, color: '#262b30', shoulder: '#1a1e22', highway: true },
+  highway_8: { id: 'highway_8', label: '高速道路(8車線)', cost: 96, lanes: 8, maxSpeed: 100, hubMul: 3.235, unpaved: false, median: true, edgeWalk: false, color: '#262b30', shoulder: '#1a1e22', highway: true },
+  highway_ramp_1: { id: 'highway_ramp_1', label: '高速道路ランプ(1車線)', cost: 24, lanes: 1, maxSpeed: 60, hubMul: 0.55, unpaved: false, median: false, edgeWalk: false, color: '#262b30', shoulder: '#1a1e22', oneWay: true },
+  highway_ramp_2: { id: 'highway_ramp_2', label: '高速道路ランプ(2車線)', cost: 36, lanes: 2, maxSpeed: 70, hubMul: 0.85, unpaved: false, median: false, edgeWalk: false, color: '#262b30', shoulder: '#1a1e22', oneWay: true },
+  highway_connector: { id: 'highway_connector', label: 'コネクター道路', cost: 20, lanes: 1, maxSpeed: 60, hubMul: 0.55, unpaved: false, median: false, edgeWalk: false, color: '#262b30', shoulder: '#1a1e22', oneWay: true },
 };
-const ROAD_TYPE_KEYS = ['small', 'two', 'four', 'four_median', 'six', 'six_median', 'eight_median', 'dirt', 'highway']; // index in this array == the value stored in the roadType grid
+const ROAD_TYPE_KEYS = ['small', 'two', 'four', 'four_median', 'six', 'six_median', 'eight_median', 'dirt', 'highway']; // index in this array == the value stored in the roadType grid — Prompt 20F's new highway_* types are deliberately NOT in this array (Free Road Network only, see above)
 const DEFAULT_ROAD_TYPE_IDX = ROAD_TYPE_KEYS.indexOf('two');
 // Converts a road type's nominal maxSpeed (km/h) into the actual world-units/sec a vehicle should
 // drive at on that road, scaled against CAR_SPEED @ BASE_ROAD_SPEED_KMH (see comment there). This
@@ -678,6 +704,225 @@ function buildFreeRoadJunctionGeometry(network, node) {
   geo.setIndex(indices);
   geo.computeVertexNormals();
   return { geo, roadType: matRoadType };
+}
+
+// ============================================================================
+// Prompt 20F — Additive Highway Variants + Junction Presets: RoadNode/RoadSegment topology
+//
+// Everything below is ADD-ONLY (spec 絶対条件): no existing ROAD_TYPES entry, and no existing
+// getRoadLayout()/getRoadPoint()/getRoadTangent()/getRoadNormal()/getRoadWidth()/
+// getRoadLaneCenter()/buildRoadSegmentGeometry()/buildFreeRoadJunctionGeometry() result is
+// touched — every function here only CALLS those, via makeRoadNode/makeRoadSegment/
+// addRoadNodeToNetwork/addRoadSegmentToNetwork exactly like the hand-drawn Free Road tool does.
+//
+// On-Ramp / Off-Ramp / Merge / Diverge (Part E-H) and every Junction Preset (Part J-Q) reduce to
+// ONE shared idea: split an existing RoadSegment at a point along its length (splitRoadSegmentAt)
+// and attach new RoadSegments to the freshly-created shared RoadNode. That shared node then gets
+// buildFreeRoadJunctionGeometry's paved junction-surface treatment for free (2 segments meeting =
+// a seamless join, 3 = a natural T, 4 = a natural crossroads — see that function's own header),
+// and every car crossing it gets pickForwardLaneOffset's existing "pick the lane closest to my
+// current offset" behavior for free too (see that function's header) — which is exactly the
+// "車両が合流区間で横方向へワープしない" requirement Part G/I ask for, already solved by code that
+// predates this prompt and needs no changes here.
+//
+// SCOPE NOTE (reported per 完了条件 §11/§出力, in this file's established practice of reporting a
+// deliberate simplification rather than quietly shipping a lower-fidelity stand-in for it):
+//   - splitRoadSegmentAt turns the split segment's curve into two STRAIGHT sub-chords. Exact for
+//     already-straight input (the common case for authored highways); a curved input keeps its
+//     endpoints and elevation but loses its exact mid-curve bend at the split point.
+//   - Trumpet/Cloverleaf loop ramps (_buildLoopRamp) are a small fixed chain of quadratic-bezier
+//     RoadSegments swept ~270° around a computed loop center — a real, editable, non-fixed-Mesh
+//     RoadNode/RoadSegment chain (Part O's explicit requirement), but not a continuously-solved
+//     spiral curve.
+//   - Diamond/Cloverleaf keep the highway at grade (elevation 0) and lift only the cross road
+//     (Part M's own text allows this: "必要ならelevationを使って...構成可能にする"); Flyover/
+//     Underpass are the two presets that are actually ABOUT the elevation split, and use it
+//     directly for both roads' physical separation.
+//   - Placement (Part S) is click-to-place at a fixed default orientation — there is no live
+//     drag-rotate preview before commit. The preset becomes ordinary editable RoadSegments the
+//     instant it's placed (Part T), so its rotation/shape can still be adjusted afterward with the
+//     Free Road tool's own K/L/O/M controls like any other segment.
+//   - The On-Ramp/Off-Ramp click-tool (placeHighwayRampStamp below) auto-generates its own short
+//     ordinary-road stub rather than asking the player to pick an existing distant road node in a
+//     second click — kept to a single-click "stamp" placement, matching the existing
+//     edu_place_/cargo_hub tool pattern, instead of a new multi-step selection UI.
+// ============================================================================
+
+// -- shared geometry constants (Part C: "既存のSTANDARD_LANE_WIDTHを基本として使用する" — reused
+// for lane width already, above; these are just the preset system's own spacing figures) --
+const JUNCTION_PRESET_ARM_LEN = TILE * 8; // how far each preset's stub arms reach from its anchor
+const JUNCTION_LOOP_RADIUS = TILE * 3; // Trumpet/Cloverleaf loop-ramp sweep radius
+const JUNCTION_FLYOVER_ELEV = TILE * 1.2; // world-unit height separating Flyover/Diamond/Cloverleaf's two levels
+
+// splitRoadSegmentAt — Part E/F/G/H's shared primitive. Cuts `segmentId` at parameter `t` into two
+// new RoadSegments sharing a brand-new RoadNode at that point, preserving roadType and linearly
+// interpolating elevation; the original segment is removed from the network (see SCOPE NOTE above
+// re: curve fidelity through the cut). Returns null if the segment doesn't exist.
+function splitRoadSegmentAt(network, segmentId, t) {
+  const seg = network.segments.get(segmentId);
+  if (!seg) return null;
+  const p = getRoadPoint(network, seg, t);
+  const elevA = seg.elevation.start, elevB = seg.elevation.end;
+  const elevMid = elevA + (elevB - elevA) * t;
+  const { a, b } = _roadNodes(network, seg);
+  const newNode = addRoadNodeToNetwork(network, makeRoadNode(p.x, p.y, p.z));
+  network.segments.delete(seg.id);
+  a.connectedSegmentIds = a.connectedSegmentIds.filter((id) => id !== seg.id);
+  b.connectedSegmentIds = b.connectedSegmentIds.filter((id) => id !== seg.id);
+  const segA = addRoadSegmentToNetwork(network, makeRoadSegment(seg.startNodeId, newNode.id, {
+    roadType: seg.roadType, curve: null, elevation: { start: elevA, end: elevMid },
+  }));
+  const segB = addRoadSegmentToNetwork(network, makeRoadSegment(newNode.id, seg.endNodeId, {
+    roadType: seg.roadType, curve: null, elevation: { start: elevMid, end: elevB },
+  }));
+  return { node: newNode, segA, segB, removedSegmentId: seg.id };
+}
+
+// createHighwayRampConnection — the shared primitive behind On-Ramp (Part E), Off-Ramp (Part F),
+// Merge (Part G) and Diverge (Part H) alike: split the highway-class segment, then attach a ramp
+// RoadSegment from/to the new node and an already-existing `otherNodeId` (an ordinary road node
+// for a ramp, or another highway-class node for a merge/diverge). direction:'on' feeds traffic
+// INTO the highway (otherNode -> new node); direction:'off' takes traffic OUT of it (new node ->
+// otherNode) — see Part E/F's ascii art.
+function createHighwayRampConnection(network, highwaySegmentId, t, otherNodeId, opts = {}) {
+  const split = splitRoadSegmentAt(network, highwaySegmentId, Math.max(0.04, Math.min(0.96, t)));
+  if (!split) return null;
+  const otherNode = network.nodes.get(otherNodeId);
+  if (!otherNode) return null;
+  const rampType = opts.rampType || 'highway_ramp_1';
+  const tangent = getRoadTangent(network, split.segA, 1);
+  const bend = opts.direction === 'off' ? 1 : -1;
+  const mx = (otherNode.position.x + split.node.position.x) / 2 + tangent.x * bend * TILE * 1.5;
+  const mz = (otherNode.position.z + split.node.position.z) / 2 + tangent.z * bend * TILE * 1.5;
+  const fromId = opts.direction === 'off' ? split.node.id : otherNode.id;
+  const toId = opts.direction === 'off' ? otherNode.id : split.node.id;
+  const rampSegment = addRoadSegmentToNetwork(network, makeRoadSegment(fromId, toId, {
+    roadType: rampType, curve: { controlPoint: { x: mx, y: 0, z: mz } },
+  }));
+  return { splitNode: split.node, removedSegmentId: split.removedSegmentId, newHighwaySegments: [split.segA, split.segB], rampSegment };
+}
+function createOnRamp(network, highwaySegmentId, t, ordinaryRoadNodeId, rampType) {
+  return createHighwayRampConnection(network, highwaySegmentId, t, ordinaryRoadNodeId, { rampType, direction: 'on' });
+}
+function createOffRamp(network, highwaySegmentId, t, ordinaryRoadNodeId, rampType) {
+  return createHighwayRampConnection(network, highwaySegmentId, t, ordinaryRoadNodeId, { rampType, direction: 'off' });
+}
+// Merge (Part G) / Diverge (Part H): a ramp merging into / diverging from the mainline is exactly
+// an on-ramp/off-ramp whose "ordinary road" end happens to be highway-class too — same primitive,
+// no separate lane-taper geometry needed (see block header re: pickForwardLaneOffset).
+const createHighwayMerge = createOnRamp;
+const createHighwayDiverge = createOffRamp;
+
+// _buildLoopRamp — Trumpet/Cloverleaf loop ramp (Part N/O). Sweeps ~270° around a computed loop
+// center, in `bendSign` chained curved RoadSegments (never a fixed Mesh — Part O's explicit ban).
+// See SCOPE NOTE above re: this being a swept approximation, not a solved spiral.
+function _buildLoopRamp(network, fromNode, toNode, radius, rampType, bendSign) {
+  const mx = (fromNode.position.x + toNode.position.x) / 2;
+  const mz = (fromNode.position.z + toNode.position.z) / 2;
+  const baseAngle = Math.atan2(fromNode.position.z - mz, fromNode.position.x - mx);
+  const STEPS = 3;
+  const chain = [fromNode];
+  for (let i = 1; i < STEPS; i++) {
+    const ang = baseAngle + bendSign * (Math.PI * 1.5) * (i / STEPS);
+    chain.push(addRoadNodeToNetwork(network, makeRoadNode(mx + Math.cos(ang) * radius, 0, mz + Math.sin(ang) * radius)));
+  }
+  chain.push(toNode);
+  const segments = [];
+  for (let i = 0; i < chain.length - 1; i++) {
+    const ctrlAng = baseAngle + bendSign * (Math.PI * 1.5) * ((i + 0.5) / STEPS);
+    const ctrl = { x: mx + Math.cos(ctrlAng) * radius * 1.15, y: 0, z: mz + Math.sin(ctrlAng) * radius * 1.15 };
+    segments.push(addRoadSegmentToNetwork(network, makeRoadSegment(chain[i].id, chain[i + 1].id, { roadType: rampType, curve: { controlPoint: ctrl } })));
+  }
+  return { nodes: chain.slice(1, -1), segments };
+}
+
+// createJunctionPreset — Part J-Q. Generates a full, real RoadNode/RoadSegment topology for one
+// of the 7 presets, anchored at `anchor` ({x,z}) and rotated by `rotation` (radians, World Space —
+// never a Tile-center snap, Part S). Returns { nodes:[], segments:[] } of everything newly
+// created, so the caller can build meshes for each new segment and re-run the usual post-edit
+// refresh (see placeJunctionPreset in the component below).
+function createJunctionPreset(network, presetType, anchor, rotation, opts = {}) {
+  const mainType = opts.mainRoadType || 'highway';
+  const crossType = opts.crossRoadType || 'two';
+  const rampType = opts.rampType || 'highway_ramp_1';
+  const ARM = JUNCTION_PRESET_ARM_LEN;
+  const created = { nodes: [], segments: [] };
+  const pt = (localAngle, dist) => ({ x: anchor.x + Math.cos(rotation + localAngle) * dist, z: anchor.z + Math.sin(rotation + localAngle) * dist });
+  const addN = (p) => { const n = addRoadNodeToNetwork(network, makeRoadNode(p.x, 0, p.z)); created.nodes.push(n); return n; };
+  const addS = (fromId, toId, type, ctrl, elevation) => {
+    const s = addRoadSegmentToNetwork(network, makeRoadSegment(fromId, toId, { roadType: type, curve: ctrl ? { controlPoint: { x: ctrl.x, y: 0, z: ctrl.z } } : null }));
+    if (elevation) s.elevation = elevation;
+    created.segments.push(s);
+    return s;
+  };
+
+  if (presetType === 't') {
+    // Part K: ═══highway═══ through a center node, one cross-road stub dropping south — a real T,
+    // not a fixed Mesh (spec requirement).
+    const west = addN(pt(Math.PI, ARM)), center = addN(anchor), east = addN(pt(0, ARM)), south = addN(pt(Math.PI / 2, ARM));
+    addS(west.id, center.id, mainType); addS(center.id, east.id, mainType); addS(center.id, south.id, crossType);
+    return created;
+  }
+  if (presetType === 'y') {
+    // Part L: highway forks into two forward branches.
+    const west = addN(pt(Math.PI, ARM)), center = addN(anchor);
+    const a = addN(pt(-Math.PI / 7, ARM)), b = addN(pt(Math.PI / 7, ARM));
+    addS(west.id, center.id, mainType);
+    addS(center.id, a.id, mainType, pt(-Math.PI / 14, ARM * 0.55));
+    addS(center.id, b.id, mainType, pt(Math.PI / 14, ARM * 0.55));
+    return created;
+  }
+  if (presetType === 'diamond' || presetType === 'cloverleaf') {
+    // Part M/O shared base: highway straight through at grade 0; cross road lifted to
+    // JUNCTION_FLYOVER_ELEV where it passes over (real grade separation, not a flat crossing),
+    // easing back to ground at its own two far ends. Four ramp-junction nodes (hwJ1/hwJ2/crJ1/
+    // crJ2) sit where the connecting ramps attach.
+    const hwW = addN(pt(Math.PI, ARM)), hwE = addN(pt(0, ARM));
+    const hwJ1 = addN(pt(Math.PI, ARM * 0.32)), hwJ2 = addN(pt(0, ARM * 0.32));
+    const crS = addN(pt(Math.PI / 2, ARM)), crN = addN(pt(-Math.PI / 2, ARM));
+    const crJ1 = addN(pt(Math.PI / 2, ARM * 0.32)), crJ2 = addN(pt(-Math.PI / 2, ARM * 0.32));
+    addS(hwW.id, hwJ1.id, mainType); addS(hwJ1.id, hwJ2.id, mainType); addS(hwJ2.id, hwE.id, mainType);
+    addS(crS.id, crJ1.id, crossType, null, { start: 0, end: JUNCTION_FLYOVER_ELEV });
+    addS(crJ1.id, crJ2.id, crossType, null, { start: JUNCTION_FLYOVER_ELEV, end: JUNCTION_FLYOVER_ELEV });
+    addS(crJ2.id, crN.id, crossType, null, { start: JUNCTION_FLYOVER_ELEV, end: 0 });
+    if (presetType === 'diamond') {
+      // Part M: 4 diagonal ramps forming the diamond around the crossing.
+      addS(hwJ1.id, crJ1.id, rampType); addS(crJ1.id, hwJ2.id, rampType);
+      addS(hwJ2.id, crJ2.id, rampType); addS(crJ2.id, hwJ1.id, rampType);
+    } else {
+      // Part O: the same 4 connections, but each a swept loop ramp instead of a diagonal.
+      [[hwJ1, crJ1, 1], [crJ1, hwJ2, -1], [hwJ2, crJ2, 1], [crJ2, hwJ1, -1]].forEach(([a, b, sign]) => {
+        const loop = _buildLoopRamp(network, a, b, JUNCTION_LOOP_RADIUS, rampType, sign);
+        created.nodes.push(...loop.nodes); created.segments.push(...loop.segments);
+      });
+    }
+    return created;
+  }
+  if (presetType === 'trumpet') {
+    // Part N: highway straight through, TWO ramp-junction points along it, each feeding the SAME
+    // single ordinary-road stub — one via a direct diagonal ramp, one via a swept loop ramp.
+    const hwW = addN(pt(Math.PI, ARM)), hwE = addN(pt(0, ARM));
+    const hwJ = addN(pt(0, ARM * 0.22)), hwJ2 = addN(pt(0, ARM * 0.42));
+    addS(hwW.id, hwJ.id, mainType); addS(hwJ.id, hwJ2.id, mainType); addS(hwJ2.id, hwE.id, mainType);
+    const ordNode = addN(pt(Math.PI / 2, ARM));
+    addS(hwJ.id, ordNode.id, rampType, pt(Math.PI / 4, ARM * 0.5));
+    const loop = _buildLoopRamp(network, hwJ2, ordNode, JUNCTION_LOOP_RADIUS, rampType, 1);
+    created.nodes.push(...loop.nodes); created.segments.push(...loop.segments);
+    return created;
+  }
+  if (presetType === 'flyover' || presetType === 'underpass') {
+    // Part P/Q: two roads physically cross without sharing a node — separated purely by
+    // elevation (Part Q explicitly asks for reusing terrainHeight()'s existing role here; that
+    // happens automatically since getRoadPoint's y is ALWAYS terrainHeight(x,z)+elevation, so a
+    // negative elevation offset stays correctly relative to the actual ground underneath it).
+    const west = addN(pt(Math.PI, ARM)), east = addN(pt(0, ARM));
+    const south = addN(pt(Math.PI / 2, ARM)), north = addN(pt(-Math.PI / 2, ARM));
+    addS(west.id, east.id, mainType);
+    const elev = presetType === 'flyover' ? JUNCTION_FLYOVER_ELEV : -JUNCTION_FLYOVER_ELEV;
+    addS(south.id, north.id, crossType, null, { start: elev, end: elev });
+    return created;
+  }
+  return created;
 }
 
 // ============================================================================
@@ -7089,6 +7334,62 @@ export default function CityGridIso() {
       clearFreeRoadPreview();
     }
 
+    // ---- Prompt 20F Part S/T/E/F — Junction Preset placement & On/Off-Ramp stamp tools ----
+    // Both are single-click "stamp" placements (matching the existing edu_place_/cargo_hub tool
+    // pattern) that mutate roadNetworkRef.current using the pure topology generators declared at
+    // module scope above (createJunctionPreset / createOnRamp / createOffRamp), then re-run
+    // exactly the same post-edit refresh finalizeFreeRoadDraft already runs for a hand-drawn
+    // segment — mesh rebuild, junction caps, support structures, roadside land, building
+    // parcels, highway gates, unified traffic graph — so the result is drivable/query-able
+    // immediately, with no separate preset-only code path (Part T: "通常のFree Road Networkと
+    //同じRoadNode/RoadSegmentとして扱う").
+    function _refreshAfterNetworkEdit() {
+      rebuildFreeRoadJunctionCaps();
+      rebuildFreeRoadSupportStructures();
+      rebuildRoadsideLandOverlay();
+      rebuildBuildingParcelRegistry();
+      highwayGatesRef.current = computeHighwayGates();
+      roadGraphRef.current = buildRoadGraphFromGrid();
+    }
+    function placeJunctionPreset(presetType, point) {
+      const network = roadNetworkRef.current;
+      const created = createJunctionPreset(network, presetType, { x: point.x, z: point.z }, 0, {});
+      if (!created || !created.segments.length) return;
+      created.segments.forEach((seg) => rebuildFreeRoadSegmentMesh(seg));
+      _refreshAfterNetworkEdit();
+    }
+    // Finds the nearest highway-class RoadSegment to `point` (sampled, not exact-projected —
+    // sufficient precision for a click-to-place stamp) and attaches a fresh ramp + auto-generated
+    // ordinary-road stub there. `direction`: 'on' (Part E) or 'off' (Part F).
+    function placeHighwayRampStamp(direction, point) {
+      const network = roadNetworkRef.current;
+      let best = null, bestDist = Infinity, bestT = 0;
+      network.segments.forEach((seg) => {
+        if (!ROAD_TYPES[seg.roadType] || !ROAD_TYPES[seg.roadType].highway) return;
+        for (let i = 0; i <= 20; i++) {
+          const tt = i / 20;
+          const p = getRoadPoint(network, seg, tt);
+          const d = (p.x - point.x) ** 2 + (p.z - point.z) ** 2;
+          if (d < bestDist) { bestDist = d; best = seg; bestT = tt; }
+        }
+      });
+      if (!best || bestT < 0.06 || bestT > 0.94) return; // too close to an existing node — nothing to split
+      const p = getRoadPoint(network, best, bestT), n = getRoadNormal(network, best, bestT);
+      const side = direction === 'off' ? 1 : -1;
+      const stubNear = addRoadNodeToNetwork(network, makeRoadNode(p.x + n.x * TILE * 6 * side, p.y, p.z + n.z * TILE * 6 * side));
+      const stubFar = addRoadNodeToNetwork(network, makeRoadNode(p.x + n.x * TILE * 12 * side, p.y, p.z + n.z * TILE * 12 * side));
+      const stubSeg = addRoadSegmentToNetwork(network, makeRoadSegment(direction === 'off' ? stubNear.id : stubFar.id, direction === 'off' ? stubFar.id : stubNear.id, { roadType: 'two' }));
+      rebuildFreeRoadSegmentMesh(stubSeg);
+      const result = direction === 'off'
+        ? createOffRamp(network, best.id, bestT, stubNear.id, 'highway_ramp_1')
+        : createOnRamp(network, best.id, bestT, stubNear.id, 'highway_ramp_1');
+      if (!result) return;
+      removeFreeRoadSegmentMesh(result.removedSegmentId);
+      result.newHighwaySegments.forEach((seg) => rebuildFreeRoadSegmentMesh(seg));
+      rebuildFreeRoadSegmentMesh(result.rampSegment);
+      _refreshAfterNetworkEdit();
+    }
+
     // ---- Roadside Land / Parcel overlay (Prompt 4) — visualizes createParcelAlongFrontage()'s
     // 8 distance bands on both sides of every free RoadSegment, proving the query layer follows
     // curves, respects the road's real paved footprint, and leaves buildable land next to even
@@ -7544,6 +7845,8 @@ export default function CityGridIso() {
       rebuildFreeRoadJunctionCaps, rebuildFreeRoadSupportStructures,
       startFreeRoadDraft, updateFreeRoadDraftEnd, adjustFreeRoadCurve, adjustFreeRoadElevation,
       finalizeFreeRoadDraft, cancelFreeRoadDraft,
+      // Prompt 20F Part S/T/E/F — Junction Preset + On/Off-Ramp stamp tools.
+      placeJunctionPreset, placeHighwayRampStamp,
       // Roadside Land / Parcel overlay (Prompt 4).
       roadsideLandGroup, rebuildRoadsideLandOverlay,
     };
@@ -10442,6 +10745,16 @@ export default function CityGridIso() {
       else t.finalizeFreeRoadDraft();
       return;
     }
+    // Prompt 20F Part S — Junction Preset / On-Ramp / Off-Ramp: single-click World Space stamp
+    // placement (never a Tile snap), same as freeroad above — bypasses worldToTile()/applyTool().
+    if (toolRef.current.startsWith('preset_')) {
+      threeRef.current?.placeJunctionPreset?.(toolRef.current.slice('preset_'.length), point);
+      return;
+    }
+    if (toolRef.current === 'ramp_on' || toolRef.current === 'ramp_off') {
+      threeRef.current?.placeHighwayRampStamp?.(toolRef.current === 'ramp_off' ? 'off' : 'on', point);
+      return;
+    }
     const { tx, ty } = worldToTile(point);
     if (RES_LOT_TYPES[toolRef.current]) {
       // anchor is a raw World Space point (never a Tile index) — see updateLotPreview.
@@ -10564,7 +10877,14 @@ export default function CityGridIso() {
   const resToolIds = ['zone_res', 'res_terrace', 'res_mid', 'res_lowrent', 'res_mixed', 'res_high'];
   const roadToolIds = ROAD_TYPE_KEYS.map((k) => `road_${k}`);
   const eduToolIds = Object.keys(EDUCATION_FACILITIES).map((k) => `edu_place_${k}`);
-  const submenuToolIds = [...resToolIds, ...roadToolIds, ...eduToolIds];
+  // Prompt 20F Part R — additive "高速道路" category (new highway variants + junction presets +
+  // ramp stamps). Existing road/res/edu categories and IDs above are completely unchanged. The 5
+  // highway-variant buttons below just set freeRoadTypeRef + tool='freeroad' (reusing the
+  // existing Free Road draw tool as-is, so they use custom onClick, not toolBtn/these ids as a
+  // `tool` value) — only the preset/ramp stamp tools below are real `tool` values.
+  const hwxHighwayVariantKeys = ['highway_6', 'highway_8', 'highway_ramp_1', 'highway_ramp_2', 'highway_connector'];
+  const hwxPresetIds = ['preset_t', 'preset_y', 'preset_diamond', 'preset_trumpet', 'preset_cloverleaf', 'preset_flyover', 'preset_underpass', 'ramp_on', 'ramp_off'];
+  const submenuToolIds = [...resToolIds, ...roadToolIds, ...eduToolIds, ...hwxPresetIds];
 
   const toolBtn = (id, label, color, locked) => (
     <button onClick={() => { if (locked) return; setTool(id); if (!submenuToolIds.includes(id)) setToolCategory(null); }} style={{ padding: '7px 12px', background: tool === id ? `${color}33` : 'rgba(15, 21, 18, 0.85)', border: `1px solid ${tool === id ? color : 'rgba(120, 200, 160, 0.25)'}`, borderRadius: 4, color: locked ? '#5a6a5f' : tool === id ? color : '#a8d8bc', fontSize: 12, cursor: locked ? 'not-allowed' : 'pointer', fontFamily: "'Courier New', monospace", whiteSpace: 'nowrap', opacity: locked ? 0.55 : 1 }}>
@@ -10636,6 +10956,12 @@ export default function CityGridIso() {
                 style={{ padding: '7px 12px', background: roadToolIds.includes(tool) ? '#c9b25a33' : 'rgba(15, 21, 18, 0.85)', border: `1px solid ${roadToolIds.includes(tool) || toolCategory === 'road' ? '#c9b25a' : 'rgba(120, 200, 160, 0.25)'}`, borderRadius: 4, color: roadToolIds.includes(tool) ? '#c9b25a' : '#a8d8bc', fontSize: 12, cursor: 'pointer', fontFamily: "'Courier New', monospace", whiteSpace: 'nowrap' }}
               >
                 道路 {toolCategory === 'road' ? '▴' : '▾'}
+              </button>
+              <button
+                onClick={() => { setToolCategory((c) => (c === 'hwx' ? null : 'hwx')); if (!hwxPresetIds.includes(tool) && tool !== 'freeroad') setTool('freeroad'); }}
+                style={{ padding: '7px 12px', background: (hwxPresetIds.includes(tool) || (tool === 'freeroad' && ROAD_TYPES[freeRoadType]?.highway === true && freeRoadType !== 'highway')) ? '#5ad0e033' : 'rgba(15, 21, 18, 0.85)', border: `1px solid ${toolCategory === 'hwx' ? '#5ad0e0' : 'rgba(120, 200, 160, 0.25)'}`, borderRadius: 4, color: '#5ad0e0', fontSize: 12, cursor: 'pointer', fontFamily: "'Courier New', monospace", whiteSpace: 'nowrap' }}
+              >
+                高速道路+JCT {toolCategory === 'hwx' ? '▴' : '▾'}
               </button>
               {toolBtn('erase', 'ERASE', '#e05a4f')}
               <button
@@ -10759,6 +11085,36 @@ export default function CityGridIso() {
                     )}
                   </>
                 )}
+              </div>
+            )}
+            {toolCategory === 'hwx' && (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 6, maxWidth: 480, padding: '8px', background: 'rgba(15, 21, 18, 0.92)', border: '1px solid rgba(90, 208, 224, 0.4)', borderRadius: 4 }}>
+                <div style={{ fontSize: 11, color: '#5ad0e0' }}>高速道路バリエーション(自由道路として作図・クリックで始点/終点):</div>
+                <div style={{ display: 'flex', gap: 5, flexWrap: 'wrap', justifyContent: 'center' }}>
+                  {hwxHighwayVariantKeys.map((k) => (
+                    <button key={k}
+                      onClick={() => { setFreeRoadTypeState(k); setTool('freeroad'); }}
+                      style={{ padding: '7px 10px', background: (tool === 'freeroad' && freeRoadType === k) ? '#5ad0e033' : 'rgba(15, 21, 18, 0.85)', border: `1px solid ${(tool === 'freeroad' && freeRoadType === k) ? '#5ad0e0' : 'rgba(90, 208, 224, 0.35)'}`, borderRadius: 4, color: '#5ad0e0', fontSize: 12, cursor: 'pointer', fontFamily: "'Courier New', monospace", whiteSpace: 'nowrap' }}
+                    >
+                      {ROAD_TYPES[k].label} (¥{ROAD_TYPES[k].cost}/{ROAD_TYPES[k].lanes}車線/{ROAD_TYPES[k].maxSpeed}km)
+                    </button>
+                  ))}
+                </div>
+                <div style={{ fontSize: 11, color: '#5ad0e0' }}>オンランプ/オフランプ(既存の高速道路上でクリック):</div>
+                <div style={{ display: 'flex', gap: 5, flexWrap: 'wrap', justifyContent: 'center' }}>
+                  {toolBtn('ramp_on', 'オンランプ設置', '#5ad0e0')}
+                  {toolBtn('ramp_off', 'オフランプ設置', '#5ad0e0')}
+                </div>
+                <div style={{ fontSize: 11, color: '#5ad0e0' }}>ジャンクション・プリセット(クリックで設置):</div>
+                <div style={{ display: 'flex', gap: 5, flexWrap: 'wrap', justifyContent: 'center' }}>
+                  {toolBtn('preset_t', 'T字', '#5ad0e0')}
+                  {toolBtn('preset_y', 'Y字', '#5ad0e0')}
+                  {toolBtn('preset_diamond', 'ダイヤモンド', '#5ad0e0')}
+                  {toolBtn('preset_trumpet', 'トランペット', '#5ad0e0')}
+                  {toolBtn('preset_cloverleaf', 'クローバーリーフ', '#5ad0e0')}
+                  {toolBtn('preset_flyover', 'フライオーバー', '#5ad0e0')}
+                  {toolBtn('preset_underpass', 'アンダーパス', '#5ad0e0')}
+                </div>
               </div>
             )}
           </div>
