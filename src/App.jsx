@@ -584,12 +584,27 @@ function getRoadLaneCenter(network, segment, laneIndex, t) {
 function buildRoadSegmentGeometry(network, segment, subdivisions = 20) {
   const halfW = getRoadWidth(segment) / 2;
   const positions = [], uvs = [];
+  // Part A (Prompt 20A) requirement #4/#5/#11: V is the segment's own cumulative WORLD-SPACE arc
+  // length (never a normalized 0..1 `t`), measured in units of ROAD_DASH_PERIOD — the same
+  // lane-dash rhythm unit makeAsphaltRibbonTexture bakes exactly ONE cycle of onto a
+  // wrapT=RepeatWrapping texture. That is what lets the painted dash rhythm tile at a constant,
+  // curve-length-correct pitch along a Free Road segment of ANY real length/curvature, instead of
+  // stretching or compressing a fixed 0..1 UV span across whatever arc the segment happens to
+  // cover (the old normalized-t mapping is exactly what made curved-road paint smear/warp).
+  let prevPoint = null;
+  let cumulativeDist = 0;
   for (let i = 0; i <= subdivisions; i++) {
     const t = i / subdivisions;
     const p = getRoadPoint(network, segment, t), n = getRoadNormal(network, segment, t);
+    if (prevPoint) cumulativeDist += Math.hypot(p.x - prevPoint.x, p.z - prevPoint.z);
+    prevPoint = p;
+    const v = cumulativeDist / ROAD_DASH_PERIOD;
+    // U convention matches drawRoadPaint's pxForOffset (offset=+rhw -> canvas px128/u=1,
+    // offset=-rhw -> canvas px0/u=0): the +normal edge (offset=+halfW) gets u=1, the -normal edge
+    // gets u=0, so a Free Road's lane markings land at the same physical offsets as Tile roads'.
     positions.push(p.x + n.x * halfW, p.y + 0.015, p.z + n.z * halfW);
     positions.push(p.x - n.x * halfW, p.y + 0.015, p.z - n.z * halfW);
-    uvs.push(0, t, 1, t);
+    uvs.push(1, v, 0, v);
   }
   const indices = [];
   for (let i = 0; i < subdivisions; i++) {
@@ -602,6 +617,152 @@ function buildRoadSegmentGeometry(network, segment, subdivisions = 20) {
   geo.setIndex(indices);
   geo.computeVertexNormals();
   return geo;
+}
+
+// ============================================================================
+// Free Road Junction Surface (Prompt 20C Part A/B/C)
+//
+// Replaces the old flat circular "cap" disc that used to be dropped at every RoadNode with
+// 2+ connected segments. A circle/disc is the wrong shape for this job (spec Part A: "円・
+// 円盤・Sphere・Circleを道路接続部の穴埋めとして使用しない") — it has no relationship to the
+// actual road widths meeting there, so a 2-lane and an 8-lane road sharing a node either
+// leave a paved gap outside the disc or the disc oversails past the narrow road's own curb.
+//
+// Instead, for every RoadSegment connected at a node we take its REAL edge points at that
+// end — centerline ± getRoadWidth(segment)/2 along getRoadNormal(t), i.e. the EXACT same
+// two vertices buildRoadSegmentGeometry() already emits for the ribbon's last cross-section
+// (Part B requirement: connect paved footprints, not bare centerlines) — and fan-triangulate
+// them around the node's own position. Two segments meeting head-on (straight-through or a
+// C1-continuous curve-to-curve chain, Part C) produce a degenerate sliver with effectively no
+// visible seam ("seamless transition"); three produce a natural T; four a natural crossroads.
+// None of it can show a hole, because every single vertex is a point already authored by a
+// real segment's own ribbon edge — there is no separate "cap" surface to align, just the
+// wedges between whatever ribbons actually meet there.
+// ============================================================================
+function buildFreeRoadJunctionGeometry(network, node) {
+  const ids = (node.connectedSegmentIds || []).filter((id) => network.segments.has(id));
+  if (ids.length < 2) return null;
+  const edgePoints = [];
+  let cx = 0, cz = 0, cy = 0, matRoadType = null, maxHalfW = 0, count = 0;
+  ids.forEach((segId) => {
+    const seg = network.segments.get(segId);
+    if (!seg) return;
+    const isEnd = seg.endNodeId === node.id;
+    const t = isEnd ? 1 : 0;
+    const p = getRoadPoint(network, seg, t);
+    const n = getRoadNormal(network, seg, t);
+    const halfW = getRoadWidth(seg) / 2;
+    if (halfW > maxHalfW) maxHalfW = halfW;
+    if (!matRoadType) matRoadType = seg.roadType; // widest/first connected road type "wins" the fill color
+    cx += p.x; cz += p.z; cy += p.y; count++;
+    edgePoints.push({ x: p.x + n.x * halfW, y: p.y, z: p.z + n.z * halfW });
+    edgePoints.push({ x: p.x - n.x * halfW, y: p.y, z: p.z - n.z * halfW });
+  });
+  if (edgePoints.length < 4 || maxHalfW <= 0 || count < 2) return null;
+  cx /= count; cz /= count; cy /= count;
+  // Sort every connected road's two edge points by angle around the shared center so the fan
+  // triangulation always winds around the junction in order, regardless of how many roads
+  // meet here or from which direction each was drawn (2-way, T, or full 4-way crossroads).
+  edgePoints.forEach((p) => { p.angle = Math.atan2(p.z - cz, p.x - cx); });
+  edgePoints.sort((a, b) => a.angle - b.angle);
+  const Y_LIFT = 0.018; // sits just above the segment ribbons themselves (which bake in +0.015)
+  const positions = [cx, cy + Y_LIFT, cz];
+  const uvs = [0.5, 0.5];
+  edgePoints.forEach((p) => { positions.push(p.x, p.y + Y_LIFT, p.z); uvs.push(0.5, 0.5); });
+  const indices = [];
+  const n = edgePoints.length;
+  for (let i = 0; i < n; i++) indices.push(0, 1 + i, 1 + ((i + 1) % n));
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+  geo.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2));
+  geo.setIndex(indices);
+  geo.computeVertexNormals();
+  return { geo, roadType: matRoadType };
+}
+
+// ============================================================================
+// Free Road Editor — Orthogonal Snap / Overlap Prevention (Prompt 20B)
+//
+// Pure geometry helpers, kept at module scope (alongside getRoadPoint/getRoadWidth/etc. above)
+// so the draft-drawing closures further down (startFreeRoadDraft/updateFreeRoadDraftEnd/
+// finalizeFreeRoadDraft) and any future caller can both reuse the exact same math with zero
+// duplication. Nothing here touches gridRef/roadTypeRef/lotIdGridRef or any Citizen/Household/
+// Economy/Zone-growth code — this is Road Editing / Free Road Geometry only (Part A/D spec).
+// ============================================================================
+
+// Part A — angle tolerance (degrees) within which a freely-dragged endpoint snaps onto the
+// nearest world-axis-aligned (0/90/180/270) direction from the segment's start point. Not a hard
+// grid: outside this tolerance the road stays exactly where the player dragged it (fully free
+// diagonal roads remain possible — spec requirement "自由道路 = 完全自由 + 直角へ自然に吸着").
+const ORTHOGONAL_SNAP_DEG = 15;
+
+// computeOrthogonalSnappedPoint: given a fixed start point and a raw (unsnapped) cursor point,
+// returns the endpoint to actually draw — snapped onto the nearest world X/Z axis direction from
+// start if the raw drag angle falls within ORTHOGONAL_SNAP_DEG of that axis, otherwise the raw
+// point unchanged. `freeAngle` (held modifier, e.g. Shift) forces fully free angles, matching
+// spec requirement #9 ("既存modifierの仕様を壊さない" — this is purely additive, never required).
+function computeOrthogonalSnappedPoint(startX, startZ, rawX, rawZ, freeAngle) {
+  const dx = rawX - startX, dz = rawZ - startZ;
+  const dist = Math.hypot(dx, dz);
+  if (freeAngle || dist < 1e-6) return { x: rawX, z: rawZ, snapped: false };
+  const deg = Math.atan2(dz, dx) * 180 / Math.PI;
+  const nearest90 = Math.round(deg / 90) * 90;
+  let diff = ((deg - nearest90 + 540) % 360) - 180; // wrap to (-180, 180]
+  if (Math.abs(diff) <= ORTHOGONAL_SNAP_DEG) {
+    const rad = nearest90 * Math.PI / 180;
+    return { x: startX + Math.cos(rad) * dist, z: startZ + Math.sin(rad) * dist, snapped: true };
+  }
+  return { x: rawX, z: rawZ, snapped: false };
+}
+
+// Part D — Road Segment overlap/collision detection. Rather than comparing raw centerline
+// distance alone (spec explicitly forbids this — §6 "単純なcenterline距離だけで判定しない"), this
+// samples the CANDIDATE segment's curve and, for every existing RoadSegment (free OR
+// tile-derived — both live together in the unified `targetGraph`, e.g. roadGraphRef.current),
+// measures the real gap between the two PAVED FOOTPRINTS (candidate half-width + existing
+// half-width, via getRoadWidth — spec §7) using the same closestPointOnRoadSegment() the
+// Roadside-Land system already trusts for curve-accurate distance (spec §3/§4/§8).
+//
+// A single crossing point (an intentional X/T intersection, spec §9/Test 12) naturally only
+// produces a SHORT run of too-close samples (the crossing's own footprint width); a duplicated or
+// near-parallel road (spec §11/Test 9-11) produces a LONG run. So instead of rejecting on any
+// single too-close sample, this rejects only when a *run* of consecutive too-close samples
+// exceeds FREE_ROAD_OVERLAP_MAX_RUN — cheap, dependency-free, and matches the Test 9/10/11 vs
+// Test 12 distinction from the spec without needing full polygon-clipping.
+//
+// Samples that land within a shared endpoint RoadNode's own footprint radius are always excluded
+// (spec §9/§10: an intentional junction/intersection connection is allowed, not treated as
+// overlap) by zeroing the run counter there rather than testing distance.
+const FREE_ROAD_OVERLAP_SAMPLES = 20;
+const FREE_ROAD_OVERLAP_TOLERANCE = 0.12; // world units of slack absorbing float/sampling noise (spec §13)
+const FREE_ROAD_OVERLAP_MAX_RUN = 3; // consecutive too-close samples tolerated as "just a crossing"
+
+function checkFreeRoadSegmentOverlap(candidateNetwork, candidateSegment, targetGraph) {
+  const halfWCandidate = getRoadWidth(candidateSegment) / 2;
+  const startNodeId = candidateSegment.startNodeId, endNodeId = candidateSegment.endNodeId;
+  const startPos = candidateNetwork.nodes.get(startNodeId)?.position;
+  const endPos = candidateNetwork.nodes.get(endNodeId)?.position;
+  let worstRun = 0, worstSegmentId = null;
+  targetGraph.segments.forEach((existingSeg) => {
+    if (existingSeg.id === candidateSegment.id) return;
+    const existingHalfW = getRoadWidth(existingSeg) / 2;
+    const minSeparation = halfWCandidate + existingHalfW - FREE_ROAD_OVERLAP_TOLERANCE;
+    const sharesStart = existingSeg.startNodeId === startNodeId || existingSeg.endNodeId === startNodeId;
+    const sharesEnd = existingSeg.startNodeId === endNodeId || existingSeg.endNodeId === endNodeId;
+    const junctionRadius = Math.max(halfWCandidate, existingHalfW) * 1.6;
+    let run = 0, maxRunHere = 0;
+    for (let i = 0; i <= FREE_ROAD_OVERLAP_SAMPLES; i++) {
+      const t = i / FREE_ROAD_OVERLAP_SAMPLES;
+      const p = getRoadPoint(candidateNetwork, candidateSegment, t);
+      if (sharesStart && startPos && Math.hypot(p.x - startPos.x, p.z - startPos.z) < junctionRadius) { run = 0; continue; }
+      if (sharesEnd && endPos && Math.hypot(p.x - endPos.x, p.z - endPos.z) < junctionRadius) { run = 0; continue; }
+      const hit = closestPointOnRoadSegment(targetGraph, existingSeg, p.x, p.z);
+      if (hit && hit.distance < minSeparation) { run++; if (run > maxRunHere) maxRunHere = run; }
+      else run = 0;
+    }
+    if (maxRunHere > worstRun) { worstRun = maxRunHere; worstSegmentId = existingSeg.id; }
+  });
+  return { overlapping: worstRun > FREE_ROAD_OVERLAP_MAX_RUN, worstRun, worstSegmentId };
 }
 
 // ============================================================================
@@ -3931,6 +4092,48 @@ function makeAsphaltCurveTexture(color = ASPHALT_COLOR, unpaved = false, corner 
   return new THREE.CanvasTexture(canvas);
 }
 
+// ---- Free Road continuous asphalt ribbon texture (Prompt 20A Part A) -----------------------
+// Free Road segments have no fixed "one Tile" length, so they can't reuse makeAsphaltHubTexture/
+// makeAsphaltCurveTexture/makeArmDashTexture as-is (those are baked for exactly ONE Tile's world
+// length and stitched per-instance at Tile seams). Instead this bakes exactly ONE
+// ROAD_DASH_PERIOD's worth of lane-marking rhythm (drawRoadPaint's own reps===1 case) onto a
+// canvas whose V axis is wrapT=RepeatWrapping, so buildRoadSegmentGeometry can tile it seamlessly
+// along a curve of ANY real length just by scaling its V coordinate by the segment's own
+// cumulative world-space arc length (see buildRoadSegmentGeometry) — never a hardcoded Tile
+// length. Reuses drawRoadPaint() itself (Part A requirement #9/#10: the SAME getRoadLayout-driven
+// lane/median/divider math that already drives every Tile road texture and every car's lane
+// offset), so a Free Road's lane lines are guaranteed to land at the identical physical lane
+// positions Tile roads and cars use — never a second, independently authored line layout.
+const freeRoadRibbonTextureCache = {};
+function makeAsphaltRibbonTexture(rt, roadTypeKey) {
+  if (freeRoadRibbonTextureCache[roadTypeKey]) return freeRoadRibbonTextureCache[roadTypeKey];
+  const canvas = document.createElement('canvas');
+  canvas.width = 128; canvas.height = 128;
+  const ctx = canvas.getContext('2d');
+  ctx.fillStyle = rt.color; ctx.fillRect(0, 0, 128, 128);
+  // Asphalt texture feel (Part A requirement #1/#7: never fall back to a flat, uniform color) — a
+  // fine random grain speckle, subtle on paved roads and heavier on unpaved ones. Drawn
+  // independently of any lane-marking geometry (pure per-pixel randomness, no edge-aligned
+  // pattern), so it tiles along V with no visible seam regardless of how many times it repeats.
+  const speckleAlpha = rt.unpaved ? 0.14 : 0.055;
+  const speckleCount = rt.unpaved ? 260 : 170;
+  ctx.fillStyle = `rgba(0,0,0,${speckleAlpha})`;
+  for (let n = 0; n < speckleCount; n++) ctx.fillRect(Math.random() * 128, Math.random() * 128, 1.5, 1.5);
+  ctx.fillStyle = `rgba(255,255,255,${speckleAlpha * 0.6})`;
+  for (let n = 0; n < speckleCount * 0.6; n++) ctx.fillRect(Math.random() * 128, Math.random() * 128, 1, 1);
+  if (!rt.unpaved) {
+    // Exactly one dash+gap period's worth of lane markings: drawRoadPaint derives its dash count
+    // as Math.max(1, Math.round(lengthWorld / ROAD_DASH_PERIOD)), so passing
+    // lengthWorld=ROAD_DASH_PERIOD always yields reps===1 — one full cycle, tileable edge-to-edge.
+    drawRoadPaint(ctx, ROAD_DASH_PERIOD, rt, false);
+  }
+  const tex = new THREE.CanvasTexture(canvas);
+  tex.wrapS = THREE.ClampToEdgeWrapping; // U spans the full road width exactly once, never repeats
+  tex.wrapT = THREE.RepeatWrapping; // V tiles once per ROAD_DASH_PERIOD of real-world arc length
+  freeRoadRibbonTextureCache[roadTypeKey] = tex;
+  return tex;
+}
+
 // dead-end hub tile (a NODE_DEADEND node has exactly one connected neighbor): paints a normal
 // paved approach (edge lines running in from the connected side) capped by a solid line near the
 // far edge, like a real road's end-of-pavement marking, instead of a blank plain slab. `side`
@@ -4678,6 +4881,11 @@ export default function CityGridIso() {
 
   const [tool, setTool] = useState('select');
   const [freeRoadType, setFreeRoadTypeState] = useState('two'); // mirrors freeRoadTypeRef, for the UI selector
+  // Part A/D (Prompt 20B) — live HUD readout of the in-progress Free Road draft: whether the
+  // current drag is orthogonal-angle-snapped, snapped onto an existing RoadNode, or would overlap
+  // an existing road's paved footprint if placed right now. Updated straight from
+  // updateFreeRoadDraftEnd's own return value on every pointer move — no extra per-frame polling.
+  const [freeRoadDraftStatus, setFreeRoadDraftStatus] = useState(null);
   const [showRoadsideLand, setShowRoadsideLand] = useState(false); // mirrors showRoadsideLandRef, roadside-land band overlay toggle
   const [toolCategory, setToolCategory] = useState(null); // which submenu is open: 'res' | 'zone' | null
   const [threeLaneFlip, setThreeLaneFlipState] = useState(false); // mirrors threeLaneFlipRef, for the UI toggle button
@@ -4712,6 +4920,7 @@ export default function CityGridIso() {
   // Leaving the 'freeroad' tool (switched to any other tool) cancels any in-progress draft so a
   // half-drawn preview segment never lingers once the user has moved on to something else.
   if (tool !== 'freeroad' && freeRoadDraftRef.current && threeRef.current) threeRef.current.cancelFreeRoadDraft();
+  if (tool !== 'freeroad' && freeRoadDraftStatus) setFreeRoadDraftStatus(null);
   toolRef.current = tool;
   freeRoadTypeRef.current = freeRoadType;
   taxRef.current = taxRate;
@@ -5503,12 +5712,15 @@ export default function CityGridIso() {
     if (!seg) {
       // road no longer exists under this hop (edited/removed mid-frame, before this car's own
       // revalidateCarsAround() catches up) — same raw fallback math as before, never a crash/NaN.
-      const fx = fromNode.position.x, fz = fromNode.position.z;
-      const tx2 = toNode.position.x, tz2 = toNode.position.z;
+      // Part C: y still comes from the RoadNode's OWN stored position (never terrainHeight at
+      // render time) — a plain lerp between the two endpoints' y is the correct degenerate
+      // fallback for "the segment briefly doesn't exist", not a re-derivation from the ground.
+      const fx = fromNode.position.x, fz = fromNode.position.z, fy = fromNode.position.y;
+      const tx2 = toNode.position.x, tz2 = toNode.position.z, ty2 = toNode.position.y;
       const dx = tx2 - fx, dz = tz2 - fz;
       const len = Math.hypot(dx, dz) || 1;
       const px = -dz / len, pz = dx / len;
-      return { x: fx + dx * t + px * lane, z: fz + dz * t + pz * lane, heading: Math.atan2(dx, dz) };
+      return { x: fx + dx * t + px * lane, y: fy + (ty2 - fy) * t, z: fz + dz * t + pz * lane, heading: Math.atan2(dx, dz) };
     }
     const forward = segmentIsForward(seg, fromNode.id);
     const segT = forward ? t : 1 - t;
@@ -5516,7 +5728,11 @@ export default function CityGridIso() {
     const p = getRoadLanePoint(seg.id, laneIndex, segT);
     const tan = getRoadTangentForSegment(seg.id, segT);
     const dirX = forward ? tan.x : -tan.x, dirZ = forward ? tan.z : -tan.z;
-    return { x: p.x, z: p.z, heading: Math.atan2(dirX, dirZ) };
+    // Part A/B/C: getRoadLanePoint (-> getRoadLaneCenter/getRoadPoint) is the RoadSegment's own
+    // Single Source of Truth for BOTH the lane-offset x/z AND the elevation-aware y (terrainHeight
+    // + the segment's own authored elevationOffset) — p.y is carried straight through here rather
+    // than dropped, so nothing downstream ever needs to re-derive height from bare terrain.
+    return { x: p.x, y: p.y, z: p.z, heading: Math.atan2(dirX, dirZ) };
   };
   // laneCur = the lane offset for the segment the entity is currently on; laneNext = the lane
   // offset it will use on the SEGMENT AFTER nextNode. Using two separate values (instead of one
@@ -5606,7 +5822,14 @@ export default function CityGridIso() {
     clamped = clampAgainstMedian(x, z, { x: tx2, z: tz2 }, dOut, laneNext, toMedianHalf);
     x = clamped.x; z = clamped.z;
 
-    return { x, z, heading: lerpAngle(p0.heading, p2.heading, s) };
+    // Part C/E — elevation across the corner fillet: a plain lerp (using the SAME eased `s` the
+    // heading slerp already uses) between the entry point's y and the exit point's y, both of
+    // which are themselves genuine RoadSegment/getRoadLaneCenter elevations (via segPoint above,
+    // never terrainHeight-only). No separate bezier control-point height is needed — a short
+    // corner fillet spanning at most two segment ends never needs its own vertical curvature.
+    const y = p0.y + (p2.y - p0.y) * s;
+
+    return { x, y, z, heading: lerpAngle(p0.heading, p2.heading, s) };
   };
   // how long (seconds) a straight-line lane-offset change (e.g. crossing from a 2-lane road onto
   // a 3-lane one on the same heading) takes to blend from the old offset to the new one, instead
@@ -5664,44 +5887,46 @@ export default function CityGridIso() {
     return false;
   }, []);
 
-  // Finds every highway tile currently sitting ON the map border that is part of the connected
-  // road network AND has a real road tile immediately inland of it — i.e. every point where
-  // outside-world traffic can actually enter/exit this city (requirement #4/#18: the highway IS
-  // the "外部交通ゲート"). Recomputed whenever the road network changes (see recomputeConnectivity
-  // call sites) rather than hardcoded, so player-extended highway reaching a second map edge, or a
-  // future second highway entrance, is picked up automatically with no extra wiring.
+  // Part 20E Part E — Highway external gate. A "gate" is now purely a World Space concept: every
+  // point where a native Highway RoadSegment (roadType.highway === true) in roadNetworkRef has an
+  // endpoint RoadNode sitting ON the map boundary — i.e. every place outside-world traffic can
+  // actually enter/exit this city. This deliberately no longer scans the Tile grid at all (no
+  // border-tile check, no Tile connectivity check): a Highway RoadSegment is either drawn all the
+  // way to the boundary or it isn't, and roadNetworkRef is always internally consistent the
+  // instant a segment/node is added. Recomputed whenever the road network changes (same call
+  // sites as before) so a player-extended highway reaching a second map edge, or a future second
+  // highway entrance, is picked up automatically with no extra wiring.
+  // Gate record shape (Part E, minimum required fields): { segmentId, nodeId, worldPosition,
+  // direction, roadType }.
   const computeHighwayGates = useCallback(() => {
-    const grid = gridRef.current;
-    const roadType = roadTypeRef.current;
-    const connected = connectedRef.current;
-    const highwayIdx = ROAD_TYPE_KEYS.indexOf('highway');
+    const network = roadNetworkRef.current;
+    const mapHalf = (GRID_SIZE * TILE) / 2;
+    const eps = TILE * 0.75; // tolerance so a boundary node need not be pixel-exact on the edge
     const gates = [];
     const seen = new Set();
-    // A "gate" is now a RoadNode sitting on the Map border with a RoadSegment reaching inland from
-    // it (requirement: migrate from a raw Tile-border check to RoadSegment endpoints touching the
-    // Map border) — same external gate shape ({tx,ty,inTx,inTy}) as before, so highwayGatesRef,
-    // pickExitGate, spawn/despawn all keep working exactly as-is; only how a gate is VALIDATED
-    // changed, from "is the neighbor Tile a road" to "does a RoadSegment actually connect here".
-    const tryAdd = (tx, ty, inTx, inTy) => {
-      const key = `${tx},${ty}`;
-      if (seen.has(key)) return;
-      const i = idx(tx, ty);
-      if (grid[i] !== TILE_ROAD || roadType[i] !== highwayIdx || !connected[i]) return;
-      const node = roadGraphRef.current.nodes.get(tileNodeId(tx, ty));
-      if (!node) return;
-      const inSeg = segmentForEdge(tx, ty, inTx, inTy);
-      if (!inSeg) return;
-      seen.add(key);
-      gates.push({ tx, ty, inTx, inTy });
-    };
-    for (let tx = 0; tx < GRID_SIZE; tx++) {
-      tryAdd(tx, 0, tx, 1);
-      tryAdd(tx, GRID_SIZE - 1, tx, GRID_SIZE - 2);
-    }
-    for (let ty = 0; ty < GRID_SIZE; ty++) {
-      tryAdd(0, ty, 1, ty);
-      tryAdd(GRID_SIZE - 1, ty, GRID_SIZE - 2, ty);
-    }
+    network.segments.forEach((segment) => {
+      const rt = ROAD_TYPES[segment.roadType];
+      if (!rt || !rt.highway) return; // only real Highway RoadSegments can host a gate
+      const a = network.nodes.get(segment.startNodeId);
+      const b = network.nodes.get(segment.endNodeId);
+      if (!a || !b) return;
+      [[a, b], [b, a]].forEach(([node, other]) => {
+        if (seen.has(node.id)) return;
+        const p = node.position;
+        const onBoundary = p.x <= -mapHalf + eps || p.x >= mapHalf - eps || p.z <= -mapHalf + eps || p.z >= mapHalf - eps;
+        if (!onBoundary) return;
+        seen.add(node.id);
+        const dx = node.position.x - other.position.x, dz = node.position.z - other.position.z;
+        const len = Math.hypot(dx, dz) || 1;
+        gates.push({
+          segmentId: segment.id,
+          nodeId: node.id,
+          worldPosition: { x: node.position.x, y: node.position.y, z: node.position.z },
+          direction: { x: dx / len, z: dz / len }, // points OUTWARD, away from the city
+          roadType: segment.roadType,
+        });
+      });
+    });
     return gates;
   }, []);
 
@@ -5768,47 +5993,92 @@ export default function CityGridIso() {
   // "a highway neighbor does NOT count" rule) and the free World Space RoadSegment network
   // (getRoadFrontage, which itself resolves to the nearest RoadSegment's own curve) — so a Building
   // can front either kind of road, on a straight OR curved alignment.
+  // Prompt 20A Part C rewrite: the old version only probed a SINGLE point (each edge's midpoint,
+  // always at rotation=0) against the free RoadSegment network. A diagonal or curved Free Road
+  // very often does not pass anywhere near an axis-aligned edge's midpoint even though it clearly
+  // runs alongside part of that edge (or a corner) — that mismatch is what made Building
+  // Placement fail near Free Road in practice. This version treats each of the 4 candidate
+  // frontage edges as a real World Space segment, samples several points along its FULL length
+  // (requirement #3: "各footprint edgeを複数点サンプリング"), and queries the existing World Space
+  // APIs (getRoadFrontage / getNearestRoadPoint, via getRoadFrontage) at every sample — never a
+  // new "adjacent Tile has a road" shortcut (requirement #13). Highway frontage stays excluded
+  // exactly as before, via getRoadFrontage(..., ) itself passing includeHighway:false internally.
+  const FRONTAGE_EDGE_SAMPLES = 7; // 8 points per edge (requirement #3: "5〜9 points程度")
   const findLotFrontage = useCallback((cx, cz, w, h) => {
     const grid = gridRef.current, roadType = roadTypeRef.current;
     const network = roadNetworkRef.current;
     const halfW = w / 2, halfD = h / 2, probe = 0.6, mapHalf = (GRID_SIZE * TILE) / 2;
-    const edges = [
-      { fx: cx, fz: cz - halfD - probe, sign: -1, axis: 'z' }, // north edge
-      { fx: cx, fz: cz + halfD + probe, sign: 1, axis: 'z' },  // south edge
-      { fx: cx - halfW - probe, fz: cz, sign: -1, axis: 'x' }, // west edge
-      { fx: cx + halfW + probe, fz: cz, sign: 1, axis: 'x' },  // east edge
+    // Each candidate edge is defined by its own two endpoints (not just a midpoint), still using
+    // the building's UNROTATED (candidate) axis-aligned footprint — rotation is only decided AFTER
+    // a frontage edge is chosen, then re-validated against the real rotated OBB below (requirement
+    // #8/#9), exactly like the previous version already did for its single sample point.
+    const edgeDefs = [
+      { axis: 'z', sign: -1, from: { x: cx - halfW, z: cz - halfD - probe }, to: { x: cx + halfW, z: cz - halfD - probe } }, // north
+      { axis: 'z', sign: 1, from: { x: cx - halfW, z: cz + halfD + probe }, to: { x: cx + halfW, z: cz + halfD + probe } }, // south
+      { axis: 'x', sign: -1, from: { x: cx - halfW - probe, z: cz - halfD }, to: { x: cx - halfW - probe, z: cz + halfD } }, // west
+      { axis: 'x', sign: 1, from: { x: cx + halfW + probe, z: cz - halfD }, to: { x: cx + halfW + probe, z: cz + halfD } }, // east
     ];
-    for (const e of edges) {
-      const tx = Math.floor((e.fx + mapHalf) / TILE), ty = Math.floor((e.fz + mapHalf) / TILE);
-      if (inBounds(tx, ty) && grid[idx(tx, ty)] === TILE_ROAD && ROAD_TYPE_KEYS[roadType[idx(tx, ty)]] !== 'highway') {
-        // legacy Tile-grid road: keep the existing cardinal-only orientation exactly as before —
-        // rotationY stays 0, only frontSign (which cardinal wall gets the entrance) varies.
-        return { ok: true, frontSign: e.sign, rotationY: 0 };
-      }
-      const frontage = getRoadFrontage(network, e.fx, e.fz);
-      if (frontage) {
-        // Prompt 17 §7/8/9: align the building's real World Space rotation to the free
-        // RoadSegment's own frontage point (getRoadFrontage) — the entrance-side local axis
-        // (e.axis/e.sign, matching buildLotGroup's frontSign convention) is rotated so it points
-        // from the building's center straight at the road, letting the entrance face a curved or
-        // angled road exactly instead of only ever snapping to a cardinal direction.
-        const segment = network.segments.get(frontage.segmentId);
-        const localDirX = e.axis === 'x' ? e.sign : 0, localDirZ = e.axis === 'z' ? e.sign : 0;
-        const worldDirX = frontage.roadPoint.x - cx, worldDirZ = frontage.roadPoint.z - cz;
-        const rotationY = segment ? (Math.atan2(worldDirX, worldDirZ) - Math.atan2(localDirX, localDirZ)) : 0;
-        // Prompt 18 §2/§5/§6/§13: a free-road frontage point alone is no longer sufficient —
-        // Parcel is now the land Primary, so the Building's actual oriented footprint (at this
-        // rotation) must fully fit inside a real Parcel polygon (findParcelForFootprint) before
-        // this edge counts as valid frontage. If no Parcel contains it (e.g. the footprint would
-        // hang out past the frontage strip's own curve, or the only nearby Parcel is an
-        // unbuildable highway one — §10), try the next candidate edge instead of accepting it.
-        const parcel = findParcelForFootprint(buildingParcelRegistryRef.current, cx, cz, w, h, rotationY);
-        if (!parcel) continue;
-        return { ok: true, frontSign: e.sign, rotationY, parcel, viaFreeNetwork: true };
+
+    // 1) legacy Tile-grid road check first (unchanged priority/behavior from before this Prompt),
+    // just sampled along the whole edge instead of only its midpoint so a long edge that only
+    // partially overlaps a road Tile column still registers.
+    for (const e of edgeDefs) {
+      for (let i = 0; i <= FRONTAGE_EDGE_SAMPLES; i++) {
+        const t = i / FRONTAGE_EDGE_SAMPLES;
+        const fx = e.from.x + (e.to.x - e.from.x) * t, fz = e.from.z + (e.to.z - e.from.z) * t;
+        const tx = Math.floor((fx + mapHalf) / TILE), ty = Math.floor((fz + mapHalf) / TILE);
+        if (inBounds(tx, ty) && grid[idx(tx, ty)] === TILE_ROAD && ROAD_TYPE_KEYS[roadType[idx(tx, ty)]] !== 'highway') {
+          // legacy Tile-grid road: keep the existing cardinal-only orientation exactly as before —
+          // rotationY stays 0, only frontSign (which cardinal wall gets the entrance) varies.
+          return { ok: true, frontSign: e.sign, rotationY: 0 };
+        }
       }
     }
+
+    // 2) free (World Space) RoadSegment network — gather every sample point across all 4 edges
+    // that resolves to real (non-highway) road frontage, then try them ordered by how close each
+    // sample actually is to its nearest RoadSegment's paved edge (requirement #5: "最も有効な
+    // ordinary RoadSegment frontageを候補として選ぶ"). For each candidate, in order, compute the
+    // rotation that aligns this edge's outward normal at the road, then re-verify against the
+    // ACTUAL rotated OBB footprint via lotFootprintClear (requirement #9) and require it to fully
+    // resolve to a real Parcel via findParcelForFootprint (requirement #10/#11) before accepting —
+    // proximity alone never grants frontage (requirement #12).
+    const candidates = [];
+    for (const e of edgeDefs) {
+      for (let i = 0; i <= FRONTAGE_EDGE_SAMPLES; i++) {
+        const t = i / FRONTAGE_EDGE_SAMPLES;
+        const fx = e.from.x + (e.to.x - e.from.x) * t, fz = e.from.z + (e.to.z - e.from.z) * t;
+        const frontage = getRoadFrontage(network, fx, fz);
+        if (frontage) candidates.push({ edge: e, frontage });
+      }
+    }
+    candidates.sort((a, b) => a.frontage.distanceFromRoadEdge - b.frontage.distanceFromRoadEdge);
+    for (const cand of candidates) {
+      const { edge: e, frontage } = cand;
+      // Prompt 17 §7/8/9: align the building's real World Space rotation to the free RoadSegment's
+      // own frontage point — the entrance-side local axis (e.axis/e.sign, matching
+      // buildLotGroup's frontSign convention) is rotated so it points from the building's center
+      // straight at the road, letting the entrance face a curved or angled road exactly instead of
+      // only ever snapping to a cardinal direction.
+      const segment = network.segments.get(frontage.segmentId);
+      const localDirX = e.axis === 'x' ? e.sign : 0, localDirZ = e.axis === 'z' ? e.sign : 0;
+      const worldDirX = frontage.roadPoint.x - cx, worldDirZ = frontage.roadPoint.z - cz;
+      const rotationY = segment ? (Math.atan2(worldDirX, worldDirZ) - Math.atan2(localDirX, localDirZ)) : 0;
+      // requirement #9: re-check collision against the ACTUAL rotated OBB footprint, not the
+      // axis-aligned candidate box the sampling above used.
+      if (rotationY && !lotFootprintClear(cx, cz, w, h, rotationY)) continue;
+      // Prompt 18 §2/§5/§6/§13: a free-road frontage point alone is no longer sufficient — Parcel
+      // is now the land Primary, so the Building's actual oriented footprint (at this rotation)
+      // must fully fit inside a real Parcel polygon (findParcelForFootprint) before this candidate
+      // counts as valid frontage. If no Parcel contains it (e.g. the footprint would hang out past
+      // the frontage strip's own curve, or the only nearby Parcel is an unbuildable highway one —
+      // requirement #6), try the next candidate instead of accepting it.
+      const parcel = findParcelForFootprint(buildingParcelRegistryRef.current, cx, cz, w, h, rotationY);
+      if (!parcel) continue;
+      return { ok: true, frontSign: e.sign, rotationY, parcel, viaFreeNetwork: true };
+    }
     return { ok: false, frontSign: -1, rotationY: 0 };
-  }, []);
+  }, [lotFootprintClear]);
 
   // Terrace houses are always a single fixed 6m x 12m World Space unit. Given a drag anchor/cursor
   // (World Space points, not Tile coords), this tries BOTH possible orientations anchored at the
@@ -6306,7 +6576,14 @@ export default function CityGridIso() {
     function freeRoadMaterialFor(roadType) {
       const rt = ROAD_TYPES[roadType];
       if (!freeRoadMaterialCache[roadType]) {
-        freeRoadMaterialCache[roadType] = new THREE.MeshStandardMaterial({ color: rt.color, roughness: rt.unpaved ? 1 : 0.9 });
+        // Part A (Prompt 20A): replaces the old flat-color-only MeshStandardMaterial with the same
+        // kind of asphalt+lane-marking CanvasTexture every Tile road already uses (requirement #1,
+        // #6, #7, #8) — roadType color is baked INTO the texture itself (requirement #2), so
+        // `color` stays default white here and never re-tints the map.
+        freeRoadMaterialCache[roadType] = new THREE.MeshStandardMaterial({
+          map: makeAsphaltRibbonTexture(rt, roadType),
+          roughness: rt.unpaved ? 1 : 0.9,
+        });
       }
       return freeRoadMaterialCache[roadType];
     }
@@ -6328,15 +6605,184 @@ export default function CityGridIso() {
       // exists. Defensive: keeps both in sync even though no in-game tool calls this yet.
       rebuildRoadsideLandOverlay();
       rebuildBuildingParcelRegistry();
+      rebuildFreeRoadJunctionCaps(); // Part E: a removed segment may leave a node with <2 connections, drop its cap
+      rebuildFreeRoadSupportStructures(); // Part F/G/H: the removed segment's own pillars/embankment must go too
+    }
+    // Part A/B/C (Prompt 20C) — junction surfaces: a real paved-footprint fan polygon (see
+    // buildFreeRoadJunctionGeometry above), dropped at any free-network RoadNode with 2+
+    // connected segments. Two (or more) independently-built ribbons only ever meet EXACTLY at a
+    // shared node's centerline point, never along a rounded curb, so without this a multi-way
+    // Free Road junction shows a thin unpaved sliver/hole at the center (spec §6/§7 "中央に不自然
+    // な穴ができない" / "四方向接続でも穴が出ない"). Purely a visual fill — it carries no
+    // Simulation topology of its own (Part H: "simulation topologyと分離する"), it only ever
+    // reuses positions/widths already authored on real RoadSegments. No circle/disc/sphere
+    // geometry is used anywhere in here (Part A prohibition) — the shape IS the junction.
+    const freeRoadJunctionGroup = new THREE.Group();
+    freeRoadJunctionGroup.name = 'freeRoadJunctionGroup';
+    scene.add(freeRoadJunctionGroup);
+    function rebuildFreeRoadJunctionCaps() {
+      while (freeRoadJunctionGroup.children.length) {
+        const c = freeRoadJunctionGroup.children.pop();
+        c.geometry.dispose();
+      }
+      const network = roadNetworkRef.current;
+      network.nodes.forEach((node) => {
+        const built = buildFreeRoadJunctionGeometry(network, node);
+        if (!built) return;
+        const mesh = new THREE.Mesh(built.geo, freeRoadJunctionMaterialFor(built.roadType));
+        mesh.name = 'junctionsurface_' + node.id;
+        mesh.receiveShadow = true;
+        freeRoadJunctionGroup.add(mesh);
+      });
+    }
+
+    // ============================================================================
+    // Free Road Support Structures (Prompt 20C Part F/G/H) — pillars, retaining walls, and
+    // embankment fill under an elevated/cut Free Road, so raised road never simply floats and a
+    // cut road never reads as detached from the terrain around it.
+    //
+    // Part H: this is a VISUAL/support layer only. It is rebuilt purely by resampling already-
+    // placed RoadSegments (position/width/elevation) — it is never written back onto the
+    // RoadSegment objects themselves and never consulted by Vehicle/Pedestrian/Citizen/Economy
+    // code, so none of that simulation topology is touched by any of this.
+    // ============================================================================
+    const ROAD_SUPPORT_MIN_CLEARANCE = 0.6;  // below this gap, road reads as "on the ground", no structure at all
+    const ROAD_EMBANKMENT_MAX_HEIGHT = 2.5;  // up to this gap: earth embankment / retaining wall (Part G)
+    const ROAD_SUPPORT_PILLAR_SPACING = 9;   // world units between pillar clusters on a tall viaduct (Part F)
+    const ROAD_DECK_THICKNESS = 0.35;        // visual-only slab thickness the support reaches up to
+    const ROAD_WIDE_SUPPORT_THRESHOLD = 9;   // getRoadWidth() at/above this gets 4 pillars instead of 2
+    const freeRoadSupportGroup = new THREE.Group();
+    freeRoadSupportGroup.name = 'freeRoadSupportGroup';
+    scene.add(freeRoadSupportGroup);
+    const freeRoadPillarMat = new THREE.MeshStandardMaterial({ color: 0x9a9a92, roughness: 0.85 });
+    const freeRoadEmbankmentMat = new THREE.MeshStandardMaterial({ color: 0x8f8a7c, roughness: 0.95, side: THREE.DoubleSide });
+    function pushSupportQuad(positions, p1, p2, p3, p4) {
+      positions.push(p1.x, p1.y, p1.z, p2.x, p2.y, p2.z, p3.x, p3.y, p3.z);
+      positions.push(p1.x, p1.y, p1.z, p3.x, p3.y, p3.z, p4.x, p4.y, p4.z);
+    }
+    // Part G — one embankment/retaining-wall "shell" spanning from sample A to sample B: side
+    // walls that run from the terrain's OWN height (so a sloping hillside is followed, not
+    // flattened) up to the road's underside, plus a start/end cap so the shell reads as solid
+    // fill rather than an open trough. This is deliberately the low-height case ONLY (Part G:
+    // "巨大な橋脚にする必要はない" — no need for full bridge piers under a modest grade change).
+    function addEmbankmentSpan(A, B, halfW) {
+      const yUA = A.p.y - ROAD_DECK_THICKNESS, yUB = B.p.y - ROAD_DECK_THICKNESS;
+      const aL = { x: A.p.x + A.n.x * halfW, y: A.terrainY, z: A.p.z + A.n.z * halfW };
+      const aLt = { x: aL.x, y: yUA, z: aL.z };
+      const aR = { x: A.p.x - A.n.x * halfW, y: A.terrainY, z: A.p.z - A.n.z * halfW };
+      const aRt = { x: aR.x, y: yUA, z: aR.z };
+      const bL = { x: B.p.x + B.n.x * halfW, y: B.terrainY, z: B.p.z + B.n.z * halfW };
+      const bLt = { x: bL.x, y: yUB, z: bL.z };
+      const bR = { x: B.p.x - B.n.x * halfW, y: B.terrainY, z: B.p.z - B.n.z * halfW };
+      const bRt = { x: bR.x, y: yUB, z: bR.z };
+      const positions = [];
+      pushSupportQuad(positions, aL, bL, bLt, aLt); // left retaining wall
+      pushSupportQuad(positions, bR, aR, aRt, bRt); // right retaining wall
+      pushSupportQuad(positions, aR, aL, aLt, aRt); // start end-cap
+      pushSupportQuad(positions, bL, bR, bRt, bLt); // end end-cap
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+      geo.computeVertexNormals();
+      const mesh = new THREE.Mesh(geo, freeRoadEmbankmentMat);
+      mesh.receiveShadow = true;
+      freeRoadSupportGroup.add(mesh);
+    }
+    // Part F — a cluster of concrete support pillars (real column geometry, not a hole-filling
+    // disc — the Part A prohibition is specifically about junction-cap infill, an actual bridge
+    // pier is exactly what a cylinder is for) reaching from the terrain up to the road's
+    // underside, spaced along the segment (ROAD_SUPPORT_PILLAR_SPACING) once clearance is tall
+    // enough that an embankment stops being a sensible amount of fill (Part F: "低い高架: 2本柱 /
+    // 広い道路: 4本程度").
+    function addPillarCluster(pt, halfW, segment) {
+      const underside = pt.p.y - ROAD_DECK_THICKNESS;
+      const height = Math.max(0.3, underside - pt.terrainY);
+      const wide = getRoadWidth(segment) >= ROAD_WIDE_SUPPORT_THRESHOLD;
+      const offsets = wide ? [-halfW * 0.72, -halfW * 0.24, halfW * 0.24, halfW * 0.72] : [-halfW * 0.55, halfW * 0.55];
+      const radius = wide ? 0.42 : 0.32;
+      offsets.forEach((off) => {
+        const cx = pt.p.x + pt.n.x * off, cz = pt.p.z + pt.n.z * off;
+        const geo = new THREE.CylinderGeometry(radius, radius * 1.2, height, 8);
+        const mesh = new THREE.Mesh(geo, freeRoadPillarMat);
+        mesh.position.set(cx, pt.terrainY + height / 2, cz);
+        mesh.castShadow = true;
+        mesh.receiveShadow = true;
+        freeRoadSupportGroup.add(mesh);
+      });
+    }
+    // Part I — samples ONE RoadSegment's already-authored curve/elevation (never re-deriving a
+    // separate support-only shape) and, per interval, picks embankment vs. pillars vs. nothing
+    // purely from how far the road surface sits above the terrain sample directly under it.
+    // Cut (elevationOffset < 0) sections are left alone — Part I explicitly treats those as
+    // "road below terrain", already visually grounded, needing no separate structure.
+    function buildFreeRoadSupportForSegment(network, segment) {
+      const SAMPLE_N = 16;
+      const halfW = getRoadWidth(segment) / 2;
+      const pts = [];
+      let cum = 0, prev = null;
+      for (let i = 0; i <= SAMPLE_N; i++) {
+        const t = i / SAMPLE_N;
+        const p = getRoadPoint(network, segment, t);
+        const n = getRoadNormal(network, segment, t);
+        const terrainY = terrainHeight(p.x, p.z);
+        if (prev) cum += Math.hypot(p.x - prev.x, p.z - prev.z);
+        pts.push({ p, n, terrainY, s: cum });
+        prev = p;
+      }
+      for (let i = 0; i < SAMPLE_N; i++) {
+        const A = pts[i], B = pts[i + 1];
+        const clearMid = ((A.p.y - A.terrainY) + (B.p.y - B.terrainY)) / 2;
+        if (clearMid > ROAD_SUPPORT_MIN_CLEARANCE && clearMid <= ROAD_EMBANKMENT_MAX_HEIGHT) {
+          addEmbankmentSpan(A, B, halfW);
+        }
+      }
+      let lastPillarS = -Infinity;
+      pts.forEach((pt) => {
+        const clearance = pt.p.y - pt.terrainY;
+        if (clearance > ROAD_EMBANKMENT_MAX_HEIGHT && pt.s - lastPillarS >= ROAD_SUPPORT_PILLAR_SPACING) {
+          addPillarCluster(pt, halfW, segment);
+          lastPillarS = pt.s;
+        }
+      });
+    }
+    function rebuildFreeRoadSupportStructures() {
+      while (freeRoadSupportGroup.children.length) {
+        const c = freeRoadSupportGroup.children.pop();
+        c.geometry.dispose();
+      }
+      const network = roadNetworkRef.current;
+      network.segments.forEach((segment) => buildFreeRoadSupportForSegment(network, segment));
+    }
+    // Part A/B (Prompt 20C) — flat, unmarked fill material for the junction surface itself
+    // (no lane-paint texture): a real intersection's paved center doesn't carry a through-lane
+    // dash pattern either way, and sampling the striped ribbon texture at a single UV point
+    // across an irregular fan polygon would just smear one arbitrary stripe across the whole
+    // junction. Colour still matches the connected road type's own asphalt tone.
+    const freeRoadJunctionMaterialCache = {};
+    function freeRoadJunctionMaterialFor(roadType) {
+      const rt = ROAD_TYPES[roadType];
+      if (!freeRoadJunctionMaterialCache[roadType]) {
+        freeRoadJunctionMaterialCache[roadType] = new THREE.MeshStandardMaterial({
+          color: rt.color,
+          roughness: rt.unpaved ? 1 : 0.9,
+        });
+      }
+      return freeRoadJunctionMaterialCache[roadType];
     }
     // Preview group: the in-progress draft (start marker + live curve ribbon) while the
     // 'freeroad' tool is drawing. Rebuilt every pointer-move / K,L,O,M press, never persisted.
     const freeRoadPreviewGroup = new THREE.Group();
     freeRoadPreviewGroup.name = 'freeRoadPreviewGroup';
     scene.add(freeRoadPreviewGroup);
+    // Part A/D — preview tint communicates draw state at a glance (spec Part A §8 "HUD/preview上で
+    // 直角スナップ中であることが分かるように", Part D §14 invalid feedback): default blue, a
+    // brighter green once an angle-snap or an existing-RoadNode snap is engaged, red the instant
+    // the current drag would overlap an existing road's paved footprint (never actually built).
     const freeRoadPreviewMat = new THREE.MeshBasicMaterial({ color: 0x6ad0ff, transparent: true, opacity: 0.55, depthWrite: false });
+    const freeRoadPreviewSnappedMat = new THREE.MeshBasicMaterial({ color: 0x7dffa6, transparent: true, opacity: 0.6, depthWrite: false });
+    const freeRoadPreviewInvalidMat = new THREE.MeshBasicMaterial({ color: 0xff5252, transparent: true, opacity: 0.6, depthWrite: false });
     const freeRoadNodeMarkerGeo = new THREE.SphereGeometry(TILE * 0.18, 12, 10);
     const freeRoadNodeMarkerMat = new THREE.MeshBasicMaterial({ color: 0x6ad0ff });
+    const freeRoadNodeMarkerSnappedMat = new THREE.MeshBasicMaterial({ color: 0x7dffa6 });
     function clearFreeRoadPreview() {
       while (freeRoadPreviewGroup.children.length) {
         const c = freeRoadPreviewGroup.children.pop();
@@ -6348,32 +6794,123 @@ export default function CityGridIso() {
     // -- draft lifecycle: start / update / curve+elevation adjust / finalize / cancel --
     // Curve is expressed as a signed "bend" in world units: the quadratic-bezier control point is
     // placed at the segment midpoint, offset sideways (along the midpoint's perpendicular) by
-    // `bend`. bend=0 is a perfectly straight segment (curve:null).
+    // `bend`. bend=0 is a perfectly straight segment (curve:null) UNLESS this draft is chaining off
+    // a previous RoadNode with a usable tangent — see computeDraftCurve below (Part B).
     const FREE_ROAD_CURVE_STEP = TILE * 0.35;
     const FREE_ROAD_CURVE_MAX = TILE * 6;
     const FREE_ROAD_ELEV_STEP = 0.5;
-    const FREE_ROAD_ELEV_MAX = 12;
+    // Part D (Prompt 20C) — a game-world-plausible elevation band instead of the old flat ±12,
+    // asymmetric because "8m up" (a modest viaduct) and "12m down" read very differently: a road
+    // cut 12m INTO the ground has no sensible in-game meaning, whereas an 8m-high elevated road
+    // is an ordinary viaduct. ROAD_Y itself is still always `terrainHeight + elevationOffset`
+    // (see _roadElevationY) — these two constants just bound how far elevationOffset may stray
+    // from 0, they never detach the road from the terrain sample under it.
+    const FREE_ROAD_ELEV_MAX_ABOVE = 8;   // meters above local terrain a Free Road may rise to
+    const FREE_ROAD_ELEV_MAX_BELOW = -2;  // meters a Free Road may cut below local terrain
+    // Part E — maximum road grade (rise / horizontal run) a single Free Road segment may take
+    // between its own start and end elevation. Without this, O/M (or a long drag ending over
+    // very different terrain) could ask for the full ±8m swing over a couple of meters of
+    // horizontal length — an instant near-vertical wall, not a road. 9% is a steep-but-real-world
+    // grade (comparable to a demanding mountain highway), used as the ceiling in both directions.
+    const MAX_ROAD_GRADE = 0.09;
+    // Given the draft's OWN current start/end horizontal distance, clamps a candidate elevation
+    // offset to: (1) the absolute above/below-ground band, AND (2) whatever offset keeps the
+    // start->end grade under MAX_ROAD_GRADE. Rather than rejecting the whole edit outright, this
+    // silently holds the elevation at the steepest grade still allowed — the endpoint position
+    // itself is never moved, only how high its road surface is asked to sit (spec Part E: "高さ
+    // 変更を拒否" — reject/clamp the height change, not the drawn geometry).
+    function clampFreeRoadElevationForDraft(d, candidateElev) {
+      let e = Math.max(FREE_ROAD_ELEV_MAX_BELOW, Math.min(FREE_ROAD_ELEV_MAX_ABOVE, candidateElev));
+      const len = Math.hypot(d.endPreviewPos.x - d.startPos.x, d.endPreviewPos.z - d.startPos.z);
+      if (len > 0.01) {
+        const startY = terrainHeight(d.startPos.x, d.startPos.z) + d.startElevation;
+        const endTerrainY = terrainHeight(d.endPreviewPos.x, d.endPreviewPos.z);
+        const maxRise = len * MAX_ROAD_GRADE;
+        const rise = (endTerrainY + e) - startY;
+        if (rise > maxRise) e = (startY + maxRise) - endTerrainY;
+        else if (rise < -maxRise) e = (startY - maxRise) - endTerrainY;
+        e = Math.max(FREE_ROAD_ELEV_MAX_BELOW, Math.min(FREE_ROAD_ELEV_MAX_ABOVE, e));
+      }
+      return e;
+    }
+    // Part B (§9-12) — given a RoadNode id, looks at the most recently connected RoadSegment at
+    // that node (Free OR Tile-derived — roadGraphRef.current is the already-unified graph) and
+    // returns: the outgoing tangent direction to continue smoothly in, and — when that segment
+    // itself was a curve — the exact quadratic-bezier control point MIRRORED about the shared node.
+    // Using the mirrored point directly as the new segment's own control point is the standard
+    // construction for an exactly tangent-continuous ("C1") chain of quadratic beziers, so two
+    // curved Free Road segments meeting at a node read as one smooth flowing curve, never a
+    // "two boards glued at a corner" kink (spec Part E §1 target).
+    function getNodeChainInfo(nodeId) {
+      const graph = roadGraphRef.current;
+      const n = graph.nodes.get(nodeId);
+      if (!n) return { nodeId, position: null, tangent: null, mirrorControl: null };
+      const ids = n.connectedSegmentIds || [];
+      const segId = ids.length ? ids[ids.length - 1] : null;
+      const seg = segId ? graph.segments.get(segId) : null;
+      if (!seg) return { nodeId, position: n.position, tangent: null, mirrorControl: null };
+      const isEnd = seg.endNodeId === nodeId;
+      const tan = getRoadTangent(graph, seg, isEnd ? 1 : 0);
+      const dirSign = isEnd ? 1 : -1; // continuing FORWARD past this node, regardless of which end of `seg` it is
+      const tangent = { x: tan.x * dirSign, z: tan.z * dirSign };
+      let mirrorControl = null;
+      if (isEnd && seg.curve && seg.curve.controlPoint) {
+        mirrorControl = {
+          x: 2 * n.position.x - seg.curve.controlPoint.x, y: n.position.y,
+          z: 2 * n.position.z - seg.curve.controlPoint.z,
+        };
+      }
+      return { nodeId, position: n.position, tangent, mirrorControl };
+    }
+    // Resolves the actual curve (or null = straight) for the segment a draft currently describes.
+    // Priority: (1) an explicit K/L bend the player dialed in always wins outright; (2) otherwise,
+    // if this draft is NOT an explicit right-angle turn (spec §12 — an orthogonal-snapped turn is
+    // allowed to stay a sharp junction) and it inherited a chain tangent, auto-curve to stay
+    // tangent-continuous with the previous segment (mirrored control point if the previous segment
+    // was itself curved, or a gentle bend toward that tangent otherwise); (3) plain straight line.
+    function computeDraftCurve(d) {
+      const dx = d.endPreviewPos.x - d.startPos.x, dz = d.endPreviewPos.z - d.startPos.z;
+      const len = Math.hypot(dx, dz) || 1;
+      if (Math.abs(d.curveBend) > 1e-4) {
+        const mx = (d.startPos.x + d.endPreviewPos.x) / 2, mz = (d.startPos.z + d.endPreviewPos.z) / 2;
+        const nx = -dz / len, nz = dx / len;
+        return { controlPoint: { x: mx + nx * d.curveBend, y: 0, z: mz + nz * d.curveBend } };
+      }
+      if (!d.isAngleSnapped && d.chainTangent) {
+        if (d.chainMirrorControl) return { controlPoint: d.chainMirrorControl };
+        const tanLen = Math.hypot(d.chainTangent.x, d.chainTangent.z) || 1;
+        const tx = d.chainTangent.x / tanLen, tz = d.chainTangent.z / tanLen;
+        const drawAngle = Math.atan2(dz, dx), tanAngle = Math.atan2(tz, tx);
+        let diff = ((drawAngle - tanAngle + Math.PI * 3) % (Math.PI * 2)) - Math.PI;
+        // only bend automatically when the drawn direction is close-but-not-identical to the
+        // inherited tangent (identical needs no curve; wildly different is a deliberate new turn
+        // the player should shape themselves with K/L, not something to silently curve for them)
+        if (Math.abs(diff) > 1e-3 && Math.abs(diff) < Math.PI * 0.5) {
+          const controlDist = len * 0.5;
+          return { controlPoint: { x: d.startPos.x + tx * controlDist, y: 0, z: d.startPos.z + tz * controlDist } };
+        }
+      }
+      return null;
+    }
     function draftPreviewSegment() {
       const d = freeRoadDraftRef.current;
       if (!d) return null;
       // Build a throwaway network containing just the two draft-preview nodes, so the SAME
       // getRoadPoint/getRoadTangent/getRoadNormal/buildRoadSegmentGeometry used for real,
       // finalized segments also drives the live preview — no separate preview-only math to drift.
+      // When either end is already snapped onto a real RoadNode, its REAL id/position is used here
+      // (not a throwaway 'draft_start'/'draft_end' id) so the live overlap check below recognizes
+      // it as an intentional shared junction, not a false-positive overlap against itself.
       const previewNet = { nodes: new Map(), segments: new Map(), intersections: new Map() };
-      const startNode = { id: 'draft_start', position: d.startPos, connectedSegmentIds: [] };
-      const endNode = { id: 'draft_end', position: d.endPreviewPos, connectedSegmentIds: [] };
+      const startId = d.startNodeId || 'draft_start';
+      const endId = (d.endSnapNodeId && d.endSnapNodeId !== startId) ? d.endSnapNodeId : 'draft_end';
+      const startNode = { id: startId, position: d.startPos, connectedSegmentIds: [] };
+      const endNode = { id: endId, position: d.endPreviewPos, connectedSegmentIds: [] };
       previewNet.nodes.set(startNode.id, startNode);
       previewNet.nodes.set(endNode.id, endNode);
-      const mx = (d.startPos.x + d.endPreviewPos.x) / 2, mz = (d.startPos.z + d.endPreviewPos.z) / 2;
-      const dx = d.endPreviewPos.x - d.startPos.x, dz = d.endPreviewPos.z - d.startPos.z;
-      const len = Math.hypot(dx, dz) || 1;
-      const nx = -dz / len, nz = dx / len;
-      const curve = Math.abs(d.curveBend) > 1e-4
-        ? { controlPoint: { x: mx + nx * d.curveBend, y: 0, z: mz + nz * d.curveBend } }
-        : null;
-      const segment = makeRoadSegment('draft_start', 'draft_end', {
+      const segment = makeRoadSegment(startId, endId, {
         roadType: freeRoadTypeRef.current,
-        curve,
+        curve: computeDraftCurve(d),
         elevation: { start: d.startElevation, end: d.elevationOffset },
       });
       return { network: previewNet, segment };
@@ -6382,32 +6919,91 @@ export default function CityGridIso() {
       clearFreeRoadPreview();
       const d = freeRoadDraftRef.current;
       if (!d) return;
-      const startMarker = new THREE.Mesh(freeRoadNodeMarkerGeo, freeRoadNodeMarkerMat);
+      const startMat = d.startNodeId ? freeRoadNodeMarkerSnappedMat : freeRoadNodeMarkerMat;
+      const startMarker = new THREE.Mesh(freeRoadNodeMarkerGeo, startMat);
       startMarker.position.set(d.startPos.x, d.startPos.y + 0.2, d.startPos.z);
       freeRoadPreviewGroup.add(startMarker);
       const dist = Math.hypot(d.endPreviewPos.x - d.startPos.x, d.endPreviewPos.z - d.startPos.z);
-      if (dist < 0.05) return; // avoid degenerate zero-length preview geometry
+      if (dist < 0.05) { d.invalid = false; return; } // avoid degenerate zero-length preview geometry
       const { network, segment } = draftPreviewSegment();
+      // Part D — live overlap feedback while dragging, using the SAME check finalize enforces, so
+      // what the player sees red is exactly what would be rejected on click (spec §14).
+      d.invalid = checkFreeRoadSegmentOverlap(network, segment, roadGraphRef.current).overlapping;
       const geo = buildRoadSegmentGeometry(network, segment, 24);
-      const ribbon = new THREE.Mesh(geo, freeRoadPreviewMat);
+      const mat = d.invalid ? freeRoadPreviewInvalidMat : (d.isAngleSnapped || d.endSnapNodeId) ? freeRoadPreviewSnappedMat : freeRoadPreviewMat;
+      const ribbon = new THREE.Mesh(geo, mat);
       freeRoadPreviewGroup.add(ribbon);
+      if (d.endSnapNodeId) {
+        const endMarker = new THREE.Mesh(freeRoadNodeMarkerGeo, freeRoadNodeMarkerSnappedMat);
+        endMarker.position.set(d.endPreviewPos.x, d.endPreviewPos.y + 0.2, d.endPreviewPos.z);
+        freeRoadPreviewGroup.add(endMarker);
+      }
     }
-    function startFreeRoadDraft(point) {
-      const y = terrainHeight(point.x, point.z);
+    // chainInfo (Part B): passed internally by finalizeFreeRoadDraft's own chain-continue call —
+    // { nodeId, position, tangent, mirrorControl } straight from getNodeChainInfo() for the
+    // segment's own just-placed end node. A fresh user click (chainInfo omitted) instead tries an
+    // ordinary distance snap onto any existing RoadNode (Part C), inheriting that node's own chain
+    // info too if it already has a road (e.g. starting a Free Road off an existing Tile road end).
+    function startFreeRoadDraft(point, chainInfo = null) {
+      const prevElevation = freeRoadDraftRef.current ? freeRoadDraftRef.current.elevationOffset : 0;
+      let startNodeId = null, startPos, chainTangent = null, chainMirrorControl = null;
+      if (chainInfo && chainInfo.position) {
+        startNodeId = chainInfo.nodeId;
+        startPos = { x: chainInfo.position.x, y: chainInfo.position.y, z: chainInfo.position.z };
+        chainTangent = chainInfo.tangent;
+        chainMirrorControl = chainInfo.mirrorControl;
+      } else {
+        const snap = findGraphNodeNear(point.x, point.z, FREE_ROAD_SNAP_DIST);
+        if (snap) {
+          startNodeId = snap.id;
+          startPos = { x: snap.position.x, y: snap.position.y, z: snap.position.z };
+          const info = getNodeChainInfo(snap.id);
+          chainTangent = info.tangent;
+          chainMirrorControl = info.mirrorControl;
+        } else {
+          startPos = { x: point.x, y: terrainHeight(point.x, point.z), z: point.z };
+        }
+      }
       freeRoadDraftRef.current = {
-        startPos: { x: point.x, y, z: point.z },
-        startElevation: freeRoadDraftRef.current ? freeRoadDraftRef.current.elevationOffset : 0, // chain: continue from previous end height
-        endPreviewPos: { x: point.x, y, z: point.z },
+        startPos,
+        startNodeId, // exact RoadNode id this draft starts from, or null = will mint a fresh node
+        startElevation: prevElevation, // chain: continue from previous end height
+        endPreviewPos: { x: startPos.x, y: startPos.y, z: startPos.z },
+        endSnapNodeId: null,
         curveBend: 0,
-        elevationOffset: freeRoadDraftRef.current ? freeRoadDraftRef.current.elevationOffset : 0,
+        elevationOffset: prevElevation,
+        isAngleSnapped: false,
+        chainTangent, chainMirrorControl,
+        invalid: false,
       };
       updateFreeRoadPreview();
     }
-    function updateFreeRoadDraftEnd(point) {
+    // Part A/C — freeAngle (held modifier, e.g. Shift) bypasses the orthogonal snap entirely for a
+    // fully free diagonal drag. Returns a small status object so the React layer can mirror
+    // snap/invalid state into the HUD without re-deriving any of this math itself.
+    function updateFreeRoadDraftEnd(point, freeAngle = false) {
       const d = freeRoadDraftRef.current;
-      if (!d) return;
-      d.endPreviewPos = { x: point.x, y: terrainHeight(point.x, point.z), z: point.z };
+      if (!d) return null;
+      const snapped = computeOrthogonalSnappedPoint(d.startPos.x, d.startPos.z, point.x, point.z, freeAngle);
+      d.isAngleSnapped = snapped.snapped;
+      // Part C — endpoint-snap onto any existing RoadNode (Tile-derived or Free) within range;
+      // snapping to the node's EXACT stored position (not the raw cursor point) is what removes
+      // the float-rounding micro-gap the spec calls out (§6/§13).
+      const endSnap = findGraphNodeNear(snapped.x, snapped.z, FREE_ROAD_SNAP_DIST);
+      if (endSnap && endSnap.id !== d.startNodeId) {
+        d.endSnapNodeId = endSnap.id;
+        d.endPreviewPos = { x: endSnap.position.x, y: endSnap.position.y, z: endSnap.position.z };
+      } else {
+        d.endSnapNodeId = null;
+        d.endPreviewPos = { x: snapped.x, y: terrainHeight(snapped.x, snapped.z), z: snapped.z };
+      }
+      // Part E — the endpoint (and therefore the segment's horizontal length) just moved, so an
+      // elevationOffset that was previously within the max-grade limit might not be anymore;
+      // reclamp against the CURRENT length every time the draft's far end changes, not only when
+      // O/M is pressed, so dragging can never silently leave a too-steep offset in place.
+      d.elevationOffset = clampFreeRoadElevationForDraft(d, d.elevationOffset);
       updateFreeRoadPreview();
+      return { isAngleSnapped: d.isAngleSnapped, isNodeSnapped: !!d.endSnapNodeId, invalid: !!d.invalid };
     }
     function adjustFreeRoadCurve(sign) {
       const d = freeRoadDraftRef.current;
@@ -6418,7 +7014,10 @@ export default function CityGridIso() {
     function adjustFreeRoadElevation(sign) {
       const d = freeRoadDraftRef.current;
       if (!d) return;
-      d.elevationOffset = Math.max(-FREE_ROAD_ELEV_MAX, Math.min(FREE_ROAD_ELEV_MAX, d.elevationOffset + sign * FREE_ROAD_ELEV_STEP));
+      // Part D (band) + Part E (grade) both enforced in one place — see
+      // clampFreeRoadElevationForDraft. Pressing O/M past either limit simply stops moving
+      // (Test 4/6: "それ以上上がらない/下がらない"), it never wraps or overshoots.
+      d.elevationOffset = clampFreeRoadElevationForDraft(d, d.elevationOffset + sign * FREE_ROAD_ELEV_STEP);
       updateFreeRoadPreview();
     }
     function finalizeFreeRoadDraft() {
@@ -6427,38 +7026,63 @@ export default function CityGridIso() {
       const dist = Math.hypot(d.endPreviewPos.x - d.startPos.x, d.endPreviewPos.z - d.startPos.z);
       if (dist < 0.05) { cancelFreeRoadDraft(); return; } // ignore an accidental zero-length click
       const network = roadNetworkRef.current;
-      // Prompt 15 (requirement #14 "外部流入車もFree Roadへ接続できる設計にする"): snap each
-      // endpoint onto an already-connected RoadNode — Tile-grid OR another Free Road segment — if
-      // one sits close enough, instead of always minting a brand-new, disconnected node. This is
-      // what actually lets a car ROUTE from the Tile road network onto a Free Road and back,
-      // rather than the two systems merely occupying the same World Space unconnected.
-      const snapStart = findGraphNodeNear(d.startPos.x, d.startPos.z, FREE_ROAD_SNAP_DIST);
-      const snapEnd = findGraphNodeNear(d.endPreviewPos.x, d.endPreviewPos.z, FREE_ROAD_SNAP_DIST);
-      const startNode = snapStart || addRoadNodeToNetwork(network, makeRoadNode(d.startPos.x, d.startPos.y, d.startPos.z));
-      const endNode = snapEnd || addRoadNodeToNetwork(network, makeRoadNode(d.endPreviewPos.x, d.endPreviewPos.y, d.endPreviewPos.z));
-      const mx = (d.startPos.x + d.endPreviewPos.x) / 2, mz = (d.startPos.z + d.endPreviewPos.z) / 2;
-      const dx = d.endPreviewPos.x - d.startPos.x, dz = d.endPreviewPos.z - d.startPos.z;
-      const len = Math.hypot(dx, dz) || 1;
-      const nx = -dz / len, nz = dx / len;
-      const curve = Math.abs(d.curveBend) > 1e-4
-        ? { controlPoint: { x: mx + nx * d.curveBend, y: 0, z: mz + nz * d.curveBend } }
-        : null;
-      const segment = addRoadSegmentToNetwork(network, makeRoadSegment(startNode.id, endNode.id, {
+      const graph = roadGraphRef.current;
+      // Part B/C — resolve each endpoint to an EXACT already-known RoadNode id whenever the live
+      // draft already found one this frame (chained start, or a Part-C snap on either end), rather
+      // than re-deriving by distance here — removes any float-rounding gap at the joint (spec
+      // §6/§13) and guarantees the next chained draft (below) shares the identical node. Only
+      // falls back to a fresh distance search / minting a brand-new node when nothing was live-
+      // resolved (e.g. Escape/tool-switch edge cases reusing this path indirectly never happens,
+      // but keeps this function safe to call defensively).
+      const startNode = (d.startNodeId && graph.nodes.get(d.startNodeId))
+        || findGraphNodeNear(d.startPos.x, d.startPos.z, FREE_ROAD_SNAP_DIST)
+        || addRoadNodeToNetwork(network, makeRoadNode(d.startPos.x, d.startPos.y, d.startPos.z));
+      const endNode = (d.endSnapNodeId && graph.nodes.get(d.endSnapNodeId))
+        || findGraphNodeNear(d.endPreviewPos.x, d.endPreviewPos.z, FREE_ROAD_SNAP_DIST)
+        || addRoadNodeToNetwork(network, makeRoadNode(d.endPreviewPos.x, d.endPreviewPos.y, d.endPreviewPos.z));
+      if (startNode.id === endNode.id) { cancelFreeRoadDraft(); return; } // snapped onto the same node at both ends
+      // A node borrowed from the unified graph (Tile-derived, or an already-placed Free segment)
+      // may not be registered in the free network's OWN node map yet — register it now so this
+      // segment's addRoadSegmentToNetwork call below can push its connectedSegmentIds correctly.
+      if (!network.nodes.has(startNode.id)) addRoadNodeToNetwork(network, startNode);
+      if (!network.nodes.has(endNode.id)) addRoadNodeToNetwork(network, endNode);
+      const candidateSegment = makeRoadSegment(startNode.id, endNode.id, {
         roadType: freeRoadTypeRef.current,
-        curve,
+        curve: computeDraftCurve(d),
         elevation: { start: d.startElevation, end: d.elevationOffset },
-      }));
+      });
+      // Part D — reject BEFORE mutating the real network if the candidate's paved footprint
+      // overlaps an existing Free OR Tile-derived RoadSegment (Test 9/10/11). An intentional
+      // junction connection at a shared node stays allowed — see checkFreeRoadSegmentOverlap's own
+      // node-exclusion handling (Test 12).
+      const checkNet = { nodes: new Map([[startNode.id, startNode], [endNode.id, endNode]]), segments: new Map(), intersections: new Map() };
+      const overlap = checkFreeRoadSegmentOverlap(checkNet, candidateSegment, graph);
+      if (overlap.overlapping) {
+        // §14/§15: existing roads are left completely untouched, no cost is taken, and the draft
+        // is NOT cleared — the player can keep dragging to find a valid path, or hit Escape.
+        d.invalid = true;
+        updateFreeRoadPreview();
+        return;
+      }
+      const segment = addRoadSegmentToNetwork(network, candidateSegment);
       rebuildFreeRoadSegmentMesh(segment);
+      rebuildFreeRoadJunctionCaps();
+      rebuildFreeRoadSupportStructures(); // Part F/G/H: pillars/embankment for the newly placed segment
       rebuildRoadsideLandOverlay();
       rebuildBuildingParcelRegistry(); // Prompt 18: keep Building Placement Parcels in sync too
+      // Part 20E Part E: a Free Road segment can itself be drawn with roadType 'highway' — recompute
+      // gates right away so a player-extended Highway reaching the map boundary is immediately a
+      // valid external entry point, not only after the next unrelated Tile edit.
+      highwayGatesRef.current = computeHighwayGates();
       // Rebuild the unified traffic graph immediately (rather than waiting for the next Tile
       // edit's recomputeConnectivity call) so this segment — and any snap connection it just
       // made onto the Tile network — is drivable the instant it's placed (requirement: a car can
       // actually follow a freshly-drawn Free Road, not just see it rendered).
       roadGraphRef.current = buildRoadGraphFromGrid();
-      // Chain: immediately continue drawing from the just-placed end node, like the existing
-      // drag-to-paint tile road tools — Escape (or switching tool) stops the chain.
-      startFreeRoadDraft(d.endPreviewPos);
+      // Part B — chain: continue from the segment's OWN just-placed end node, passing its exact
+      // id/position/tangent so the next draft starts glued to this one with no gap and (when not
+      // overridden by an angle-snap or manual K/L bend) continues tangent-smoothly from it.
+      startFreeRoadDraft(d.endPreviewPos, getNodeChainInfo(endNode.id));
     }
     function cancelFreeRoadDraft() {
       freeRoadDraftRef.current = null;
@@ -6916,7 +7540,8 @@ export default function CityGridIso() {
       vehicleKinds, wheelMesh, allChassisMeshes, crashMesh,
       pedBodyMeshes, pedHeadMesh, pedColorsLen: pedColors.length,
       // Free Road Network (World Space, Prompt 3) — see the block above raycaster setup.
-      freeRoadGroup, freeRoadPreviewGroup, rebuildFreeRoadSegmentMesh, removeFreeRoadSegmentMesh,
+      freeRoadGroup, freeRoadPreviewGroup, freeRoadJunctionGroup, freeRoadSupportGroup, rebuildFreeRoadSegmentMesh, removeFreeRoadSegmentMesh,
+      rebuildFreeRoadJunctionCaps, rebuildFreeRoadSupportStructures,
       startFreeRoadDraft, updateFreeRoadDraftEnd, adjustFreeRoadCurve, adjustFreeRoadElevation,
       finalizeFreeRoadDraft, cancelFreeRoadDraft,
       // Roadside Land / Parcel overlay (Prompt 4).
@@ -7207,31 +7832,56 @@ export default function CityGridIso() {
     // disable frustum culling on all of them and let the GPU do per-triangle clipping instead.
     scene.traverse((o) => { if (o.isInstancedMesh) o.frustumCulled = false; });
 
-    // ---- initial external highway connection (【追加仕様】 #2/#12) ----
+    // ---- initial external highway connection (Prompt 20E — Native Free Road Network) ----
     // The game never starts on a blank map: a highway already runs in from the west map edge,
-    // standing in for "an outside city is out there", plus a short ordinary-road stub (a minimal
-    // IC/interchange — see requirement #10) so the player has something real to extend their own
-    // road network from on turn one, instead of laying every road themselves from nothing.
-    // Only done once, on first mount — gridRef starts as an all-TILE_EMPTY Uint8Array, so this
-    // simply seeds a few tiles before the very first recomputeConnectivity()/syncInstances() below.
+    // standing in for "an outside city is out there", plus a short ordinary-road IC stub so the
+    // player has something real to extend their own road network from on turn one. Per Prompt
+    // 20E this is authored DIRECTLY on the World Space Free Road Network (roadNetworkRef) using
+    // the exact same RoadNode/RoadSegment primitives (makeRoadNode/makeRoadSegment/
+    // addRoadNodeToNetwork/addRoadSegmentToNetwork) and the exact same rendering pipeline
+    // (rebuildFreeRoadSegmentMesh / rebuildFreeRoadJunctionCaps / rebuildFreeRoadSupportStructures
+    // / rebuildRoadsideLandOverlay / rebuildBuildingParcelRegistry) a player-drawn Free Road uses
+    // — the Tile grid (gridRef/roadTypeRef) is never written to for this, so the initial highway
+    // is never "a Tile road painted to look free"; it only ever exists in roadNetworkRef (Part A:
+    // Tile-grid highway generation as the primary implementation is prohibited). Only done once,
+    // on first mount, before the very first recomputeConnectivity()/syncInstances() below.
     {
-      const grid = gridRef.current;
-      const roadType = roadTypeRef.current;
-      const highwayIdx = ROAD_TYPE_KEYS.indexOf('highway');
-      const twoIdx = ROAD_TYPE_KEYS.indexOf('two');
+      const network = roadNetworkRef.current;
+      const mapHalf = (GRID_SIZE * TILE) / 2;
       const midY = Math.floor(GRID_SIZE / 2);
-      const HIGHWAY_LEN = 8; // tiles of highway, from the map edge (tx=0) inward
-      const IC_STUB_LEN = 3; // ordinary-road tiles right after the highway ends, for the player to build from
-      for (let tx = 0; tx <= HIGHWAY_LEN; tx++) {
-        const i = idx(tx, midY);
-        grid[i] = TILE_ROAD;
-        roadType[i] = highwayIdx;
-      }
-      for (let tx = HIGHWAY_LEN + 1; tx <= HIGHWAY_LEN + IC_STUB_LEN; tx++) {
-        const i = idx(tx, midY);
-        grid[i] = TILE_ROAD;
-        roadType[i] = twoIdx;
-      }
+      const midZ = tileWorldZ(midY);
+      const HIGHWAY_LEN = 8; // world-space span (in tile units) of highway, from the map edge inward — matches the old tile span
+      const IC_STUB_LEN = 3; // world-space span (in tile units) of ordinary road right after the highway ends, for the player to build from
+
+      // Part B — highway start node (ON the map boundary — this doubles as the Part E external
+      // gate location) / end node (city-side), plus the highway RoadSegment itself, using
+      // roadType 'highway' (existing ROAD_TYPES.highway — Part C: no separate geometry rule, this
+      // is the exact shared getRoadPoint/getRoadTangent/getRoadNormal/getRoadWidth/getRoadLayout/
+      // buildRoadSegmentGeometry pipeline every Free Road segment uses).
+      const outerX = -mapHalf;
+      const innerX = tileWorldX(HIGHWAY_LEN);
+      const icEndX = tileWorldX(HIGHWAY_LEN + IC_STUB_LEN);
+      const outerNode = addRoadNodeToNetwork(network, makeRoadNode(outerX, terrainHeight(outerX, midZ), midZ));
+      const innerNode = addRoadNodeToNetwork(network, makeRoadNode(innerX, terrainHeight(innerX, midZ), midZ));
+      const icEndNode = addRoadNodeToNetwork(network, makeRoadNode(icEndX, terrainHeight(icEndX, midZ), midZ));
+      const highwaySegment = addRoadSegmentToNetwork(network, makeRoadSegment(outerNode.id, innerNode.id, { roadType: 'highway' }));
+      // Part H — the IC stub (ordinary road) connecting the highway to the (future) city network,
+      // also a native World Space RoadSegment, chained onto the highway's own inner RoadNode so
+      // "Highway -> ordinary road -> city network" is real RoadNode topology, never a Tile-
+      // adjacency coincidence. The player can extend it further with the Free Road tool (it snaps
+      // onto icEndNode via the normal findGraphNodeNear node-snap, same as any other junction).
+      const icSegment = addRoadSegmentToNetwork(network, makeRoadSegment(innerNode.id, icEndNode.id, { roadType: 'two' }));
+
+      // Part C/D — render this exactly like any player-drawn Free Road segment: real asphalt +
+      // lane-marking + median + shoulder mesh (Part D visual), junction caps, roadside-land /
+      // building-parcel registries, and support structures (a no-op today since elevation is
+      // {0,0}, kept only for consistency with every other call site that mutates roadNetworkRef).
+      rebuildFreeRoadSegmentMesh(highwaySegment);
+      rebuildFreeRoadSegmentMesh(icSegment);
+      rebuildFreeRoadJunctionCaps();
+      rebuildFreeRoadSupportStructures();
+      rebuildRoadsideLandOverlay();
+      rebuildBuildingParcelRegistry();
     }
 
     recomputeConnectivity();
@@ -7245,7 +7895,7 @@ export default function CityGridIso() {
       return {
         active: false, fromTx: 0, fromTy: 0, toTx: 0, toTy: 0, nextTx: null, nextTy: null, t: 0,
         state: 'drive', crashTimer: 0, crashTilt: 0, closeFlag: false, speed: 0, stuckTimer: 0, turnCooldown: 0,
-        kindIdx, colorIdx, profile: randomProfile(), worldX: 0, worldZ: 0, heading: 0, laneOffset: CAR_LANE,
+        kindIdx, colorIdx, profile: randomProfile(), worldX: 0, worldY: 0, worldZ: 0, heading: 0, laneOffset: CAR_LANE,
         nextLaneOffset: CAR_LANE, laneBlendFrom: CAR_LANE, laneBlendTo: CAR_LANE, laneBlendT: 1,
         // Vehicle position record (Prompt 15 — RoadSegment is now the PRIMARY source of truth for
         // vehicle movement, not Tile hop): {roadSegmentId, segmentT, laneIndex, routeSegmentIds,
@@ -7253,14 +7903,19 @@ export default function CityGridIso() {
         // drives every frame (via pickNextSegmentAtNode/segmentBetweenNodes — a pure RoadNode/
         // RoadSegment graph walk); fromTx/fromTy/toTx/toTy/nextTx/nextTy below are kept only as a
         // SECONDARY mirror (populated from the current RoadNode's own .tx/.ty when it happens to
-        // be Tile-derived) for the couple of systems that intentionally still key off Tile
-        // coordinates by design — highway gate spawn/despawn (gates are always Tile-grid map-edge
-        // tiles) and Tile-edit revalidation. World Position/heading come from
+        // be Tile-derived), used by Tile-edit revalidation — it stays null on a Free Road node,
+        // including a Highway gate node (Part 20E: a gate is no longer assumed to be Tile-grid).
+        // World Position/heading come from
         // getRoadLanePoint(segmentId, laneIndex, t) exactly as documented on segPoint/movePoint.
         roadSegmentId: null, laneIndex: 0, segmentT: 0,
         fromNodeId: null, toNodeId: null, nextNodeId: null,
         routeSegmentIds: [], routeIndex: -1,
-        destTx: 0, destTy: 0,
+        // destTx/destTy: Tile-coordinate destination, only meaningful for an in-city errand.
+        // destWorldX/destWorldZ: the SAME destination as a World Position — always populated,
+        // Tile-derived or not — and what pickNextSegmentAtNode/reachedDest actually read.
+        // destGateNodeId: set only while `exiting` is true — the exact RoadNode id of the Highway
+        // gate this trip is heading out through (Part E/G — a gate is no longer assumed Tile-grid).
+        destTx: 0, destTy: 0, destWorldX: 0, destWorldZ: 0, destGateNodeId: null,
         // every car now comes from, and eventually returns to, the outside world through a
         // highway gate (【追加仕様】 #6/#7) — 'exiting' flips true once the car's current
         // destination IS a highway gate it's driving out through (see pickCarDestination),
@@ -7432,7 +8087,7 @@ export default function CityGridIso() {
         if (car.nextNodeId) {
           const stillRoad = segmentBetweenNodes(car.toNodeId, car.nextNodeId);
           if (!stillRoad) {
-            const destWorld = { x: tileWorldX(car.destTx), z: tileWorldZ(car.destTy) };
+            const destWorld = { x: car.destWorldX, z: car.destWorldZ };
             const nb2 = pickNextSegmentAtNode(car.toNodeId, curSeg.id, destWorld);
             car.nextNodeId = nb2 ? nb2.toNodeId : null;
             car.nextLaneOffset = nb2 ? laneOffsetForSegment(nb2.segment, freshLane) : freshLane;
@@ -7479,9 +8134,12 @@ export default function CityGridIso() {
       const gates = highwayGatesRef.current;
       if (!gates.length) return null;
       if (gates.length === 1 || Math.random() < 0.25) return gates[Math.floor(Math.random() * gates.length)];
+      // Part E: gates carry a real World Position now (not necessarily a Tile tuple), so distance
+      // is measured in World Distance — the direct generalization of the old Tile Manhattan check.
+      const fx = tileWorldX(fromTx), fz = tileWorldZ(fromTy);
       let best = gates[0], bestDist = Infinity;
       gates.forEach((g) => {
-        const d = Math.abs(g.inTx - fromTx) + Math.abs(g.inTy - fromTy);
+        const d = Math.hypot(g.worldPosition.x - fx, g.worldPosition.z - fz);
         if (d < bestDist) { bestDist = d; best = g; }
       });
       return best;
@@ -7494,19 +8152,27 @@ export default function CityGridIso() {
     const assignNextTrip = (car, fromTx, fromTy) => {
       const gate = (Math.random() < EXIT_TRIP_CHANCE) ? pickExitGate(fromTx, fromTy) : null;
       if (gate) {
-        car.exiting = true; car.destTx = gate.tx; car.destTy = gate.ty;
+        // Part E/F: the exit destination is now the gate's own RoadNode id + World Position —
+        // works whether the gate sits on a Tile-derived node or (as for the native Highway) a
+        // pure Free Road node with no tx/ty at all.
+        car.exiting = true;
+        car.destGateNodeId = gate.nodeId;
+        car.destWorldX = gate.worldPosition.x; car.destWorldZ = gate.worldPosition.z;
+        car.destTx = null; car.destTy = null;
       } else {
         car.exiting = false;
+        car.destGateNodeId = null;
         const dest = pickCityDestination(fromTx, fromTy);
         car.destTx = dest.tx; car.destTy = dest.ty;
+        car.destWorldX = tileWorldX(dest.tx); car.destWorldZ = tileWorldZ(dest.ty);
       }
     };
     // a segment is safe to spawn/enter if no other active car already occupies it too close to
     // its start (t < margin) — prevents spawning on top of / just behind an existing car.
-    const segmentClearForSpawn = (ftx, fty, ttx, tty, margin) => {
-      // Prompt 20 §3: keyed off RoadNode id (the routing state's actual identity), not the
-      // Tile-tuple mirror — correct even on a frame where a car's mirror hasn't been refreshed yet.
-      const fromId = tileNodeId(ftx, fty), toId = tileNodeId(ttx, tty);
+    const segmentClearForSpawn = (fromId, toId, margin) => {
+      // Keyed directly off RoadNode id (the routing state's actual identity) — works identically
+      // for a Tile-derived node id and a native Free Road node id (Part E/F: no Tile-tuple
+      // conversion here anymore).
       for (let k = 0; k < cars.length; k++) {
         const c = cars[k];
         if (c.active && c.fromNodeId === fromId && c.toNodeId === toId && c.t < margin) return false;
@@ -7514,45 +8180,57 @@ export default function CityGridIso() {
       return true;
     };
     // ---- external traffic spawn (【追加仕様】 #5/#6/#7/#19/#20) ----
-    // Cars no longer appear at a random road tile. Every car is created at a highway gate tile
-    // sitting on the map border (see computeHighwayGates) and immediately driven INWARD onto the
-    // real road tile just past it (gate.inTx/inTy) — never the reverse, so a spawned car can never
-    // be pointed the wrong way down the highway (requirement #20). `car.origin = 'outside'` and
-    // `car.exiting = false` mark it as a fresh arrival from outside the city; assignNextTrip then
-    // gives it a real in-city errand (or, occasionally, an immediate turnaround back out) so it
-    // never just idles at the on-ramp. Throttled by externalSpawnTimerRef so gates don't flood
-    // every car in at once the instant a slot opens (requirement #13).
+    // Cars no longer appear at a random road tile. Every car is created at a highway gate's own
+    // World Position (see computeHighwayGates — a native Highway RoadSegment endpoint touching the
+    // map boundary) and immediately driven INWARD onto the real segment just past it — never the
+    // reverse, so a spawned car can never be pointed the wrong way down the highway (requirement
+    // #20). `car.origin = 'outside'` and `car.exiting = false` mark it as a fresh arrival from
+    // outside the city; assignNextTrip then gives it a real in-city errand (or, occasionally, an
+    // immediate turnaround back out) so it never just idles at the on-ramp. Throttled by
+    // externalSpawnTimerRef so gates don't flood every car in at once the instant a slot opens
+    // (requirement #13).
     const trySpawnExternalCar = (car, dt) => {
       if (externalSpawnTimerRef.current > 0) return;
       const gates = highwayGatesRef.current;
       if (!gates.length) return; // no highway reaches the map edge yet — nothing can spawn
       const gate = gates[Math.floor(Math.random() * gates.length)];
+      const graph = roadGraphRef.current;
+      const curSeg = graph.segments.get(gate.segmentId);
+      if (!curSeg) return; // the gate's own Highway segment vanished (edited/removed) — nothing to spawn onto
+      // Part F: the gate node IS where the car appears, and the segment's OTHER endpoint is the
+      // inward direction — resolved directly from RoadNode topology, never a Tile-tuple lookup.
+      const inNodeId = curSeg.startNodeId === gate.nodeId ? curSeg.endNodeId : curSeg.startNodeId;
       // only enter if this gate's inbound segment isn't already occupied right at the on-ramp —
       // exactly the same "no overlapping spawns" rule normal respawns already used.
-      if (!segmentClearForSpawn(gate.tx, gate.ty, gate.inTx, gate.inTy, CAR_FOLLOW_SOFT_GAP * 1.5)) return;
+      if (!segmentClearForSpawn(gate.nodeId, inNodeId, CAR_FOLLOW_SOFT_GAP * 1.5)) return;
       car.t = 0; car.active = true;
       car.state = 'drive'; car.crashTimer = 0; car.closeFlag = false; car.speed = 0; car.stuckTimer = 0; car.turnCooldown = 0;
       car.origin = 'outside';
-      // Prompt 20 §3: RoadNode id is resolved and stored FIRST — that's the car's real routing
-      // state. fromTx/fromTy/toTx/toTy are set only as the Tile-derived MIRROR right after (same
-      // convention the main update loop already uses post-transition), never read back as the
-      // source of truth for where the car actually is. A highway gate is still always a Tile-grid
-      // map-border tile by design (see computeHighwayGates), so the mirror is meaningful here —
-      // unlike on a car driving a Free Road segment, where it stays null.
-      car.fromNodeId = tileNodeId(gate.tx, gate.ty);
-      car.toNodeId = tileNodeId(gate.inTx, gate.inTy);
-      car.fromTx = gate.tx; car.fromTy = gate.ty;
-      car.toTx = gate.inTx; car.toTy = gate.inTy;
-      car.segmentT = 0;
-      const curSeg = segmentBetweenNodes(car.fromNodeId, car.toNodeId);
-      const lane = curSeg ? laneOffsetForSegment(curSeg, undefined) : CAR_LANE;
+      // RoadNode id is resolved and stored FIRST — that's the car's real routing state.
+      // fromTx/fromTy/toTx/toTy are set only as a Tile-derived MIRROR right after (same convention
+      // the main update loop already uses post-transition), and stay null when the node in
+      // question is a native Free Road node (e.g. the Highway gate itself) — never read back as
+      // the source of truth for where the car actually is.
+      car.fromNodeId = gate.nodeId;
+      car.toNodeId = inNodeId;
+      const fromNode = graph.nodes.get(gate.nodeId), toNode = graph.nodes.get(inNodeId);
+      car.fromTx = fromNode && Number.isInteger(fromNode.tx) ? fromNode.tx : null;
+      car.fromTy = fromNode && Number.isInteger(fromNode.tx) ? fromNode.ty : null;
+      car.toTx = toNode && Number.isInteger(toNode.tx) ? toNode.tx : null;
+      car.toTy = toNode && Number.isInteger(toNode.tx) ? toNode.ty : null;
+      // Part F — position/lane/heading come directly from the Highway segment's own geometry
+      // (getRoadLanePoint / getRoadTangentForSegment, via the normal segPoint/movePoint render
+      // path below), never reconstructed from a Tile coordinate.
+      const lane = laneOffsetForSegment(curSeg, undefined);
       car.laneOffset = lane; car.laneBlendFrom = lane; car.laneBlendTo = lane; car.laneBlendT = 1;
-      car.roadSegmentId = curSeg ? curSeg.id : null;
-      car.routeSegmentIds = curSeg ? [curSeg.id] : [];
-      car.routeIndex = car.routeSegmentIds.length - 1;
+      car.roadSegmentId = curSeg.id;
+      car.segmentT = segmentIsForward(curSeg, car.fromNodeId) ? 0 : 1;
+      car.laneIndex = laneIndexFromOffset(ROAD_TYPES[curSeg.roadType], lane, segmentIsForward(curSeg, car.fromNodeId));
+      car.routeSegmentIds = [curSeg.id];
+      car.routeIndex = 0;
       assignNextTrip(car, car.toTx, car.toTy);
-      const destWorld = { x: tileWorldX(car.destTx), z: tileWorldZ(car.destTy) };
-      const nb2 = pickNextSegmentAtNode(car.toNodeId, curSeg ? curSeg.id : null, destWorld);
+      const destWorld = { x: car.destWorldX, z: car.destWorldZ };
+      const nb2 = pickNextSegmentAtNode(car.toNodeId, curSeg.id, destWorld);
       car.nextNodeId = nb2 ? nb2.toNodeId : null;
       car.nextTx = nb2 && Number.isInteger(nb2.toNode.tx) ? nb2.toNode.tx : null;
       car.nextTy = nb2 && Number.isInteger(nb2.toNode.tx) ? nb2.toNode.ty : null;
@@ -7626,9 +8304,26 @@ export default function CityGridIso() {
           // RoadNodes is simply gone from roadGraphRef.
           const graph = roadGraphRef.current;
           const fromNode = graph.nodes.get(car.fromNodeId);
-          const toNode = graph.nodes.get(car.toNodeId);
-          const curSeg = (fromNode && toNode) ? segmentBetweenNodes(car.fromNodeId, car.toNodeId) : null;
-          if (!fromNode || !toNode || !curSeg) { car.active = false; return; }
+          if (!fromNode) { car.active = false; return; } // the node this car thinks it's AT is gone — nothing to recover from
+          let toNode = graph.nodes.get(car.toNodeId);
+          let curSeg = toNode ? segmentBetweenNodes(car.fromNodeId, car.toNodeId) : null;
+          if (!toNode || !curSeg) {
+            // Part H — invalid-state recovery: the specific segment/next-node this car was
+            // driving toward has vanished (edited/removed mid-frame) or was never valid this
+            // frame. Before giving up, look for ANY still-valid RoadSegment actually leaving the
+            // node the car is really at (step 2) — only deactivate (step 3, letting it naturally
+            // respawn next frame via trySpawnExternalCar) if truly nothing connects there anymore.
+            const recovery = pickNextSegmentAtNode(car.fromNodeId, null, null);
+            if (!recovery) { car.active = false; return; }
+            toNode = graph.nodes.get(recovery.toNodeId);
+            curSeg = recovery.segment;
+            if (!toNode || !curSeg) { car.active = false; return; }
+            car.toNodeId = recovery.toNodeId;
+            car.t = 0;
+            car.nextNodeId = null;
+            car.laneOffset = laneOffsetForSegment(curSeg, car.laneOffset);
+            car.laneBlendFrom = car.laneOffset; car.laneBlendTo = car.laneOffset; car.laneBlendT = 1;
+          }
           const nextNode = car.nextNodeId ? graph.nodes.get(car.nextNodeId) : null;
           const nextSeg = nextNode ? segmentBetweenNodes(car.toNodeId, car.nextNodeId) : null;
           const curForward = segmentIsForward(curSeg, car.fromNodeId);
@@ -7795,7 +8490,14 @@ export default function CityGridIso() {
           const blendedLane = car.laneBlendFrom + (car.laneBlendTo - car.laneBlendFrom) * smoothstep(car.laneBlendT);
           car.laneOffset = blendedLane;
           const p = movePoint(fromNode, toNode, nextNode, blendedLane, car.nextLaneOffset, car.t, turning);
-          car.worldX = p.x; car.worldZ = p.z; car.heading = p.heading;
+          // Part H — NaN/Infinity guard: never let a broken RoadSegment/lane computation (e.g. a
+          // degenerate zero-length segment slipping through mid-edit) propagate into car state or
+          // the instanced-mesh matrices below. Safely deactivate instead of drawing/holding a
+          // corrupted position — it naturally respawns fresh next frame via trySpawnExternalCar.
+          if (!Number.isFinite(p.x) || !Number.isFinite(p.y) || !Number.isFinite(p.z) || !Number.isFinite(p.heading)) {
+            car.active = false; return;
+          }
+          car.worldX = p.x; car.worldY = p.y; car.worldZ = p.z; car.heading = p.heading;
           // Vehicle position record (requirement: a Vehicle references
           // {roadSegmentId, segmentT, laneIndex, routeSegmentIds, routeIndex} and World Position
           // comes from getRoadLanePoint(segmentId, laneIndex, t) — the actual position/heading
@@ -7843,14 +8545,14 @@ export default function CityGridIso() {
             car.laneOffset = car.nextLaneOffset;
             // reached (close to) its destination -> either despawn out through the highway gate
             // it was heading for, or pick a new trip so it keeps making purposeful journeys
-            // (【追加仕様】 #6/#7). An exit trip's destination IS the gate tile itself, so it must be
-            // physically reached (exact match, still Tile-keyed since gates are Tile-grid by
-            // design), not just "close" — an ordinary in-city errand's arrival check is now real
-            // World Distance to the destination's World point, the direct generalization of the
-            // old "within 1 Tile" Manhattan check.
+            // (【追加仕様】 #6/#7). Part E/G: an exit trip's destination IS the gate's own RoadNode,
+            // matched by id (correct whether that node is Tile-derived or — as for the native
+            // Highway — a pure Free Road node with no tx/ty at all), not just "close" — an ordinary
+            // in-city errand's arrival check stays real World Distance to the destination's World
+            // point, the direct generalization of the old "within 1 Tile" Manhattan check.
             const reachedDest = car.exiting
-              ? (Number.isInteger(arrivalNode.tx) && arrivalNode.tx === car.destTx && arrivalNode.ty === car.destTy)
-              : (Math.hypot(arrivalNode.position.x - tileWorldX(car.destTx), arrivalNode.position.z - tileWorldZ(car.destTy)) <= TILE * 1.5);
+              ? (arrivalNode.id === car.destGateNodeId)
+              : (Math.hypot(arrivalNode.position.x - car.destWorldX, arrivalNode.position.z - car.destWorldZ) <= TILE * 1.5);
             if (reachedDest) {
               if (car.exiting) {
                 // drove all the way out through the gate onto the highway segment at the map edge
@@ -7860,7 +8562,7 @@ export default function CityGridIso() {
               }
               assignNextTrip(car, Number.isInteger(arrivalNode.tx) ? arrivalNode.tx : car.destTx, Number.isInteger(arrivalNode.tx) ? arrivalNode.ty : car.destTy);
             }
-            const destWorld = { x: tileWorldX(car.destTx), z: tileWorldZ(car.destTy) };
+            const destWorld = { x: car.destWorldX, z: car.destWorldZ };
             const nb2 = pickNextSegmentAtNode(car.toNodeId, landedSeg.id, destWorld);
             car.nextNodeId = nb2 ? nb2.toNodeId : null;
             car.nextLaneOffset = nb2 ? laneOffsetForSegment(nb2.segment, newLane) : newLane;
@@ -7885,7 +8587,11 @@ export default function CityGridIso() {
         const ci = car.colorIdx;
         const tiltZ = car.state === 'crashed' ? car.crashTilt : 0;
         const liftY = car.state === 'crashed' ? 0.08 : 0;
-        dummy.position.set(car.worldX, terrainHeight(car.worldX, car.worldZ) + CAR_GROUND_Y + liftY, car.worldZ);
+        // Part C — the road surface's own Y (already terrain + any authored elevationOffset, via
+        // getRoadPoint/getRoadLaneCenter through movePoint/segPoint above) IS car.worldY; never
+        // re-derive it from terrainHeight(x,z) here, or an elevated Free Road's cars would sink
+        // straight back down through the deck to ground level every frame.
+        dummy.position.set(car.worldX, car.worldY + CAR_GROUND_Y + liftY, car.worldZ);
         dummy.rotation.set(0, car.heading, tiltZ);
         dummy.scale.set(1, 1, 1);
         dummy.updateMatrix();
@@ -7904,7 +8610,13 @@ export default function CityGridIso() {
         kd.spec.wheel.offsets.forEach(([ox, oz]) => {
           const wx = car.worldX + ox * cosH + oz * sinH;
           const wz = car.worldZ - ox * sinH + oz * cosH;
-          wheelDummy.position.set(wx, terrainHeight(wx, wz) + CAR_GROUND_Y + kd.spec.wheel.r, wz);
+          // Part J — every wheel shares the vehicle BODY's own road-surface Y (car.worldY), only
+          // rotated/offset in the XZ plane; it is never independently re-sampled via
+          // terrainHeight(wx, wz) at the wheel's own (slightly offset) x/z. On flat ground the two
+          // were indistinguishable, which is exactly why this bug hid until an elevated Free Road
+          // made wheels compute a completely different (ground-level) height than the chassis
+          // above them.
+          wheelDummy.position.set(wx, car.worldY + CAR_GROUND_Y + kd.spec.wheel.r, wz);
           wheelDummy.rotation.set(0, car.heading, 0);
           wheelDummy.scale.set(kd.spec.wheel.w, kd.spec.wheel.r, kd.spec.wheel.r);
           wheelDummy.updateMatrix();
@@ -9697,10 +10409,10 @@ export default function CityGridIso() {
     if (roadCost > 0) setBudget((b) => ({ ...b, treasury: b.treasury - roadCost }));
     if (roadChanged) {
       recomputeConnectivity();
-      // the highway-gate list depends on the connected road network (a gate must be a connected
-      // border highway tile with real road just inland of it), so any road edit near a highway or
-      // the map edge can add/remove a valid external entry point — recompute it here rather than
-      // only at map init (requirement #4/#18: gates stay in sync with what the player builds).
+      // Highway gates are World Space (Part 20E — a native Highway RoadSegment endpoint touching
+      // the map boundary), so a Tile-grid road edit can't itself create/remove one; recomputed
+      // here anyway (cheap, and harmless) so gates always reflect the current roadNetworkRef state
+      // rather than only ever being computed once at map init.
       highwayGatesRef.current = computeHighwayGates();
       threeRef.current?.rebuildRoadTileList?.();
       // also refresh the 8 neighbors so their road pattern (hub/arm) updates immediately
@@ -9752,7 +10464,8 @@ export default function CityGridIso() {
     const point = raycastGround(e.clientX, e.clientY);
     if (!point) return;
     if (toolRef.current === 'freeroad') {
-      if (freeRoadDraftRef.current) threeRef.current.updateFreeRoadDraftEnd(point);
+      // Part A: hold Shift for a fully free diagonal drag (bypasses orthogonal angle-snap).
+      if (freeRoadDraftRef.current) setFreeRoadDraftStatus(threeRef.current.updateFreeRoadDraftEnd(point, e.shiftKey));
       return;
     }
     const { tx, ty } = worldToTile(point);
@@ -10029,8 +10742,21 @@ export default function CityGridIso() {
                       {ROAD_TYPE_KEYS.map((k) => <option key={k} value={k}>{ROAD_TYPES[k].label}</option>)}
                     </select>
                     <div style={{ width: '100%', fontSize: 11, color: '#6ad0ff', padding: '2px 4px' }}>
-                      クリック: 始点/終点を設置(連続作図) ・ K/L: カーブ左右 ・ O/M: 高さ上下 ・ Esc: 作図キャンセル
+                      クリック: 始点/終点を設置(連続作図) ・ K/L: カーブ左右 ・ O/M: 高さ上下 ・ Shift押しながら: 直角スナップ解除(自由角度) ・ Esc: 作図キャンセル
                     </div>
+                    {freeRoadDraftRef.current && (
+                      <div style={{
+                        width: '100%', fontSize: 11, padding: '3px 4px', fontWeight: 'bold',
+                        color: freeRoadDraftStatus?.invalid ? '#ff6b6b' : (freeRoadDraftStatus?.isAngleSnapped || freeRoadDraftStatus?.isNodeSnapped) ? '#7dffa6' : '#6ad0ff',
+                      }}>
+                        {freeRoadDraftStatus?.invalid
+                          ? '✕ 既存の道路と重なっています(建設不可) — ドラッグして経路を調整してください'
+                          : [
+                              freeRoadDraftStatus?.isAngleSnapped ? '直角スナップ中' : null,
+                              freeRoadDraftStatus?.isNodeSnapped ? '既存道路ノードへ接続' : null,
+                            ].filter(Boolean).join(' ・ ') || '自由な角度で作図中'}
+                      </div>
+                    )}
                   </>
                 )}
               </div>
