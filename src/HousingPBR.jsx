@@ -600,3 +600,4 @@ export function buildTerraceHouseByIndex(index) {
 }
 
 export { TEXTURE_BASE, TEXTURE_FILES, getPBRMaterial, getSolidMaterial };
+//a
