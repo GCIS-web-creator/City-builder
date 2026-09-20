@@ -4077,8 +4077,10 @@ function residentialDensityTier(pop) {
   if (pop >= 200) return 'res_mid';
   return 'res_low';
 }
+// Prompt 23-R2: the low tier now maps to its own 'res_low' lot type (was 'res_terrace', which made a
+// Roadside-Plot house go through the terrace-house mesh builder instead of the low-density one).
 function legacyLotTypeForDensityTier(tier) {
-  return tier === 'res_high' ? 'res_high' : tier === 'res_mid' ? 'res_mid' : 'res_terrace';
+  return tier === 'res_high' ? 'res_high' : tier === 'res_mid' ? 'res_mid' : 'res_low';
 }
 // ---- Prompt 20K-R3 Part J/Q/S: Large Zone Packing --------------------------------------------
 // Pure geometry — splits a zoned World Space rectangle into equal-width modules along its longer
@@ -4273,6 +4275,78 @@ function findParcelForFootprint(parcelRegistry, cx, cz, w, h, rotation = 0) {
   return null;
 }
 
+// ---- Prompt 23-R2: Roadside Plot selection -> Building Parcel adapter --------------------------
+// The Roadside Plot Cells the player selects are the PRIMARY land source for a low-density house.
+// The Building Parcel registry (one deep strip per road side) used to be a hard gate: "no matching
+// Parcel" refused the house. createParcelFromRoadsidePlotSelection builds a Parcel record straight
+// from the selected cell block instead (its polygon is the exact outline of the selected cells, in
+// road coordinates, so it follows a curved road), which Building Placement can use whenever the
+// registry has no matching Parcel. Pure geometry — `sel` is getPlotSelection's result (a full
+// column x row block: sel.missing === 0), cells carry poly = [P(c,r), P(c+1,r), P(c+1,r+1), P(c,r+1)].
+function createParcelFromRoadsidePlotSelection(sel) {
+  if (!sel || !sel.group || !sel.cells || !sel.cells.length || sel.missing > 0) return null;
+  const cm = sel.group.cellMap, S = PLOT_KEY_STRIDE;
+  const cell = (c, r) => cm.get(c * S + r);
+  const { c0, c1, r0, r1 } = sel;
+  for (let c = c0; c <= c1; c++) for (let r = r0; r <= r1; r++) if (!cell(c, r)) return null;
+  const poly = [];
+  for (let c = c0; c <= c1; c++) poly.push(cell(c, r0).poly[0]);       // near edge (touching the road side)
+  poly.push(cell(c1, r0).poly[1]);
+  for (let r = r0; r <= r1; r++) poly.push(cell(c1, r).poly[2]);        // far end of the block
+  for (let c = c1; c >= c0; c--) poly.push(cell(c, r1).poly[3]);        // back edge
+  for (let r = r1; r > r0; r--) poly.push(cell(c0, r).poly[0]);         // start end, walking back to the road
+  return {
+    id: `plotparcel_${sel.group.gid}_${c0}_${r0}_${c1}_${r1}`,
+    segmentId: sel.group.segId, side: sel.group.side,
+    polygon: poly.map((p) => ({ x: p.x, z: p.z })),
+    buildable: true,
+    source: 'roadside_plot_selection',
+  };
+}
+function _distPointSegment(px, pz, ax, az, bx, bz) {
+  const dx = bx - ax, dz = bz - az, l2 = dx * dx + dz * dz;
+  let u = l2 > 1e-12 ? ((px - ax) * dx + (pz - az) * dz) / l2 : 0;
+  u = u < 0 ? 0 : u > 1 ? 1 : u;
+  return Math.hypot(ax + dx * u - px, az + dz * u - pz);
+}
+// footprintCoveredByPolygon: the (rotated) footprint must lie inside the polygon. It is sampled on a
+// 5x5 lattice (corners + edges + interior); a sample may sit on the boundary or poke out by `tol` m —
+// a straight footprint laid over cells that bend with a curved road deviates from the cell outline by a
+// few cm (sag = w^2/8R), and on a straight road the footprint IS the outline, so its corners lie exactly
+// on the boundary.
+function footprintCoveredByPolygon(polygon, cx, cz, w, d, rotation = 0, tol = 0.35) {
+  const N = 4, cosR = Math.cos(rotation), sinR = Math.sin(rotation);
+  for (let iz = 0; iz <= N; iz++) for (let ix = 0; ix <= N; ix++) {
+    const lx = (ix / N - 0.5) * w, lz = (iz / N - 0.5) * d;
+    const sx = cx + lx * cosR + lz * sinR, sz = cz - lx * sinR + lz * cosR;
+    if (pointInPolygon(polygon, sx, sz)) continue;
+    let best = Infinity;
+    for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
+      const dd = _distPointSegment(sx, sz, polygon[j].x, polygon[j].z, polygon[i].x, polygon[i].z);
+      if (dd < best) best = dd;
+    }
+    if (best > tol) return false;
+  }
+  return true;
+}
+// Player-facing text for every failure reason (Zone / Building). Keys are the machine reasons.
+const LOW_DENSITY_FAIL_TEXT = {
+  selection_invalid: '選択範囲が無効です',
+  missing_cells: '選択範囲に欠けたセルがあります(道路や他の区画で切り取られた部分)',
+  unsupported_size: '低密度住宅は 3×3 〜 6×6 の決められたセルサイズ(3×4 / 4×6 / 5×6 / 6×6 など)のみ建築できます',
+  cell_blocked: '選択範囲に使用できないセルがあります(建物・道路・建築禁止エリア)',
+  parcel_missing: 'Parcel未生成(選択セルから敷地を作れませんでした)',
+  footprint_outside_cells: '建物が選択セルからはみ出します(道路のカーブが急すぎます)',
+  footprint_collision: 'Footprint collision(既存の建物と衝突します)',
+  road_collision: '道路(舗装面)と衝突します',
+  legacy_tile_block: '旧Tileの占有(旧Tile道路・他ゾーン・施設)と重なります',
+  terrain_too_steep: '地形が急すぎて建築できません',
+  finalize_failed: '建物の生成に失敗しました(内部エラー)',
+  out_of_bounds: 'マップ外にはみ出します',
+  no_module: '建築できる区画モジュールが見つかりません(Parcel・寸法)',
+  unknown: '不明な理由',
+};
+
 
 // -- one-way direction enum for 'small' roads (see recomputeOneWayNetwork / isRoadMoveAllowed) --
 // Actual compass directions, NOT a +/- sign: a bare sign bit can't tell "east" apart from "south"
@@ -4455,7 +4529,14 @@ const ZONE_COLORS = {
 // ============ residential lot types (multi-tile plots) ============
 // res_low stays a plain 1-tile paint zone (existing behaviour); the other five are
 // drag-rectangle "lots" that occupy w x h tiles as a single growing building.
+// Prompt 23-R2: `res_low` is now a real lot type too — it is what a Roadside-Plot low-density house
+// (exactly the selected cells, HousingPBR buildLowDensityHouseForCell) is registered as. Before this
+// entry existed the res_low branch of buildLotGroup below was unreachable (no spec -> the density
+// adapter fell back to 'res_terrace', i.e. a scaled terrace house), and finalizeLot's mesh build ran
+// the terrace builder. Population/height numbers are the same as the terrace type it replaces.
+// It is NOT a toolbar tool (no button uses this key), it only exists for lots created from a zone.
 const RES_LOT_TYPES = {
+  res_low: { label: '低密度住宅', unlockPop: 0, hMin: 3.4, hMax: 4.4, pop: [2, 30], jobs: [0, 0], color: 0xb08a5a, roof: 0x7a4a34 },
   res_terrace: { label: 'テラスハウス', unlockPop: 0, hMin: 3.4, hMax: 4.4, pop: [2, 30], jobs: [0, 0], color: 0xb08a5a, roof: 0x7a4a34 },
   res_mid: { label: '中密度住宅', unlockPop: 200, hMin: 9, hMax: 18, pop: [60, 300], jobs: [0, 0], color: 0x8fa8c8, roof: 0x4a6a90 },
   res_lowrent: { label: '低家賃住宅', unlockPop: 400, hMin: 12, hMax: 22, pop: [200, 300], jobs: [0, 0], color: 0x8a8a82, roof: 0x5a5a54 },
@@ -7647,17 +7728,19 @@ function buildLotGroup(type, w, h, level, frontSign = -1, lotId = 0) {
   if (type === 'res_low') {
     // HousingPBR integration: low-density houses previously had NO branch here at all and silently
     // fell through to the generic "res_mid" box below — this is the fix. w/h are already the lot's
-    // exact selected-cell footprint in meters (computeLowDensityPlacement / finalizeLot pass the
+    // exact selected-cell footprint in meters (planLowDensityHouse / finalizeLot pass the
     // selection's real cols x rows straight through, never scaled), and buildLotGroup's caller
     // already applies the road-aligned world rotation (lot.rotation, any angle) — so all that's
     // needed here is picking one of the 10 presets for this exact size and, like res_terrace, a
     // local 180° flip when the entrance needs to face the opposite local Z side.
     const variantIndex = ((lotId % 10) + 10) % 10;
     const house = buildLowDensityHouseForCell(w, h, variantIndex);
-    if (house) {
-      if (frontSign < 0) house.rotation.y = Math.PI;
-      group.add(house);
-    }
+    // Prompt 23-R2: an unsupported size used to leave an EMPTY group here (a registered, reserved
+    // Building with no mesh). Throw instead — finalizeLot catches it and rolls the lot back, and the
+    // caller reports the failure to the player.
+    if (!house) throw new Error(`no low-density house preset for ${w}x${h}`);
+    if (frontSign < 0) house.rotation.y = Math.PI;
+    group.add(house);
   } else if (type === 'res_terrace') {
     // HousingPBR integration: swap the old procedural box+cone body for one of the 20 PBR
     // terrace-house presets (img/ textures via HousingPBR.jsx). frontIsX/frontSign are kept
@@ -8167,6 +8250,12 @@ export default function CityGridIso() {
   const segmentLengthCacheRef = useRef(new Map());
 
   const [tool, setTool] = useState('select');
+  // Prompt 23-R2: Residential zoning status panel (drag preview + last commit result). Only React state that
+  // changes when the displayed content changes (see publishZoneStatus) so a pointer-move never re-renders needlessly.
+  const [zoneStatus, setZoneStatus] = useState(null);
+  const zoneStatusKeyRef = useRef('');
+  const zoneStatusTimerRef = useRef(null);
+  const lastZoneStatusRef = useRef(null);
   const [showMicroGrid, setShowMicroGrid] = useState(false); // Prompt 20K Part Z: 土地グリッド表示 toggle
   const [blockSpacingX, setBlockSpacingX] = useState(BLOCK_SPACING_X); // Prompt 20K Part T: UI-editable spacing (constants remain the defaults)
   const [blockSpacingZ, setBlockSpacingZ] = useState(BLOCK_SPACING_Z);
@@ -9361,62 +9450,108 @@ export default function CityGridIso() {
   const packAndBuildCommercialZone = (sel) => packAndBuildTileLockedZone(TILE_COM, finalizeCommercialBuilding, sel);
   const packAndBuildIndustrialZone = (sel) => packAndBuildTileLockedZone(TILE_IND, finalizeIndustrialBuilding, sel);
   // ---- LOW-DENSITY residential = exactly the selected cells --------------------------------------
-  // A low-density house may only be created from a cell selection of one of these EXACT 8 sizes
-  // (unordered, so 3x2 == 2x3): 3x2 3x3 3x4 3x5 3x6 4x4 4x5 4x6 (any other size, including the
+  // A low-density house may only be created from a cell selection of one of these EXACT sizes
+  // (unordered, so 3x2 == 2x3): 3x2 3x3 3x4 3x5 3x6 4x4 4x5 4x6 5x5 5x6 6x6 (any other size, including the
   // smaller 2x2/2x4/2x5/2x6 the tool used to allow, is now refused/shown red — see
   // isLowDensityCellSelection below). The house then occupies EXACTLY the selected cells: its
   // footprint is the selected block, turned to the road's own direction at that spot (Prompt 21H:
   // any angle, not just multiples of 90 degrees) with its entrance on the road side. HousingPBR.jsx
   // provides 10 real PBR house models for each of these 8 sizes (buildLowDensityHouseForCell), one
   // of which buildLotGroup's res_low branch picks and builds at the lot's exact w x d footprint.
-  const LOW_DENSITY_CELL_SIZES = ['2x3', '3x3', '3x4', '3x5', '3x6', '4x4', '4x5', '4x6'];
+  // Prompt 23-R2: the final candidate list is 3x3 3x4 3x5 3x6 4x4 4x5 4x6 5x5 5x6 6x6 (unordered), plus 2x3
+  // kept for backwards compatibility. HousingPBR.jsx's LOW_DENSITY_SIZE_CLASSES must match this list.
+  const LOW_DENSITY_CELL_SIZES = ['2x3', '3x3', '3x4', '3x5', '3x6', '4x4', '4x5', '4x6', '5x5', '5x6', '6x6'];
   const isLowDensityCellSelection = (wc, hc) => LOW_DENSITY_CELL_SIZES.includes(Math.min(wc, hc) + 'x' + Math.max(wc, hc));
   const isLowDensityResidentialNow = () => residentialDensityTier(popRef.current) === 'res_low';
-  // Geometry + Parcel check only (cheap). Returns null if the selection can't be a house.
-  const computeLowDensityPlacement = (sel) => {
-    if (!sel || sel.missing > 0 || !sel.cells.length) return null;
-    if (!isLowDensityCellSelection(sel.cols, sel.rows)) return null;
-    for (const cell of sel.cells) if (!isPlotCellOpen(cell)) return null; // every selected cell must be open
+  // Dev-only diagnostics (requirement #24). Enabled in a non-production build, or at runtime with
+  // `window.__CITY_DEBUG__ = true` / `?debug` in the URL. The UI failure reason is shown in ALL builds.
+  const lowDensityDiagEnabled = () => {
+    try {
+      return !!globalThis.__CITY_DEBUG__ || /[?&]debug\b/.test(globalThis.location?.search || '')
+        || (typeof process !== 'undefined' && !!process.env && process.env.NODE_ENV !== 'production');
+    } catch (e) { return false; }
+  };
+  const logLowDensityDiag = (sel, plan, finalizeResult, failureReason) => {
+    if (!lowDensityDiagEnabled()) return;
+    console.debug('[low-density]', {
+      selection: sel ? `${sel.cols}x${sel.rows}` : null,
+      densityTier: residentialDensityTier(popRef.current),
+      parcelFound: plan?.diag?.parcelFound ?? null,
+      parcelSource: plan?.diag?.parcelSource ?? null,
+      footprintClear: plan?.diag?.footprintClear ?? null,
+      gradingBuildable: plan?.diag?.gradingBuildable ?? null,
+      finalizeResult: finalizeResult ?? null,
+      failureReason: failureReason ?? plan?.reason ?? null,
+    });
+  };
+
+  // ---- ZONE-level validity: is the SELECTION itself something that can become a Residential zone? ----
+  // (Independent of whether a house can then be built on it — Zone and Building are separate now.)
+  const evaluateLowDensityZone = (sel) => {
+    if (!sel || !sel.cells || !sel.cells.length) return { ok: false, reason: 'selection_invalid' };
+    if (sel.missing > 0) return { ok: false, reason: 'missing_cells' };
+    if (!isLowDensityCellSelection(sel.cols, sel.rows)) return { ok: false, reason: 'unsupported_size' };
+    for (const cell of sel.cells) if (!isPlotCellOpen(cell)) return { ok: false, reason: 'cell_blocked' };
+    return { ok: true, reason: null };
+  };
+  // The house footprint IS the selected cells: cols x rows metres, centred on the block, turned to the
+  // road's own direction (chord from the first to the last column; any angle), entrance on the road side.
+  const computeLowDensityFootprint = (sel) => {
     const g = sel.group;
     let cx = 0, cz = 0;
     for (const cell of sel.cells) { cx += cell.cx; cz += cell.cz; }
     cx /= sel.cells.length; cz /= sel.cells.length;
-    // direction of the selected block along the road: chord from its first to its last column (== the
-    // road tangent on a straight road, the best-fit direction on a curve)
     const first = g.cellMap.get(sel.c0 * PLOT_KEY_STRIDE + sel.r0), last = g.cellMap.get(sel.c1 * PLOT_KEY_STRIDE + sel.r0);
     let tx = last.cx - first.cx, tz = last.cz - first.cz;
     if (Math.hypot(tx, tz) < 0.5) { tx = first.tan.x; tz = first.tan.z; }
     const tl = Math.hypot(tx, tz) || 1; tx /= tl; tz /= tl;
-    const rotationY = Math.atan2(-tz, tx), sideSign = g.sideSign, frontSign = -sideSign;
-    const nx = -tz, nz = tx; // left normal
-    const w = sel.cols, d = sel.rows;
-    // On the outside of a bend the straight footprint's road-side edge can dip a few cm into the
-    // sidewalk strip; nudge the house AWAY from the road (never toward it) until it fits a Parcel.
-    for (let shift = 0; shift <= 0.5001; shift += 0.05) {
-      const px = cx + nx * sideSign * shift, pz = cz + nz * sideSign * shift;
-      if (findParcelForFootprint(buildingParcelRegistryRef.current, px, pz, w, d, rotationY)) return { cx: px, cz: pz, w, d, rotationY, frontSign };
-    }
-    return null;
+    return { cx, cz, w: sel.cols, d: sel.rows, rotationY: Math.atan2(-tz, tx), frontSign: -g.sideSign };
   };
-  // Full check used by the preview (so red == "this would really be refused") and by the builder.
-  const canBuildLowDensityHouse = (sel) => {
-    const pl = computeLowDensityPlacement(sel);
-    if (!pl) return null;
+  // ---- PLOT-FIRST building plan --------------------------------------------------------------
+  // Returns { zoneOk, buildOk, reason, placement, diag }. The Roadside Plot selection is the primary land
+  // source: an existing Building Parcel that happens to contain the footprint is recorded (parcelFound) but
+  // its ABSENCE never refuses the house — a Parcel is built from the selected cells instead
+  // (createParcelFromRoadsidePlotSelection). Every step reports its own failure reason; zone failures
+  // (selection_invalid .. cell_blocked) and building failures are told apart by `zoneOk`.
+  const planLowDensityHouse = (sel) => {
+    const diag = { parcelFound: false, parcelSource: null, containmentOk: null, footprintClear: null, gradingBuildable: null };
+    const zone = evaluateLowDensityZone(sel);
+    if (!zone.ok) return { zoneOk: false, buildOk: false, reason: zone.reason, placement: null, diag };
+    const fp = computeLowDensityFootprint(sel);
+    const registryParcel = findParcelForFootprint(buildingParcelRegistryRef.current, fp.cx, fp.cz, fp.w, fp.d, fp.rotationY);
+    diag.parcelFound = !!registryParcel;
+    const plotParcel = createParcelFromRoadsidePlotSelection(sel);
+    diag.parcelSource = registryParcel ? 'registry' : plotParcel ? 'roadside_plot_selection' : null;
+    const parcel = registryParcel || plotParcel;
+    if (!parcel) return { zoneOk: true, buildOk: false, reason: 'parcel_missing', placement: null, diag };
+    // the Building must not spill out of the selected cells (checked against the selection's own outline)
+    diag.containmentOk = plotParcel ? footprintCoveredByPolygon(plotParcel.polygon, fp.cx, fp.cz, fp.w, fp.d, fp.rotationY) : false;
+    if (!diag.containmentOk) return { zoneOk: true, buildOk: false, reason: 'footprint_outside_cells', placement: null, diag };
+    // Free Road geometry is the primary road test; legacy Tile checks only apply to Tiles the footprint really
+    // touches (exact mode). World Space collision with every other Building (RES lots + Registry).
     zoneBuildTypeRef.current = TILE_RES;
-    try {
-      if (!lotFootprintClear(pl.cx, pl.cz, pl.w, pl.d, pl.rotationY)) return null;
-    } finally { zoneBuildTypeRef.current = null; }
-    if (!computeBuildingGrading(pl.cx, pl.cz, pl.w, pl.d, pl.rotationY).buildable) return null;
-    return pl;
+    let clearReason;
+    try { clearReason = lotFootprintCheck(fp.cx, fp.cz, fp.w, fp.d, fp.rotationY, { exact: true }); } finally { zoneBuildTypeRef.current = null; }
+    diag.footprintClear = clearReason === null;
+    if (clearReason) return { zoneOk: true, buildOk: false, reason: clearReason, placement: null, diag };
+    diag.gradingBuildable = computeBuildingGrading(fp.cx, fp.cz, fp.w, fp.d, fp.rotationY).buildable;
+    if (!diag.gradingBuildable) return { zoneOk: true, buildOk: false, reason: 'terrain_too_steep', placement: null, diag };
+    return { zoneOk: true, buildOk: true, reason: null, placement: { ...fp, parcelId: parcel.id, parcelSource: diag.parcelSource }, diag };
   };
+  // Try to actually put the house up. Returns { ok, reason, error?, plan }. Never touches the zone.
   const buildLowDensityHouse = (sel) => {
-    const pl = canBuildLowDensityHouse(sel);
-    if (!pl) return 0;
+    const plan = planLowDensityHouse(sel);
+    if (!plan.buildOk) { logLowDensityDiag(sel, plan, null, plan.reason); return { ok: false, reason: plan.reason, plan }; }
+    const pl = plan.placement, diag = {};
     const type = legacyLotTypeForDensityTier('res_low');
+    let ok = false;
     zoneBuildTypeRef.current = TILE_RES;
     try {
-      return finalizeLot(type, pl.cx, pl.cz, pl.w, pl.d, pl.frontSign, pl.rotationY, { skipRoadAccess: true, initialLevel: 1 }) ? 1 : 0;
+      ok = finalizeLot(type, pl.cx, pl.cz, pl.w, pl.d, pl.frontSign, pl.rotationY,
+        { skipRoadAccess: true, initialLevel: 1, exact: true, plotSource: 'roadside_plot_selection', diag });
     } finally { zoneBuildTypeRef.current = null; }
+    logLowDensityDiag(sel, plan, ok ? 'ok' : 'failed', ok ? null : (diag.reason || 'finalize_failed'));
+    return ok ? { ok: true, reason: null, plan } : { ok: false, reason: diag.reason || 'finalize_failed', error: diag.error, plan };
   };
 
   // getMicroCellsForFootprint: real oriented-rectangle containment (obbCorners + pointInPolygon,
@@ -9906,7 +10041,17 @@ export default function CityGridIso() {
   // footprints are no longer forced to Tile multiples). The footprint is also rasterized onto the
   // Tile grid purely to reuse gridRef/lotIdGridRef's existing zone/road/lot/edu-facility occupancy
   // bookkeeping — that rasterization is bookkeeping only, never the placement's source of truth.
-  const lotFootprintClear = useCallback((cx, cz, w, h, rotation = 0) => {
+  // Prompt 23-R2: lotFootprintCheck IS the old lotFootprintClear body, split out so a caller can be
+  // told WHY a footprint was refused. It returns null when the footprint is clear, otherwise
+  //   'out_of_bounds' | 'legacy_tile_block' | 'road_collision' | 'footprint_collision'.
+  // lotFootprintClear (just below) is now a thin `=== null` wrapper — every existing caller behaves
+  // exactly as before. opts.exact (used ONLY by Roadside-Plot houses): the Tile-grid raster test (step 1)
+  // is applied to the Tiles the ROTATED footprint really overlaps, instead of every Tile inside its
+  // bounding box, so a legacy Tile road / Tile the house does not physically touch cannot refuse a
+  // Free Road house (Free Road geometry — step 2 — is the primary road test); and the World Space
+  // Building Registry (not just the RES lot list) is consulted for collisions.
+  const lotFootprintCheck = useCallback((cx, cz, w, h, rotation = 0, opts = null) => {
+    const exact = !!(opts && opts.exact);
     const grid = gridRef.current, lotIdGrid = lotIdGridRef.current;
     const network = roadNetworkRef.current;
     // Prompt 17: bound the rotated footprint's own corners rather than the unrotated w/h box, so a
@@ -9917,14 +10062,17 @@ export default function CityGridIso() {
     const minX = Math.min(...corners.map((c) => c.x)), maxX = Math.max(...corners.map((c) => c.x));
     const minZ = Math.min(...corners.map((c) => c.z)), maxZ = Math.max(...corners.map((c) => c.z));
     const mapHalf = (GRID_SIZE * TILE) / 2;
-    if (minX < -mapHalf || maxX > mapHalf || minZ < -mapHalf || maxZ > mapHalf) return false;
+    if (minX < -mapHalf || maxX > mapHalf || minZ < -mapHalf || maxZ > mapHalf) return 'out_of_bounds';
 
     // 1) rasterized Tile-grid occupancy — old zone/road/lot/edu-facility bookkeeping
     const gx0 = Math.floor((minX + mapHalf) / TILE), gx1 = Math.ceil((maxX + mapHalf) / TILE) - 1;
     const gy0 = Math.floor((minZ + mapHalf) / TILE), gy1 = Math.ceil((maxZ + mapHalf) / TILE) - 1;
     const zoneBuild = zoneBuildTypeRef.current;
     for (let y = gy0; y <= gy1; y++) for (let x = gx0; x <= gx1; x++) {
-      if (!inBounds(x, y)) return false;
+      if (!inBounds(x, y)) return 'out_of_bounds';
+      // exact mode: a Tile inside the bounding box that the (rotated) footprint does not really touch
+      // is none of this house's business (TILE - 0.04 so merely sharing an edge does not count).
+      if (exact && !obbOverlap(cx, cz, w, h, rotation, tileWorldX(x), tileWorldZ(y), TILE - 0.04, TILE - 0.04, 0)) continue;
       if (zoneBuild != null) {
         // Prompt 21F: zone-driven auto-build. A tile only zoned for THIS type (level 0, no lot) is
         // free to build on; for RES a tile already claimed by another RES lot is also acceptable
@@ -9933,12 +10081,12 @@ export default function CityGridIso() {
         const gi = idx(x, y), g = grid[gi], owner = lotIdGrid[gi];
         const freeZoneTile = owner === -1 && (g === TILE_EMPTY || (g === zoneBuild && levelRef.current[gi] === 0));
         const sharedResLot = zoneBuild === TILE_RES && owner !== -1 && lotsRef.current.has(owner);
-        if (!freeZoneTile && !sharedResLot) return false;
-      } else if (grid[idx(x, y)] !== TILE_EMPTY || lotIdGrid[idx(x, y)] !== -1) return false;
+        if (!freeZoneTile && !sharedResLot) return 'legacy_tile_block';
+      } else if (grid[idx(x, y)] !== TILE_EMPTY || lotIdGrid[idx(x, y)] !== -1) return 'legacy_tile_block';
       // wide roads (six/six_median/eight_median etc.) occupy extra ground beyond their own grid
       // cell — treat any orthogonal neighbour whose pavement overhang reaches into this tile as
       // road-occupied too, so a Building can't be dropped into the overhang.
-      if (tileBlockedByRoadFootprint(x, y)) return false;
+      if (tileBlockedByRoadFootprint(x, y)) return 'legacy_tile_block';
     }
 
     // 2) the free (World Space) RoadSegment network's REAL paved footprint — sampled across the
@@ -9958,7 +10106,7 @@ export default function CityGridIso() {
       } else {
         sx = minX + (maxX - minX) * (ix / sampX); sz = minZ + (maxZ - minZ) * (iz / sampZ);
       }
-      if (isInsideRoadFootprint(network, sx, sz)) return false;
+      if (isInsideRoadFootprint(network, sx, sz)) return 'road_collision';
     }
 
     // 3) real World Space OBB polygon overlap against every other placed Building (requirement
@@ -9975,10 +10123,20 @@ export default function CityGridIso() {
       // micro-cell reservation, not a 0.75m buffer, is what separates them) — so no padding, and a
       // hair of negative pad so two footprints sharing an edge aren't reported as overlapping.
       const pad = zoneBuildTypeRef.current != null ? -0.02 : BUILDING_MIN_SEPARATION;
-      if (obbOverlap(cx, cz, w + pad, h + pad, rotation, other.position.x, other.position.z, other.footprint.width, other.footprint.depth, otherRotation)) return false;
+      if (obbOverlap(cx, cz, w + pad, h + pad, rotation, other.position.x, other.position.z, other.footprint.width, other.footprint.depth, otherRotation)) return 'footprint_collision';
     }
-    return true;
+    // 3b) exact mode: every OTHER Building the Registry knows about (Commercial / Industrial /
+    // Education / Workplace / Store records carry a real World Space footprint too) — RES lots were
+    // just covered above, so 'lot' records are skipped. Same hair-of-negative padding as above.
+    if (exact) {
+      for (const rec of buildingRegistryRef.current.values()) {
+        if (rec.sourceType === 'lot' || !rec.footprint) continue;
+        if (obbOverlap(cx, cz, w - 0.02, h - 0.02, rotation, rec.position.x, rec.position.z, rec.footprint.width, rec.footprint.depth, rec.footprint.rotation || 0)) return 'footprint_collision';
+      }
+    }
+    return null;
   }, []);
+  const lotFootprintClear = useCallback((cx, cz, w, h, rotation = 0) => lotFootprintCheck(cx, cz, w, h, rotation) === null, [lotFootprintCheck]);
 
   // findLotFrontage: 建物のfrontage edge -> 最寄りのRoadSegment 判定 (§道路接道). Samples the four
   // edge midpoints of the footprint (never a Tile-neighbor lookup) against BOTH road systems that
@@ -10221,17 +10379,31 @@ export default function CityGridIso() {
   // exact rotated footprint sits inside a real Building Parcel, so the un-rotated re-check that
   // lotHasRoadAccess does is skipped — it rejects perfectly good road-aligned footprints on
   // diagonal / curved roads.
+  // Prompt 23-R2: finalizeLot is now TRANSACTIONAL and reports WHY it refused.
+  //  * opts.diag (optional object): on failure finalizeLot writes diag.reason (a failure-reason key,
+  //    see LOW_DENSITY_FAIL_TEXT) and, if it caught an exception, diag.error. Return value stays boolean.
+  //  * opts.exact (Roadside-Plot houses): see lotFootprintCheck.
+  //  * opts.plotSource: recorded on the lot (which land source the placement came from).
+  //  * Everything after the lot is inserted (Building Registry record, plot/micro-cell reservation,
+  //    3D mesh) runs inside try/catch; if ANY of it throws, the lot is removed again through removeLot
+  //    (registry record, reservations, Tile bookkeeping, mesh) before returning false — so a failed
+  //    build can never leave a ghost Building Registry record or hidden plot cells behind. (That is
+  //    exactly what the CELL ReferenceError in HousingPBR used to cause: the exception escaped after
+  //    the reservation had already hidden the plot cells.)
   const finalizeLot = useCallback((type, centerX, centerZ, width, depth, frontSign, rotationY = 0, opts = {}) => {
+    const fail = (reason) => { if (opts.diag) opts.diag.reason = reason; return false; };
     const spec = RES_LOT_TYPES[type];
-    if (!spec || popRef.current < spec.unlockPop) return false;
-    if (!lotFootprintClear(centerX, centerZ, width, depth, rotationY)) return false;
-    if (!opts.skipRoadAccess && !lotHasRoadAccess(centerX, centerZ, width, depth)) return false;
+    if (!spec) return fail('unknown');
+    if (popRef.current < spec.unlockPop) return fail('unknown');
+    const clearReason = lotFootprintCheck(centerX, centerZ, width, depth, rotationY, opts.exact ? { exact: true } : null);
+    if (clearReason) return fail(clearReason);
+    if (!opts.skipRoadAccess && !lotHasRoadAccess(centerX, centerZ, width, depth)) return fail('unknown');
     // Prompt 17 §4/5/6: grade the site from the footprint's own sampled terrain heights (never a
     // single center-point guess) before committing — a site steeper than
     // BUILDING_GRADE_SLOPE_RETAINING is refused outright ("placement禁止") rather than let a house
     // float or bury itself past what a foundation/retaining wall can reasonably hide.
     const grading = computeBuildingGrading(centerX, centerZ, width, depth, rotationY);
-    if (!grading.buildable) return false;
+    if (!grading.buildable) return fail('terrain_too_steep');
     const mapHalf = (GRID_SIZE * TILE) / 2;
     // Prompt 21F: legacy Tile bookkeeping is rasterized from the ROTATED footprint's real bounds
     // (identical to before for rotation 0), so a house turned to face an east/west road no longer
@@ -10243,7 +10415,7 @@ export default function CityGridIso() {
     const gy = Math.floor((bz0 + mapHalf) / TILE);
     const w = Math.ceil((bx1 + mapHalf) / TILE) - gx;
     const h = Math.ceil((bz1 + mapHalf) / TILE) - gy;
-    if (gx < 0 || gy < 0 || gx + w > GRID_SIZE || gy + h > GRID_SIZE) return false;
+    if (gx < 0 || gy < 0 || gx + w > GRID_SIZE || gy + h > GRID_SIZE) return fail('out_of_bounds');
     const grid = gridRef.current, lotIdGrid = lotIdGridRef.current;
     const id = lotIdCounterRef.current++;
     for (let y = gy; y < gy + h; y++) for (let x = gx; x < gx + w; x++) {
@@ -10264,17 +10436,26 @@ export default function CityGridIso() {
       grading, // { strategy, baseY, foundationHeight, embedHeight, slope, ... } — see rebuildLotGroup
       gx, gy, w, h, // legacy Tile-grid rasterization — bookkeeping only, see migration header comment
       level: opts.initialLevel || 0, group: null, frontSign: frontSign ?? -1,
+      plotSource: opts.plotSource || null, // Prompt 23-R2: 'roadside_plot_selection' | null
     };
     lotsRef.current.set(id, lot);
-    registerBuildingForLot(lot); // Prompt 8: one-way Building Registry registration, additive only
-    // Prompt 20K Part O (fixed): keyed by the REAL Building Registry buildingId (lot.buildingId,
-    // set by registerBuildingForLot just above), not the legacy numeric lot id.
-    reserveMicroCellsForBuilding(lot.buildingId, centerX, centerZ, width, depth, rotationY || 0);
-    rebuildLotGroup(lot);
-    threeRef.current?.rebuildRoadTileList?.();
-    threeRef.current?.syncInstances?.();
+    try {
+      registerBuildingForLot(lot); // Prompt 8: one-way Building Registry registration, additive only
+      // Prompt 20K Part O (fixed): keyed by the REAL Building Registry buildingId (lot.buildingId,
+      // set by registerBuildingForLot just above), not the legacy numeric lot id.
+      reserveMicroCellsForBuilding(lot.buildingId, centerX, centerZ, width, depth, rotationY || 0);
+      rebuildLotGroup(lot);
+      if (threeRef.current && !lot.group) throw new Error('lot mesh was not created');
+      threeRef.current?.rebuildRoadTileList?.();
+      threeRef.current?.syncInstances?.();
+    } catch (err) {
+      console.error('[finalizeLot] building creation failed — rolling the lot back', err);
+      if (opts.diag) opts.diag.error = err && err.message ? err.message : String(err);
+      try { removeLot(id); } catch (rollbackErr) { console.error('[finalizeLot] rollback failed', rollbackErr); lotsRef.current.delete(id); }
+      return fail('finalize_failed');
+    }
     return true;
-  }, [lotFootprintClear, lotHasRoadAccess, rebuildLotGroup, registerBuildingForLot]);
+  }, [lotFootprintCheck, lotHasRoadAccess, rebuildLotGroup, registerBuildingForLot, removeLot]);
 
   // ============================================================================
   // Prompt 20M: World Space Commercial Building placement (Audit: Prompt 20L)
@@ -10833,10 +11014,25 @@ export default function CityGridIso() {
   // The anchor picks a plot cell; the pointer is mapped onto that cell's own road side (see
   // getPlotSelection), so the selection is a column x row block PARALLEL to the road — not a
   // world-axis rectangle and not a 6m Tile. The preview draws exactly the selected cells.
+  // publishZoneStatus: push the Residential zoning status to the UI panel — only when its content changed.
+  // publishZoneStatus(null, 'preview') clears the panel only if it is currently showing a drag preview
+  // (so a finished drag's RESULT is not wiped by an incidental hide).
+  const publishZoneStatus = (status, onlyIfPhase = null) => {
+    if (onlyIfPhase && lastZoneStatusRef.current?.phase !== onlyIfPhase) return;
+    const key = status ? JSON.stringify(status) : '';
+    if (key === zoneStatusKeyRef.current) return;
+    zoneStatusKeyRef.current = key;
+    lastZoneStatusRef.current = status;
+    if (zoneStatusTimerRef.current) { clearTimeout(zoneStatusTimerRef.current); zoneStatusTimerRef.current = null; }
+    setZoneStatus(status);
+    if (status && status.phase === 'result') { // a result stays visible for a while, then fades out
+      zoneStatusTimerRef.current = setTimeout(() => { zoneStatusKeyRef.current = ''; lastZoneStatusRef.current = null; setZoneStatus(null); }, 12000);
+    }
+  };
   const updateMicroZonePreview = (tool, ax, az, cx, cz) => {
     const t = threeRef.current; if (!t || !t.plotSelectionMesh) return;
     const zoneType = tool === 'zone_res' ? TILE_RES : tool === 'zone_com' ? TILE_COM : tool === 'zone_ind' ? TILE_IND : null;
-    const hide = () => { t.plotSelectionMesh.visible = false; dragRef.current.microRect = null; };
+    const hide = () => { t.plotSelectionMesh.visible = false; dragRef.current.microRect = null; publishZoneStatus(null, 'preview'); };
     if (!zoneType) { hide(); return; }
     let anchor = dragRef.current.plotAnchor;
     if (anchor === undefined) { anchor = pickPlotCellNear(ax, az, 2) || null; dragRef.current.plotAnchor = anchor; }
@@ -10845,22 +11041,39 @@ export default function CityGridIso() {
     if (!sel || !sel.cells.length) { hide(); return; }
     let openCount = 0;
     const openFlags = sel.cells.map((cell) => { const o = isPlotCellOpen(cell); if (o) openCount++; return o; });
-    let valid;
-    if (zoneType === TILE_RES && isLowDensityResidentialNow()) {
-      // Low density: the selection IS the house — must be one of the allowed cell sizes AND really buildable.
-      valid = sel.missing === 0 && openCount === sel.cells.length && isLowDensityCellSelection(sel.cols, sel.rows) && !!canBuildLowDensityHouse(sel);
+    // `valid` is the ZONE-commit gate read by onPointerUp (microRect.valid). For a low-density Residential
+    // drag the Building is planned separately: Zone READY + Building BLOCKED is a normal, shown state.
+    let valid, plan = null;
+    const lowDensity = zoneType === TILE_RES && isLowDensityResidentialNow();
+    if (lowDensity) {
+      plan = planLowDensityHouse(sel);
+      valid = plan.zoneOk;
     } else {
       // a zoning drag must span at least 3 x 3 cells (the smallest Building footprint) and contain
       // at least that many open cells — a bare click / 1-cell sliver can never hold a Building.
       valid = sel.cols >= ZONE_MIN_SELECTION_CELLS && sel.rows >= ZONE_MIN_SELECTION_CELLS && openCount >= ZONE_MIN_SELECTION_CELLS * ZONE_MIN_SELECTION_CELLS;
     }
-    dragRef.current.microRect = { sel, valid };
+    dragRef.current.microRect = { sel, valid, plan };
+    if (zoneType === TILE_RES) {
+      const sizeTxt = `${sel.cols} × ${sel.rows} cells`;
+      if (lowDensity) {
+        publishZoneStatus(!plan.zoneOk
+          ? { phase: 'preview', zone: 'INVALID', size: sizeTxt, building: '—', reason: plan.reason }
+          : plan.buildOk
+            ? { phase: 'preview', zone: 'READY', size: sizeTxt, building: `${sel.cols} × ${sel.rows} House`, buildState: 'READY' }
+            : { phase: 'preview', zone: 'READY', size: sizeTxt, building: `${sel.cols} × ${sel.rows} House`, buildState: 'BLOCKED', reason: plan.reason });
+      } else {
+        publishZoneStatus({ phase: 'preview', zone: valid ? 'READY' : 'INVALID', size: sizeTxt, building: valid ? '区画モジュールに分割して建築' : '—', buildState: valid ? 'READY' : undefined, reason: valid ? undefined : 'selection_invalid' });
+      }
+    }
+    // colours: blue/amber/purple = zone + building OK; AMBER = zone will be created but the building is blocked; RED = invalid
     const zc = new THREE.Color(zoneType === TILE_RES ? 0x5a90d8 : zoneType === TILE_COM ? 0xe0b060 : 0x9b6fdc);
+    const amber = new THREE.Color(0xe0a030);
     const red = new THREE.Color(0xe05a4f);
     const positions = [], colors = [];
     sel.cells.forEach((cell, i) => {
       if (isPlotCellReserved(cell)) return; // a house already stands here
-      const col = valid && openFlags[i] ? zc : red;
+      const col = valid && openFlags[i] ? (plan && !plan.buildOk ? amber : zc) : red;
       const [c0, c1, c2, c3] = cell.corners;
       for (const c of [c0, c1, c2, c0, c2, c3]) { positions.push(c.x, c.y + PLOT_PREVIEW_LIFT, c.z); colors.push(col.r, col.g, col.b); }
     });
@@ -17402,26 +17615,52 @@ export default function CityGridIso() {
   // still open get painted. ----
   const commitMicroZoneRect = (tool) => {
     const rect = dragRef.current.microRect;
-    if (!rect || !rect.valid) return;
+    if (!rect || !rect.valid) return; // rect.valid == the ZONE is committable (see updateMicroZonePreview)
     const sel = rect.sel;
     const zoneType = tool === 'zone_res' ? TILE_RES : tool === 'zone_com' ? TILE_COM : TILE_IND;
-    // BUILD FIRST, paint/project the zone second. projectMicroZoneToTileCache flips the legacy Tile
-    // cache to TILE_RES/COM/IND, and lotFootprintClear treats any non-empty Tile as occupied — so
-    // with the old order the zone itself blocked every building it was drawn for.
-    let built = 0;
-    if (zoneType === TILE_RES) built = isLowDensityResidentialNow() ? buildLowDensityHouse(sel) : packAndBuildResidentialZone(sel);
-    else if (zoneType === TILE_COM) built = packAndBuildCommercialZone(sel);
-    else built = packAndBuildIndustrialZone(sel);
-    // A Residential drag that could not seat a single house leaves NO blue "zone" behind — a zone
-    // that never gets a building was the reported symptom. (COM/IND keep painting: their Tile-based
-    // growth simulation can still fill a zoned Tile later.)
-    if (zoneType === TILE_RES && built === 0) {
-      threeRef.current?.refreshRoadsidePlotOverlayColors?.();
-      return;
+    const paintZone = () => {
+      const touched = new Set();
+      for (const cell of sel.cells) { if (isPlotCellOpen(cell)) paintPlotCell(cell, zoneType, touched); }
+      projectTouchedTiles(touched, zoneType);
+    };
+    if (zoneType === TILE_RES) {
+      // Prompt 23-R2: ZONE and BUILDING are separate. Zone selection -> Zone commit -> Building attempt.
+      //   1) the Residential zone is committed FIRST (plot cells zoneType = RES) and is never taken back:
+      //      a failed / thrown building attempt must not clear the selection, the zone or the roadside plots.
+      //   2) then the building is attempted. Success: cells -> RES -> Building -> Registry -> reservation.
+      //      Failure: cells stay RES, buildingId null, no reservation, no Registry record (finalizeLot
+      //      rolls back), and the reason is shown to the player.
+      // (The zone can be painted first because lotFootprintCheck accepts a Tile that is zoned RES at
+      // level 0 while a Residential zone is being built — Prompt 21F — so it no longer blocks its own house.)
+      paintZone();
+      const lowDensity = isLowDensityResidentialNow();
+      const sizeTxt = `${sel.cols} × ${sel.rows} cells`;
+      let result = null, builtCount = 0;
+      try {
+        if (lowDensity) {
+          result = buildLowDensityHouse(sel);
+          builtCount = result.ok ? 1 : 0;
+        } else {
+          builtCount = packAndBuildResidentialZone(sel);
+          result = builtCount > 0 ? { ok: true } : { ok: false, reason: 'no_module' };
+        }
+      } catch (err) { // belt and braces: nothing thrown while building may undo the zone
+        console.error('[zone_res] building attempt threw', err);
+        result = { ok: false, reason: 'finalize_failed', error: err && err.message };
+      }
+      paintZone(); // idempotent; re-projects Tiles that a rolled-back attempt reset
+      publishZoneStatus({
+        phase: 'result', zone: 'COMMITTED', size: sizeTxt,
+        building: lowDensity ? `${sel.cols} × ${sel.rows} House` : `${builtCount} 棟`,
+        buildState: result.ok ? 'BUILT' : 'FAILED',
+        reason: result.ok ? undefined : result.reason, error: result.ok ? undefined : result.error,
+      });
+    } else {
+      // COM / IND: unchanged (build first, then paint) — their Tile-based growth simulation can still fill a zoned Tile later.
+      if (zoneType === TILE_COM) packAndBuildCommercialZone(sel);
+      else packAndBuildIndustrialZone(sel);
+      paintZone();
     }
-    const touched = new Set();
-    for (const cell of sel.cells) { if (isPlotCellOpen(cell)) paintPlotCell(cell, zoneType, touched); }
-    projectTouchedTiles(touched, zoneType);
     // the just-painted cells' zone colour (and any Building just placed on them) changed, but the
     // cell geometry itself didn't move — a colors-only recolor is enough.
     threeRef.current?.refreshRoadsidePlotOverlayColors?.();
@@ -18888,6 +19127,32 @@ Grade: ${((freeRoadDraftStatus?.grade ?? 0) * 100).toFixed(1)}%${freeRoadDraftSt
           </div>
         </div>
       )}
+
+      {zoneStatus && tool === 'zone_res' && cameraMode !== 'driver' && cameraMode !== 'ped' && (() => {
+        const z = zoneStatus, isResult = z.phase === 'result';
+        const buildColor = z.buildState === 'BUILT' || z.buildState === 'READY' ? '#7fe0a8' : z.buildState === 'BLOCKED' || z.buildState === 'FAILED' ? '#e0a030' : '#a8d8bc';
+        const zoneColor = z.zone === 'INVALID' ? '#e05a4f' : '#5a90d8';
+        const reasonText = z.reason ? (LOW_DENSITY_FAIL_TEXT[z.reason] || LOW_DENSITY_FAIL_TEXT.unknown) : null;
+        return (
+          <div style={{ position: 'absolute', bottom: 70, left: '50%', transform: 'translateX(-50%)', padding: '10px 14px', background: 'rgba(15, 21, 18, 0.92)', border: `1px solid ${z.zone === 'INVALID' ? '#e05a4f' : z.buildState === 'BLOCKED' || z.buildState === 'FAILED' ? '#e0a030' : '#5a90d8'}`, borderRadius: 6, color: '#e8e8e8', fontSize: 12, minWidth: 260, maxWidth: 380, pointerEvents: 'none', lineHeight: 1.6 }}>
+            <div style={{ color: zoneColor, fontSize: 13 }}>RESIDENTIAL ZONE</div>
+            <div>{z.size}</div>
+            <div>Zone: <span style={{ color: zoneColor }}>{z.zone}</span></div>
+            {isResult && z.buildState && (
+              <div style={{ marginTop: 4 }}>住宅建築: <span style={{ color: buildColor }}>{z.buildState === 'BUILT' ? '成功' : '失敗'}</span></div>
+            )}
+            {!isResult && z.zone !== 'INVALID' && <div>Building: {z.building}</div>}
+            {!isResult && z.buildState && <div>Status: <span style={{ color: buildColor }}>{z.buildState}</span></div>}
+            {isResult && z.building && <div>Building: {z.building}</div>}
+            {reasonText && (
+              <div style={{ marginTop: 4, color: z.zone === 'INVALID' ? '#e0857a' : '#e0b060' }}>
+                理由: {reasonText}
+                <div style={{ fontSize: 10, color: '#7fa892' }}>({z.reason}{z.error ? `: ${z.error}` : ''})</div>
+              </div>
+            )}
+          </div>
+        );
+      })()}
 
       {driverPanel && cameraMode !== 'driver' && cameraMode !== 'ped' && (
         <div style={{ position: 'absolute', bottom: 70, left: '50%', transform: 'translateX(-50%)', padding: '12px 16px', background: 'rgba(15, 21, 18, 0.92)', border: '1px solid #ffd35a', borderRadius: 6, color: '#e8e8e8', fontSize: 12, minWidth: 220 }}>

@@ -168,16 +168,18 @@ function makeMansardRoof({ width, depth, height, material }) {
 }
 
 // ----------------------------------------------------------------------------
-// 4. 低密度住宅 8サイズ x 10種 = 80種 データ（res_low）
+// 4. 低密度住宅 11サイズ x 10種 = 110種 データ（res_low）
 // ----------------------------------------------------------------------------
 // メインファイルの区画選択セルは 1セル = 1メートル（PLOT_CELL_SIZE）で、低密度住宅は
 // 「選択したセルの実寸そのもの」が建物の間口(width)x奥行(depth)になる（旧30種データは
 // CELL=2.5m換算の架空サイズで作られており、しかもメインファイル側からは一度も
 // 呼び出されていなかった＝実際には使われていなかったので、ここで作り直す）。
-// 許可される区画セルサイズは次の8種類のみ（メインファイル側 LOW_DENSITY_CELL_SIZES と
+// 許可される区画セルサイズは次の11種類のみ（メインファイル側 LOW_DENSITY_CELL_SIZES と
 // 完全に一致させること）:
-//   3x2  3x3  3x4  3x5  3x6  4x4  4x5  4x6   （3x2 は正規化すると 2x3）
-const LOW_DENSITY_SIZE_CLASSES = ['2x3', '3x3', '3x4', '3x5', '3x6', '4x4', '4x5', '4x6'];
+//   3x2(=2x3, 既存互換)  3x3  3x4  3x5  3x6  4x4  4x5  4x6  5x5  5x6  6x6
+// Prompt 23-R2: 5x5 / 5x6 / 6x6 を末尾に追加。既存サイズの配列位置(=sizeIdx=seed)は
+// 変えないので、既に建っている家の見た目/シードは変わらない。
+const LOW_DENSITY_SIZE_CLASSES = ['2x3', '3x3', '3x4', '3x5', '3x6', '4x4', '4x5', '4x6', '5x5', '5x6', '6x6'];
 
 // 外観バリエーション用パレット（10種を作るための素材の組み合わせ。既存のテラスハウス
 // パレットと重複しないよう、低密度住宅らしい戸建て向け素材のみを使用）。
@@ -301,7 +303,17 @@ export function buildLowDensityHouse(config) {
   group.name = config.id;
 
   const width = Math.max(1.6, config.widthCells * 0.92);
-  const depth = Math.max(1.6, config.depthCells * 0.92);
+  const depthFull = Math.max(1.6, config.depthCells * 0.92);
+  // Prompt 23-R2: the whole house — INCLUDING the front porch and its steps — must stay inside the
+  // selected cells (= the lot footprint, config.widthCells x config.depthCells metres). Before, the
+  // porch + steps stuck out 2-3 m past the front edge (onto the sidewalk / road) and a wraparound porch
+  // was wider than the lot. So when a porch is present the main body is shortened by the porch's
+  // front extension and the whole assembly is re-centred on the footprint (see the end of this function).
+  const hasPorch = !!(config.porch && config.porch.present && depthFull >= 3.2);
+  const porchDepthC = Math.min(1.8, Math.max(0.9, depthFull * 0.3));
+  const stepCountC = porchDepthC >= 1.4 ? 3 : 2;
+  const frontExt = hasPorch ? porchDepthC + 0.34 + (stepCountC - 1) * 0.32 : 0;
+  const depth = hasPorch ? Math.max(2.0, depthFull - frontExt) : depthFull;
   const floorHeight = 2.9;
   const wallHeight = floorHeight * (config.floors || 1);
   const ridgeHeight = wallHeight * 0.5;
@@ -324,7 +336,8 @@ export function buildLowDensityHouse(config) {
   group.add(walls);
 
   // 切妻屋根（軒の出は小さい家ほど相対的に抑える）
-  const overhang = Math.min(0.5, Math.min(width, depth) * 0.14);
+  // Prompt 23-R2: eaves are clamped so the roof also stays inside the lot (body is 0.92 of the lot; slack = 4%)
+  const overhang = Math.max(0.08, Math.min(0.5, Math.min(width, depth) * 0.14, Math.min(config.widthCells, config.depthCells) * 0.04));
   const roof = makeGableRoof({ width, depth, ridgeHeight, overhang, material: roofMat });
   roof.position.y = baseY + wallHeight;
   group.add(roof);
@@ -376,10 +389,11 @@ export function buildLowDensityHouse(config) {
 
   // ポーチ（奥行3.2m未満では省略。前方(道路側の宅地セットバック側)へ張り出すだけなので
   // 隣接ロットへは食い込まない）
-  if (config.porch && config.porch.present && depth >= 3.2) {
+  if (hasPorch) {
     const wrap = config.porch.style === 'wraparound' && width >= 4;
-    const porchDepth = Math.min(1.8, Math.max(0.9, depth * 0.3));
-    const porchWidth = wrap ? width + 1.0 : Math.max(1.2, width * 0.55);
+    const porchDepth = porchDepthC;
+    // never wider than the lot itself (a wraparound porch used to overhang the neighbouring lot)
+    const porchWidth = wrap ? Math.min(width + 1.0, config.widthCells - 0.25) : Math.max(1.2, width * 0.55);
     const deckMat = getPBRMaterial('deckWood', { repeatX: porchWidth / 1.5, repeatY: porchDepth / 1.5 });
 
     const floor = new THREE.Mesh(new THREE.BoxGeometry(porchWidth, 0.15, porchDepth), deckMat);
@@ -393,11 +407,11 @@ export function buildLowDensityHouse(config) {
       col.position.set(-porchWidth / 2 + t * porchWidth, baseY + 1.25, depth / 2 + porchDepth - 0.1);
       group.add(col);
     }
-    const porchRoof = new THREE.Mesh(new THREE.BoxGeometry(porchWidth + 0.3, 0.12, porchDepth + 0.3), roofMat);
+    const porchRoof = new THREE.Mesh(new THREE.BoxGeometry(Math.min(porchWidth + 0.3, config.widthCells), 0.12, porchDepth + 0.3), roofMat);
     porchRoof.position.set(0, baseY + 2.4, depth / 2 + porchDepth / 2);
     group.add(porchRoof);
 
-    const stepCount = porchDepth >= 1.4 ? 3 : 2;
+    const stepCount = stepCountC;
     for (let s = 0; s < stepCount; s++) {
       const step = new THREE.Mesh(new THREE.BoxGeometry(Math.min(1.2, porchWidth * 0.8) - s * 0.15, 0.15, 0.32), foundationMat);
       step.position.set(0, baseY - 0.15 * (stepCount - s) + 0.075, depth / 2 + porchDepth + 0.18 + s * 0.32);
@@ -405,15 +419,18 @@ export function buildLowDensityHouse(config) {
     }
   }
 
+  // re-centre body + porch + steps on the lot footprint (everything above is a direct child of `group`)
+  if (frontExt > 0) group.children.forEach((ch) => { ch.position.z -= frontExt / 2; });
+
   group.userData.houseConfig = config;
   return group;
 }
 
 /**
  * ロットの実際の間口(w)x奥行(d)（メートル、= 選択セル数）から、対応するサイズクラスの
- * 10種プールの中から1棟選んで建てる。w/d はそのまま使う（8サイズのどちらの向きで
+ * 10種プールの中から1棟選んで建てる。w/d はそのまま使う（11サイズのどちらの向きで
  * 選択されていても、正規化したクラスから10種を探した上で実寸 w/d で建てる）。
- * サイズが8種のどれにも一致しない場合は null を返す（呼び出し側で建築を拒否すること）。
+ * サイズが11種のどれにも一致しない場合は null を返す（呼び出し側で建築を拒否すること）。
  */
 export function buildLowDensityHouseForCell(w, d, variantIndex = 0) {
   const base = getLowDensityHouseConfigForCell(w, d, variantIndex);
@@ -424,6 +441,14 @@ export function buildLowDensityHouseForCell(w, d, variantIndex = 0) {
 // ----------------------------------------------------------------------------
 // 7. テラスハウスビルダー
 // ----------------------------------------------------------------------------
+
+// Prompt 23-R2 ROOT-CAUSE FIX: buildTerraceHouse below still multiplies by CELL, but the CELL
+// constant was deleted when the low-density generator moved to 1 cell = 1 m (see §6 comment).
+// Every call therefore threw `ReferenceError: CELL is not defined`. The terrace house keeps its
+// original 2.5 m-per-unit proportions (the main file's res_terrace branch rescales it with the
+// matching NATIVE_W = 2.5*1.5 / NATIVE_D = 2.5*2*1.5), so the constant is restored here, scoped
+// to the terrace builder only — low-density houses never use it.
+const CELL = 2.5;
 
 export function buildTerraceHouse(config) {
   const group = new THREE.Group();
