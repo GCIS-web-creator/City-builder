@@ -1,6 +1,9 @@
 import React, { useRef, useEffect, useState, useCallback, useMemo } from 'react';
 import * as THREE from 'three';
-import { buildTerraceHouse, getTerraceHouseConfig, TERRACE_HOUSES, buildLowDensityHouseForCell } from './HousingPBR.jsx';
+import { buildTerraceHouse, getTerraceHouseConfig, TERRACE_HOUSES, buildLowDensityHouseForCell, getHouseArchetype } from './HousingPBR.jsx';
+// Prompt 24A: res_low Roadside-Plot houses are drawn by ONE shared InstancedMesh renderer (no per-house Group).
+import { createHouseInstanceRenderer } from './HouseInstanceRenderer.jsx';
+const HOUSE_RENDERER_IS_DEV = (() => { try { return !!(import.meta && import.meta.env && import.meta.env.DEV); } catch (e) { return false; } })();
 
 const GRID_SIZE = 64;
 const TILE = 6;
@@ -7698,6 +7701,9 @@ function buildBuildingVariants(zone) {
   return out;
 }
 
+// Prompt 24A: true when a legacy low-density preset exists for this lot's footprint (dev fallback gate).
+function isLowDensityHouseSizeAvailableForLot(lot) { return !!getHouseArchetype(lot.footprint.width, lot.footprint.depth, 0); }
+
 // ============ residential lot mesh builder (variable World Space w x h footprint, in meters) ====
 // w/h are the lot's real World Space footprint.width/footprint.depth directly (NEVER multiplied
 // by TILE here) — this is the "buildLotGroup receives worldWidth/worldDepth directly" requirement.
@@ -8541,7 +8547,10 @@ export default function CityGridIso() {
   // registerBuildingForLot: called once, right after a Lot is created (finalizeLot). Additive
   // only — sets lot.buildingId alongside the lot's existing id/gx/gy/etc, never replacing them.
   const registerBuildingForLot = useCallback((lot) => {
+    // Prompt 24A: a res_low house records its House Archetype (data only — never a THREE.Group).
+    const houseArch = lot.type === 'res_low' ? getHouseArchetype(lot.footprint.width, lot.footprint.depth, ((lot.id % 10) + 10) % 10) : null;
     const record = createBuildingRecord({
+      shapeType: houseArch ? 'house' : null, seed: houseArch ? lot.id : null, archetypeId: houseArch ? houseArch.id : null,
       kind: 'lot',
       zoneType: lot.type,
       level: lot.level,
@@ -8552,6 +8561,7 @@ export default function CityGridIso() {
       sourceType: 'lot',
       sourceId: lot.id,
     });
+    if (houseArch) record.sizeClass = houseArch.sizeClass;
     registerBuildingRecord(buildingRegistryRef.current, buildingTileIndexRef.current, record);
     lot.buildingId = record.id;
     return record.id;
@@ -10271,8 +10281,47 @@ export default function CityGridIso() {
   // placement does.
   const lotHasRoadAccess = useCallback((cx, cz, w, h) => findLotFrontage(cx, cz, w, h).ok, [findLotFrontage]);
 
+  // Prompt 24A: res_low house visual = an INSTANCE in the shared HouseInstanceRenderer (lot.renderHandle),
+  // not a THREE.Group. Level-up / re-grade only updates that instance's slots — no geometry is rebuilt
+  // or disposed. Returns true when the instanced path handled the lot.
+  const syncLowDensityHouseInstance = useCallback((lot, t) => {
+    const hr = t.houseRenderer;
+    if (!hr || lot.type !== 'res_low' || !(lot.level > 0)) return false;
+    const w = lot.footprint.width, d = lot.footprint.depth;
+    const grading = computeBuildingGrading(lot.position.x, lot.position.z, w, d, lot.rotation || 0);
+    lot.grading = grading;
+    lot.position.y = grading.baseY;
+    const isRetaining = grading.strategy === 'retaining_wall';
+    const needSkirt = grading.strategy !== 'flat' && grading.foundationHeight > 0.05;
+    const record = {
+      id: lot.id,
+      archetype: { w, d, variantIndex: ((lot.id % 10) + 10) % 10 },
+      position: { x: lot.position.x, y: grading.baseY, z: lot.position.z },
+      rotationY: (lot.rotation || 0) + ((lot.frontSign ?? -1) < 0 ? Math.PI : 0), // local 180° flip when the entrance faces the other local Z side
+      scale: 1, level: lot.level, seed: lot.id,
+      skirt: needSkirt ? { height: grading.foundationHeight + (isRetaining ? 0.3 : 0.05), retaining: isRetaining, width: w * 0.97, depth: d * 0.97, yaw: lot.rotation || 0 } : null,
+    };
+    if (lot.renderHandle != null && hr.hasHouse(lot.renderHandle)) hr.updateHouse(record);
+    else lot.renderHandle = hr.addHouse(record, { immediate: true }); // throws for an unsupported size -> finalizeLot rolls the lot back
+    if (lot.group) { // an old level-0 marker plane, if any
+      t.scene.remove(lot.group);
+      lot.group.traverse((o) => { if (o.geometry) o.geometry.dispose(); if (o.material) { const mats = Array.isArray(o.material) ? o.material : [o.material]; mats.forEach((m) => m.dispose()); } });
+      lot.group = null;
+    }
+    return true;
+  }, []);
+
   const rebuildLotGroup = useCallback((lot) => {
     const t = threeRef.current; if (!t) return;
+    if (lot.type === 'res_low' && lot.level > 0 && t.houseRenderer) {
+      try { if (syncLowDensityHouseInstance(lot, t)) return; }
+      catch (err) {
+        // Development-only fallback to the legacy per-house Group path; production never silently falls back.
+        if (!HOUSE_RENDERER_IS_DEV || !isLowDensityHouseSizeAvailableForLot(lot)) throw err;
+        console.warn('[HouseInstanceRenderer] falling back to legacy Group (dev only):', err);
+      }
+    }
+    if (lot.renderHandle != null && t.houseRenderer) { t.houseRenderer.removeHouse(lot.renderHandle); lot.renderHandle = null; }
     if (lot.group) {
       t.scene.remove(lot.group);
       lot.group.traverse((o) => {
@@ -10308,7 +10357,7 @@ export default function CityGridIso() {
     }
     t.scene.add(group);
     lot.group = group;
-  }, []);
+  }, [syncLowDensityHouseInstance]);
 
   // Part 5 (§Homeless: "家を失う"): any household whose homeId still points at a home tile/lot
   // that just got bulldozed/dezoned loses that home and its members are evicted to Homeless —
@@ -10357,6 +10406,8 @@ export default function CityGridIso() {
     evictHouseholdsAtHome(id); // legacy homeId-based eviction, unchanged (kept for compatibility)
     evictHouseholdsAtHomeBuilding(lot.buildingId); // Prompt 10: new homeBuildingId-based eviction, additive
     const t = threeRef.current;
+    // Prompt 24A: instanced house -> free its instance slots only (shared geometry/materials are never disposed per house)
+    if (t && lot.renderHandle != null && t.houseRenderer) { t.houseRenderer.removeHouse(lot.renderHandle); lot.renderHandle = null; }
     if (t && lot.group) {
       t.scene.remove(lot.group);
       lot.group.traverse((o) => {
@@ -10435,7 +10486,7 @@ export default function CityGridIso() {
       rotation: rotationY || 0,
       grading, // { strategy, baseY, foundationHeight, embedHeight, slope, ... } — see rebuildLotGroup
       gx, gy, w, h, // legacy Tile-grid rasterization — bookkeeping only, see migration header comment
-      level: opts.initialLevel || 0, group: null, frontSign: frontSign ?? -1,
+      level: opts.initialLevel || 0, group: null, renderHandle: null, frontSign: frontSign ?? -1, // renderHandle: Prompt 24A instanced-house id (no THREE object)
       plotSource: opts.plotSource || null, // Prompt 23-R2: 'roadside_plot_selection' | null
     };
     lotsRef.current.set(id, lot);
@@ -10445,7 +10496,7 @@ export default function CityGridIso() {
       // set by registerBuildingForLot just above), not the legacy numeric lot id.
       reserveMicroCellsForBuilding(lot.buildingId, centerX, centerZ, width, depth, rotationY || 0);
       rebuildLotGroup(lot);
-      if (threeRef.current && !lot.group) throw new Error('lot mesh was not created');
+      if (threeRef.current && !lot.group && lot.renderHandle == null) throw new Error('lot mesh was not created');
       threeRef.current?.rebuildRoadTileList?.();
       threeRef.current?.syncInstances?.();
     } catch (err) {
@@ -14366,7 +14417,11 @@ export default function CityGridIso() {
 
     const raycaster = new THREE.Raycaster();
 
+    // Prompt 24A: shared instanced renderer for res_low houses (one per scene; disposed in the effect cleanup)
+    const houseRenderer = createHouseInstanceRenderer(scene);
+
     threeRef.current = {
+      houseRenderer,
       scene, camera, driverCamera, renderer, ground, groundPlane, raycaster,
       sidewalkMesh, hubThroughMeshes, hubThroughMeshesFlip, hubPlainMeshes, armPlainMeshes, armPlainMeshesFlip, armStopMeshes, curbHubMeshes, curbArmMeshes, gateMesh, zoneTint, zoneTintDim, buildingMeshes, buildingVariantDefs, dummy,
       hoverMesh, selectMesh, carSelectMesh, pedSelectMesh, lotPreviewMesh, pollutionMesh, suitabilityMesh, hubMesh, sun,
@@ -15968,6 +16023,7 @@ export default function CityGridIso() {
         const lookX = selCar.worldX + Math.sin(selCar.heading) * 8;
         const lookZ = selCar.worldZ + Math.cos(selCar.heading) * 8;
         driverCamera.lookAt(lookX, carSurfaceY + 1.3, lookZ);
+        houseRenderer.update(driverCamera, {});
         renderer.render(scene, driverCamera);
       } else if (cameraModeRef.current === 'ped' && selPed && selPed.active) {
         // eye-level view riding along with the pedestrian, facing the direction they're walking
@@ -15976,8 +16032,10 @@ export default function CityGridIso() {
         const lookX = selPed.worldX + Math.sin(selPed.heading) * 6;
         const lookZ = selPed.worldZ + Math.cos(selPed.heading) * 6;
         driverCamera.lookAt(lookX, eyeY - 0.1, lookZ);
+        houseRenderer.update(driverCamera, {});
         renderer.render(scene, driverCamera);
       } else {
+        houseRenderer.update(camera, { focus: target });
         renderer.render(scene, camera);
       }
       raf = requestAnimationFrame(animate);
@@ -16002,6 +16060,7 @@ export default function CityGridIso() {
       window.removeEventListener('keydown', onKeyDown);
       window.removeEventListener('keyup', onKeyUp);
       mount.removeChild(renderer.domElement);
+      houseRenderer.dispose(); // removes only the instance buffers; shared house geometry/materials live in HousingPBR's caches
       scene.traverse((obj) => {
         if (obj.geometry) obj.geometry.dispose();
         if (obj.material) {

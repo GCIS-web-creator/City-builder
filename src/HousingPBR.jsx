@@ -600,4 +600,396 @@ export function buildTerraceHouseByIndex(index) {
 }
 
 export { TEXTURE_BASE, TEXTURE_FILES, getPBRMaterial, getSolidMaterial };
-//a
+// ============================================================================
+// 9. Prompt 24A — House Archetype + Shared Geometry Cache + Shared Material Cache
+// ----------------------------------------------------------------------------
+// buildLowDensityHouse() / buildLowDensityHouseForCell() above are kept UNCHANGED (legacy / dev
+// fallback only). The renderer (HouseInstanceRenderer.jsx) never calls them: it asks for a
+// House Archetype (a "blueprint": size class + facade family + roof + porch + chimney + dormer +
+// material refs) and for that archetype's SHARED, MERGED geometry per part and per LOD. Geometry
+// is created once per (oriented size, part, LOD, feature-signature) and reused by every house that
+// looks the same; the per-house differences (position, yaw, height jitter, tint) live in the
+// instance matrix / instance colour, never in new geometry.
+// ============================================================================
+
+// ---- 9.1 shared texture / material cache (extends _textureCache / _materialCache, no 2nd cache) ----
+// Texture repeat is baked into the geometry UVs (see _scaleUV) instead of texture.repeat, so ONE
+// THREE.Texture per image file serves every house size (the legacy path made a new Texture — and a
+// new 4K GPU upload — for every distinct width/depth repeat combination).
+function _loadSharedTex(relPath, srgb) {
+  const key = `shared|${relPath}|${srgb ? 1 : 0}`;
+  if (_textureCache.has(key)) return _textureCache.get(key);
+  const tex = _textureLoader.load(TEXTURE_BASE + relPath);
+  tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+  tex.anisotropy = 8;
+  if (srgb && 'colorSpace' in tex) tex.colorSpace = THREE.SRGBColorSpace;
+  _textureCache.set(key, tex);
+  return tex;
+}
+
+/** Full PBR (diff + normal + ARM) at repeat 1x1 — one Material per preset, shared by all houses. */
+export function getSharedPBRMaterial(presetKey) {
+  const files = TEXTURE_FILES[presetKey];
+  if (!files) return getSolidMaterial(0xcccccc);
+  const key = `shared|pbr|${presetKey}`;
+  if (_materialCache.has(key)) return _materialCache.get(key);
+  const arm = _loadSharedTex(files.arm, false);
+  const mat = new THREE.MeshStandardMaterial({
+    map: _loadSharedTex(files.diff, true),
+    normalMap: _loadSharedTex(files.nor, false),
+    roughnessMap: arm, metalnessMap: arm,
+    roughness: 1, metalness: 1,
+  });
+  _materialCache.set(key, mat);
+  return mat;
+}
+
+/** LOD2: diffuse map only (no normal / ARM lookups) — same Texture object as the PBR material. */
+export function getSharedLiteMaterial(presetKey) {
+  const files = TEXTURE_FILES[presetKey];
+  if (!files) return getSolidMaterial(0xcccccc);
+  const key = `shared|lite|${presetKey}`;
+  if (_materialCache.has(key)) return _materialCache.get(key);
+  const mat = new THREE.MeshStandardMaterial({ map: _loadSharedTex(files.diff, true), roughness: 0.85, metalness: 0 });
+  _materialCache.set(key, mat);
+  return mat;
+}
+
+// LOD3 flat colours (representative average of each preset's diffuse texture).
+const FLAT_COLOR = {
+  paintedWhiteWood: 0xd9d6cc, paintedCreamWood: 0xd8c7a0, weatheredWood: 0x8d8a84, darkWood: 0x5a4030,
+  paintedBlueWood: 0x6f8aa0, rawWoodCedar: 0xa0703f, rawWoodHinoki: 0xc9a76f, deckWood: 0x8a6a48, fenceBamboo: 0xb8a070,
+  plasterWhite: 0xe2dfd6, plasterCreamWorn: 0xb9ae8f, plasterCream: 0xd9c9a6, plasterBlue: 0x7d93a8,
+  concrete: 0x8f8d88, concreteRock: 0x85817a, brickRed: 0x8c4a3a,
+  asphaltShingleBlack: 0x3a3836, asphaltShingleGray: 0x6d6f72, tileRoofBrown: 0x7a4a34, tileRoofRed: 0x9a4530, metalRoofDark: 0x4d5155,
+  stoneRough: 0x7c766c, stoneDark: 0x4a4744,
+};
+function _flatMaterial(presetKey) { return getSolidMaterial(FLAT_COLOR[presetKey] ?? 0xcccccc, { roughness: 0.9, metalness: 0 }); }
+
+export function getHouseMaterialStats() {
+  let shared = 0, solid = 0;
+  _materialCache.forEach((_, k) => { if (k.startsWith('shared|')) shared++; else if (k.startsWith('solid|')) solid++; });
+  let sharedTex = 0;
+  _textureCache.forEach((_, k) => { if (k.startsWith('shared|')) sharedTex++; });
+  return { pbrAndLiteMaterials: shared, solidMaterials: solid, totalMaterials: _materialCache.size, sharedTextures: sharedTex, totalTextures: _textureCache.size };
+}
+
+// ---- 9.2 geometry helpers -------------------------------------------------------------------
+function _scaleUV(geo, rx, ry) {
+  const uv = geo.attributes.uv; if (!uv) return geo;
+  for (let i = 0; i < uv.count; i++) uv.setXY(i, uv.getX(i) * rx, uv.getY(i) * ry);
+  uv.needsUpdate = true;
+  return geo;
+}
+function _gableGeo(width, depth, ridgeHeight, overhang) {
+  const halfW = width / 2 + overhang, extrudeDepth = depth + overhang * 2;
+  const shape = new THREE.Shape();
+  shape.moveTo(-halfW, 0); shape.lineTo(0, ridgeHeight); shape.lineTo(halfW, 0); shape.lineTo(-halfW, 0);
+  const geo = new THREE.ExtrudeGeometry(shape, { depth: extrudeDepth, bevelEnabled: false, curveSegments: 1 });
+  geo.translate(0, 0, -extrudeDepth / 2);
+  geo.computeVertexNormals();
+  return geo;
+}
+// Version-independent merge (BufferGeometryUtils.mergeGeometries / mergeBufferGeometries was renamed
+// between three releases). Everything is flattened to non-indexed pos/normal/uv.
+function _mergeGeos(list) {
+  const parts = list.filter(Boolean).map((g) => (g.index ? g.toNonIndexed() : g));
+  if (!parts.length) return null;
+  let total = 0; parts.forEach((g) => { total += g.attributes.position.count; });
+  const pos = new Float32Array(total * 3), nor = new Float32Array(total * 3), uv = new Float32Array(total * 2);
+  let o = 0;
+  parts.forEach((g) => {
+    pos.set(g.attributes.position.array, o * 3);
+    if (g.attributes.normal) nor.set(g.attributes.normal.array, o * 3);
+    if (g.attributes.uv) uv.set(g.attributes.uv.array, o * 2);
+    o += g.attributes.position.count;
+  });
+  const out = new THREE.BufferGeometry();
+  out.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  out.setAttribute('normal', new THREE.BufferAttribute(nor, 3));
+  out.setAttribute('uv', new THREE.BufferAttribute(uv, 2));
+  out.computeBoundingSphere(); out.computeBoundingBox();
+  list.forEach((g) => g && g.dispose());
+  parts.forEach((g) => g.dispose());
+  return out;
+}
+
+// ---- 9.3 layout (numbers only — an exact mirror of the maths in buildLowDensityHouse) ----------
+function _lowDensityLayout(config) {
+  const width = Math.max(1.6, config.widthCells * 0.92);
+  const depthFull = Math.max(1.6, config.depthCells * 0.92);
+  const hasPorch = !!(config.porch && config.porch.present && depthFull >= 3.2);
+  const porchDepthC = Math.min(1.8, Math.max(0.9, depthFull * 0.3));
+  const stepCountC = porchDepthC >= 1.4 ? 3 : 2;
+  const frontExt = hasPorch ? porchDepthC + 0.34 + (stepCountC - 1) * 0.32 : 0;
+  const depth = hasPorch ? Math.max(2.0, depthFull - frontExt) : depthFull;
+  const floors = config.floors || 1;
+  const wallHeight = 2.9 * floors, ridgeHeight = wallHeight * 0.5, baseY = 0.35;
+  const overhang = Math.max(0.08, Math.min(0.5, Math.min(width, depth) * 0.14, Math.min(config.widthCells, config.depthCells) * 0.04));
+  const winW = Math.min(1.05, width * 0.3), winH = Math.min(1.25, wallHeight * 0.42);
+  const windowXs = width >= 3.2 ? [-width * 0.28, width * 0.28] : [0];
+  const L = {
+    width, depth, depthFull, hasPorch, porchDepthC, stepCountC, frontExt, floors, wallHeight, ridgeHeight, baseY, overhang,
+    winY: baseY + wallHeight * 0.55, winW, winH, glassW: winW - 0.15, glassH: winH - 0.15, windowXs,
+    doorX: windowXs.length === 1 ? width * 0.26 : 0, doorW: Math.min(0.9, width * 0.32),
+    chimney: !!(config.chimney && width >= 3),
+    dormer: !!(config.dormer && width >= 3.6 && depth >= 4.4),
+    uvFacade: [Math.max(width, 1) / 2, wallHeight / 2],
+    uvRoof: [Math.max(width, 1) / 3, Math.max(depth, 1) / 3],
+    uvFound: [Math.max(width, 1) / 2, 0.5],
+    widthCells: config.widthCells, depthCells: config.depthCells,
+    dimKey: `${config.widthCells}x${config.depthCells}`,
+    porch: null,
+  };
+  if (hasPorch) {
+    const wrap = config.porch.style === 'wraparound' && width >= 4;
+    const porchWidth = wrap ? Math.min(width + 1.0, config.widthCells - 0.25) : Math.max(1.2, width * 0.55);
+    L.porch = { wrap, style: wrap ? 'wraparound' : 'partial', key: wrap ? 'w' : 'p', depth: porchDepthC, width: porchWidth, colCount: wrap ? 6 : 4,
+      uvDeck: [porchWidth / 1.5, porchDepthC / 1.5] };
+  }
+  return L;
+}
+
+// ---- 9.4 per-part geometry builders (LOD 0..3) -------------------------------------------------
+const HOUSE_LOD_PARTS = ['wall', 'roof', 'foundation', 'trim', 'glass', 'door', 'deck', 'chimney']; // LOD0 (merged, size-specific). LOD1-3 use _unitParts.
+
+function _partSig(L, part, lod) {
+  const pk = L.hasPorch ? L.porch.key : '0';
+  switch (part) {
+    case 'wall': return `${L.floors}|${L.dormer && lod <= 1 ? 1 : 0}`;
+    case 'roof': return `${L.floors}|${L.dormer && lod <= 1 ? 1 : 0}|${pk}|${L.chimney && lod === 2 ? 1 : 0}`;
+    case 'foundation': case 'trim': case 'deck': return pk;
+    case 'glass': return `${L.dormer && lod === 0 ? 1 : 0}`;
+    case 'chimney': return `${L.floors}`;
+    default: return '0';
+  }
+}
+
+function _buildPart(L, part, lod) {
+  const out = [];
+  const zs = -L.frontExt / 2; // whole assembly is re-centred on the lot footprint (as in buildLowDensityHouse)
+  const put = (geo, x, y, z, uv) => { if (uv) _scaleUV(geo, uv[0], uv[1]); geo.translate(x, y, z + zs); out.push(geo); return geo; };
+  const { width, depth, baseY, wallHeight, ridgeHeight } = L;
+  switch (part) {
+    case 'wall': {
+      if (lod <= 1) {
+        put(new THREE.BoxGeometry(width, wallHeight, depth), 0, baseY + wallHeight / 2, 0, L.uvFacade);
+        if (L.dormer) {
+          const dw = width * 0.28, dd = depth * 0.22, dh = 0.9;
+          put(new THREE.BoxGeometry(dw, dh, dd), 0, baseY + wallHeight + ridgeHeight * 0.35, depth * 0.18, L.uvFacade);
+        }
+      } else { // LOD2/3: body reaches the ground (no separate foundation part)
+        const h = baseY + wallHeight;
+        put(new THREE.BoxGeometry(width, h, depth), 0, h / 2, 0, lod === 2 ? [L.uvFacade[0], h / 2] : null);
+      }
+      break;
+    }
+    case 'roof': {
+      put(_gableGeo(width, depth, ridgeHeight, L.overhang), 0, baseY + wallHeight, 0, lod <= 2 ? L.uvRoof : null);
+      if (lod <= 1 && L.dormer) {
+        const dw = width * 0.28, dd = depth * 0.22, dh = 0.9;
+        const dormerY = baseY + wallHeight + ridgeHeight * 0.35;
+        put(_gableGeo(dw, dd, dh * 0.6, 0.1), 0, dormerY + dh / 2, depth * 0.18, L.uvRoof);
+      }
+      if (lod <= 2 && L.hasPorch) {
+        const p = L.porch;
+        put(new THREE.BoxGeometry(Math.min(p.width + 0.3, L.widthCells), 0.12, p.depth + 0.3), 0, baseY + 2.4, depth / 2 + p.depth / 2, L.uvRoof);
+      }
+      if (lod === 2 && L.chimney) {
+        const chimneyH = wallHeight * 0.9 + ridgeHeight * 0.6, cw = Math.min(0.7, width * 0.16);
+        put(new THREE.BoxGeometry(cw, chimneyH, cw), width * 0.3, baseY + chimneyH / 2, -depth * 0.2, null);
+      }
+      break;
+    }
+    case 'foundation': {
+      put(new THREE.BoxGeometry(width + 0.2, baseY, depth + 0.2), 0, baseY / 2, 0, L.uvFound);
+      if (lod === 0 && L.hasPorch) {
+        const p = L.porch;
+        for (let s = 0; s < L.stepCountC; s++) {
+          put(new THREE.BoxGeometry(Math.min(1.2, p.width * 0.8) - s * 0.15, 0.15, 0.32), 0,
+            baseY - 0.15 * (L.stepCountC - s) + 0.075, depth / 2 + p.depth + 0.18 + s * 0.32, L.uvFound);
+        }
+      }
+      break;
+    }
+    case 'trim': {
+      L.windowXs.forEach((x) => put(new THREE.BoxGeometry(L.winW, L.winH, 0.05), x, L.winY, depth / 2, null));
+      if (L.hasPorch) {
+        const p = L.porch;
+        for (let i = 0; i < p.colCount; i++) {
+          const t = i / (p.colCount - 1);
+          put(new THREE.CylinderGeometry(0.07, 0.11, 2.2, 8), -p.width / 2 + t * p.width, baseY + 1.25, depth / 2 + p.depth - 0.1, null);
+        }
+      }
+      break;
+    }
+    case 'glass': {
+      L.windowXs.forEach((x) => put(new THREE.BoxGeometry(L.glassW, L.glassH, 0.08), x, L.winY, depth / 2 + 0.02, null));
+      if (lod === 0 && L.dormer) {
+        const dd = depth * 0.22, dormerY = baseY + wallHeight + ridgeHeight * 0.35;
+        put(new THREE.BoxGeometry(0.5, 0.5, 0.06), 0, dormerY, depth * 0.18 + dd / 2 + 0.03, null);
+      }
+      if (lod === 1) put(new THREE.BoxGeometry(L.doorW, 1.9, 0.08), L.doorX, baseY + 0.95, depth / 2 + 0.02, null); // door shares the dark glass material at LOD1
+      break;
+    }
+    case 'door': put(new THREE.BoxGeometry(L.doorW, 1.9, 0.08), L.doorX, baseY + 0.95, depth / 2 + 0.02, null); break;
+    case 'deck': {
+      if (!L.hasPorch) break;
+      const p = L.porch;
+      put(new THREE.BoxGeometry(p.width, 0.15, p.depth), 0, baseY + 0.08, depth / 2 + p.depth / 2, p.uvDeck);
+      break;
+    }
+    case 'chimney': {
+      if (!L.chimney) break;
+      const chimneyH = wallHeight * 0.9 + ridgeHeight * 0.6, cw = Math.min(0.7, width * 0.16);
+      put(new THREE.BoxGeometry(cw, chimneyH, cw), width * 0.3, baseY + chimneyH / 2, -depth * 0.2, [0.5, 1]);
+      break;
+    }
+    default: break;
+  }
+  return _mergeGeos(out);
+}
+
+// HOUSE_GEOMETRY_CACHE: `${w}x${d}|${part}|L${lod}|${featureSig}` -> merged BufferGeometry (or null = part absent)
+export const HOUSE_GEOMETRY_CACHE = new Map();
+function _getPartGeometry(L, part, lod) {
+  const key = `${L.dimKey}|${part}|L${lod}|${_partSig(L, part, lod)}`;
+  if (HOUSE_GEOMETRY_CACHE.has(key)) return { key, geometry: HOUSE_GEOMETRY_CACHE.get(key) };
+  const geometry = _buildPart(L, part, lod);
+  HOUSE_GEOMETRY_CACHE.set(key, geometry);
+  return { key, geometry };
+}
+
+// ---- 9.5 House Archetypes ----------------------------------------------------------------------
+// Base designs = LOW_DENSITY_HOUSES (11 size classes x 10 variants = 110, ids "low_4x6_07"). An
+// archetype is a base design bound to one ORIENTED lot size (a 3x4 and a 4x3 selection share the
+// 10-design pool but need different geometry, exactly like buildLowDensityHouseForCell).
+export const HOUSE_ARCHETYPE_BASES = new Map(LOW_DENSITY_HOUSES.map((h) => [h.id, h]));
+export const HOUSE_ARCHETYPES = new Map();
+
+export function getHouseArchetype(w, d, variantIndex = 0) {
+  const base = getLowDensityHouseConfigForCell(w, d, variantIndex);
+  if (!base) return null;
+  const id = `${base.id}@${w}x${d}`;
+  if (HOUSE_ARCHETYPES.has(id)) return HOUSE_ARCHETYPES.get(id);
+  const cfg = { ...base, widthCells: w, depthCells: d };
+  const L = _lowDensityLayout(cfg);
+  const arch = {
+    id, baseId: base.id, sizeClass: base.sizeKey, w, d,
+    facadeFamily: base.family, roofType: 'gable',
+    windowStyle: L.windowXs.length === 2 ? 'double' : 'single',
+    porchStyle: L.hasPorch ? L.porch.style : 'none',
+    chimney: L.chimney, dormer: L.dormer, floors: L.floors,
+    materialRefs: { facade: base.facadeMaterial, roof: base.roofMaterial, foundation: base.foundationMaterial, deck: 'deckWood', chimney: 'brickRed', trim: base.trimColor, glass: 0x1c2733, door: 0x3a2a1c },
+    layout: L, seed: base.seed, _lodParts: [null, null, null, null],
+  };
+  HOUSE_ARCHETYPES.set(id, arch);
+  return arch;
+}
+
+const _SOLID_GLASS = () => getSolidMaterial(0x1c2733, { roughness: 0.15, metalness: 0.1 });
+function _resolvePartMaterial(refs, part, lod) {
+  if (lod >= 3) {
+    const preset = part === 'roof' ? refs.roof : refs.facade;
+    return { matKey: `flat:${preset}`, material: _flatMaterial(preset) };
+  }
+  if (lod === 2) {
+    const preset = part === 'roof' ? refs.roof : refs.facade;
+    return { matKey: `lite:${preset}`, material: getSharedLiteMaterial(preset) };
+  }
+  switch (part) {
+    case 'wall': return { matKey: `pbr:${refs.facade}`, material: getSharedPBRMaterial(refs.facade) };
+    case 'roof': return { matKey: `pbr:${refs.roof}`, material: getSharedPBRMaterial(refs.roof) };
+    case 'foundation': return { matKey: `pbr:${refs.foundation}`, material: getSharedPBRMaterial(refs.foundation) };
+    case 'deck': return { matKey: `pbr:${refs.deck}`, material: getSharedPBRMaterial(refs.deck) };
+    case 'chimney': return { matKey: `pbr:${refs.chimney}`, material: getSharedPBRMaterial(refs.chimney) };
+    case 'trim': return { matKey: `solid:${refs.trim}`, material: getSolidMaterial(refs.trim) };
+    case 'door': return { matKey: `solid:${refs.door}`, material: getSolidMaterial(refs.door) };
+    default: return { matKey: 'solid:glass', material: _SOLID_GLASS() };
+  }
+}
+
+// ---- 9.6 LOD1..3: UNIT geometry + per-part local matrix --------------------------------------------
+// LOD0 keeps size-specific merged geometry (exact texture density, every detail). From LOD1 on the
+// body parts are UNIT boxes / a UNIT gable prism shared by every house of every size; the size is
+// applied by a per-part local matrix (composed with the house matrix at instance-write time). That
+// makes the number of buckets independent of how many sizes / variants are on the map (only the
+// material varies), which is what keeps draw calls low when thousands of houses are zoomed out.
+function _unitBoxGeo(uvx, uvy) {
+  const key = `unit|box|${uvx}x${uvy}`;
+  if (!HOUSE_GEOMETRY_CACHE.has(key)) HOUSE_GEOMETRY_CACHE.set(key, _scaleUV(new THREE.BoxGeometry(1, 1, 1), uvx, uvy));
+  return { key, geometry: HOUSE_GEOMETRY_CACHE.get(key) };
+}
+function _unitGableGeo(uvx, uvy) {
+  const key = `unit|gable|${uvx}x${uvy}`;
+  if (!HOUSE_GEOMETRY_CACHE.has(key)) HOUSE_GEOMETRY_CACHE.set(key, _scaleUV(_gableGeo(1, 1, 1, 0), uvx, uvy));
+  return { key, geometry: HOUSE_GEOMETRY_CACHE.get(key) };
+}
+const _lm = new THREE.Matrix4(), _lp = new THREE.Vector3(), _ls = new THREE.Vector3(), _lq = new THREE.Quaternion();
+function _local(px, py, pz, sx, sy, sz) { return new THREE.Matrix4().compose(_lp.set(px, py, pz), _lq.identity(), _ls.set(sx, sy, sz)); }
+const _FLAT_WHITE = () => getSolidMaterial(0xffffff, { roughness: 0.9, metalness: 0 });
+const _flatRGB = (preset) => { const c = new THREE.Color(FLAT_COLOR[preset] ?? 0xcccccc); return [c.r, c.g, c.b]; };
+
+function _unitParts(arch, lod) {
+  const L = arch.layout, refs = arch.materialRefs, zs = -L.frontExt / 2;
+  const { width, depth, baseY, wallHeight, ridgeHeight } = L;
+  const list = [];
+  const add = (part, g, matInfo, local, extra) => list.push({ part, geoKey: g.key, geometry: g.geometry, ...matInfo, local, tinted: true, ...extra });
+  const facadeMat = (lod === 1) ? { matKey: `pbr:${refs.facade}`, material: getSharedPBRMaterial(refs.facade) }
+    : (lod === 2) ? { matKey: `lite:${refs.facade}`, material: getSharedLiteMaterial(refs.facade) } : { matKey: 'flat:white', material: _FLAT_WHITE() };
+  const roofMat = (lod === 1) ? { matKey: `pbr:${refs.roof}`, material: getSharedPBRMaterial(refs.roof) }
+    : (lod === 2) ? { matKey: `lite:${refs.roof}`, material: getSharedLiteMaterial(refs.roof) } : { matKey: 'flat:white', material: _FLAT_WHITE() };
+  const wallColor = lod === 3 ? { color: _flatRGB(refs.facade) } : null;
+  const roofColor = lod === 3 ? { color: _flatRGB(refs.roof) } : null;
+  const roofLocal = _local(0, baseY + wallHeight, zs, width + L.overhang * 2, ridgeHeight, depth + L.overhang * 2);
+
+  if (lod === 1) {
+    add('wall', _unitBoxGeo(2, 1.45), facadeMat, _local(0, baseY + wallHeight / 2, zs, width, wallHeight, depth));
+    add('roof', _unitGableGeo(1.5, 1.5), roofMat, roofLocal);
+    add('foundation', _unitBoxGeo(2, 0.5), { matKey: `pbr:${refs.foundation}`, material: getSharedPBRMaterial(refs.foundation) }, _local(0, baseY / 2, zs, width + 0.2, baseY, depth + 0.2));
+    if (L.hasPorch) {
+      const p = L.porch;
+      add('deck', _unitBoxGeo(2, 1), { matKey: `pbr:${refs.deck}`, material: getSharedPBRMaterial(refs.deck) }, _local(0, baseY + 0.08, depth / 2 + p.depth / 2 + zs, p.width, 0.15, p.depth));
+      add('porchroof', _unitBoxGeo(1.5, 1.5), roofMat, _local(0, baseY + 2.4, depth / 2 + p.depth / 2 + zs, Math.min(p.width + 0.3, L.widthCells), 0.12, p.depth + 0.3));
+    }
+    if (L.chimney) {
+      const chH = wallHeight * 0.9 + ridgeHeight * 0.6, cw = Math.min(0.7, width * 0.16);
+      add('chimney', _unitBoxGeo(0.5, 1), { matKey: `pbr:${refs.chimney}`, material: getSharedPBRMaterial(refs.chimney) }, _local(width * 0.3, baseY + chH / 2, -depth * 0.2 + zs, cw, chH, cw));
+    }
+    // windows + door: one small merged, size-specific geometry sharing ONE dark material
+    const gg = _getPartGeometry(L, 'glass', 1);
+    if (gg.geometry) list.push({ part: 'glass', geoKey: gg.key, geometry: gg.geometry, ..._resolvePartMaterial(refs, 'glass', 1), local: null, tinted: false });
+  } else { // LOD2 / LOD3: body reaches the ground (no foundation part), roof, (LOD2) porch roof
+    const h = baseY + wallHeight;
+    add('wall', _unitBoxGeo(2, 1.6), facadeMat, _local(0, h / 2, zs, width, h, depth), wallColor);
+    add('roof', _unitGableGeo(1.5, 1.5), roofMat, roofLocal, roofColor);
+    if (lod === 2 && L.hasPorch) {
+      const p = L.porch;
+      add('porchroof', _unitBoxGeo(1.5, 1.5), roofMat, _local(0, baseY + 2.4, depth / 2 + p.depth / 2 + zs, Math.min(p.width + 0.3, L.widthCells), 0.12, p.depth + 0.3));
+    }
+  }
+  return list;
+}
+
+/** Renderable parts of an archetype at one LOD (cached on the archetype):
+ *  [{ part, geoKey, geometry, matKey, material, local: Matrix4|null, tinted, color? }] */
+export function getHouseLodParts(arch, lod) {
+  if (arch._lodParts[lod]) return arch._lodParts[lod];
+  let list;
+  if (lod === 0) {
+    list = [];
+    for (const part of HOUSE_LOD_PARTS) {
+      const { key, geometry } = _getPartGeometry(arch.layout, part, 0);
+      if (!geometry) continue;
+      list.push({ part, geoKey: key, geometry, ..._resolvePartMaterial(arch.materialRefs, part, 0), local: null, tinted: !!TINT_PARTS[part] });
+    }
+  } else list = _unitParts(arch, lod);
+  arch._lodParts[lod] = list;
+  return list;
+}
+const TINT_PARTS = { wall: 1, roof: 1, foundation: 1, deck: 1, chimney: 1 };
+
+export function getHouseGeometryStats() {
+  let n = 0; HOUSE_GEOMETRY_CACHE.forEach((g) => { if (g) n++; });
+  return { geometryCount: n, archetypeCount: HOUSE_ARCHETYPES.size, baseDesignCount: HOUSE_ARCHETYPE_BASES.size };
+}
