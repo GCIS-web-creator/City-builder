@@ -9415,7 +9415,7 @@ export default function CityGridIso() {
     const type = legacyLotTypeForDensityTier('res_low');
     zoneBuildTypeRef.current = TILE_RES;
     try {
-      return finalizeLot(type, pl.cx, pl.cz, pl.w, pl.d, pl.frontSign, pl.rotationY, { skipRoadAccess: true }) ? 1 : 0;
+      return finalizeLot(type, pl.cx, pl.cz, pl.w, pl.d, pl.frontSign, pl.rotationY, { skipRoadAccess: true, initialLevel: 1 }) ? 1 : 0;
     } finally { zoneBuildTypeRef.current = null; }
   };
 
@@ -10263,7 +10263,7 @@ export default function CityGridIso() {
       rotation: rotationY || 0,
       grading, // { strategy, baseY, foundationHeight, embedHeight, slope, ... } — see rebuildLotGroup
       gx, gy, w, h, // legacy Tile-grid rasterization — bookkeeping only, see migration header comment
-      level: 0, group: null, frontSign: frontSign ?? -1,
+      level: opts.initialLevel || 0, group: null, frontSign: frontSign ?? -1,
     };
     lotsRef.current.set(id, lot);
     registerBuildingForLot(lot); // Prompt 8: one-way Building Registry registration, additive only
