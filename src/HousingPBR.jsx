@@ -168,46 +168,89 @@ function makeMansardRoof({ width, depth, height, material }) {
 }
 
 // ----------------------------------------------------------------------------
-// 4. 低密度住宅 30種 データ（res_low / クラフツマン系戸建て参照）
+// 4. 低密度住宅 8サイズ x 10種 = 80種 データ（res_low）
 // ----------------------------------------------------------------------------
+// メインファイルの区画選択セルは 1セル = 1メートル（PLOT_CELL_SIZE）で、低密度住宅は
+// 「選択したセルの実寸そのもの」が建物の間口(width)x奥行(depth)になる（旧30種データは
+// CELL=2.5m換算の架空サイズで作られており、しかもメインファイル側からは一度も
+// 呼び出されていなかった＝実際には使われていなかったので、ここで作り直す）。
+// 許可される区画セルサイズは次の8種類のみ（メインファイル側 LOW_DENSITY_CELL_SIZES と
+// 完全に一致させること）:
+//   3x2  3x3  3x4  3x5  3x6  4x4  4x5  4x6   （3x2 は正規化すると 2x3）
+const LOW_DENSITY_SIZE_CLASSES = ['2x3', '3x3', '3x4', '3x5', '3x6', '4x4', '4x5', '4x6'];
 
-export const LOW_DENSITY_HOUSES = [
-  { id: 'low_001', family: 'classic_white', widthCells: 4, depthCells: 5, facadeMaterial: 'paintedWhiteWood', roofMaterial: 'asphaltShingleBlack', trimColor: 0xf2ede2, foundationMaterial: 'stoneRough', porch: { present: true, style: 'wraparound' }, chimney: true, dormer: true, seed: 1001 },
-  { id: 'low_002', family: 'classic_white', widthCells: 4, depthCells: 4, facadeMaterial: 'paintedWhiteWood', roofMaterial: 'asphaltShingleGray', trimColor: 0xf2ede2, foundationMaterial: 'stoneRough', porch: { present: true, style: 'partial' }, chimney: true, dormer: false, seed: 1002 },
-  { id: 'low_003', family: 'classic_white', widthCells: 3, depthCells: 4, facadeMaterial: 'paintedWhiteWood', roofMaterial: 'tileRoofBrown', trimColor: 0xe8dcc0, foundationMaterial: 'stoneDark', porch: { present: true, style: 'partial' }, chimney: false, dormer: false, seed: 1003 },
-  { id: 'low_004', family: 'classic_white', widthCells: 5, depthCells: 5, facadeMaterial: 'paintedWhiteWood', roofMaterial: 'metalRoofDark', trimColor: 0xf2ede2, foundationMaterial: 'stoneRough', porch: { present: true, style: 'wraparound' }, chimney: true, dormer: true, seed: 1004 },
-  { id: 'low_005', family: 'classic_white', widthCells: 4, depthCells: 5, facadeMaterial: 'paintedWhiteWood', roofMaterial: 'asphaltShingleBlack', trimColor: 0x232323, foundationMaterial: 'concrete', porch: { present: true, style: 'partial' }, chimney: false, dormer: true, seed: 1005 },
-
-  { id: 'low_006', family: 'weathered_gray', widthCells: 4, depthCells: 4, facadeMaterial: 'weatheredWood', roofMaterial: 'asphaltShingleGray', trimColor: 0xf2ede2, foundationMaterial: 'stoneDark', porch: { present: true, style: 'partial' }, chimney: true, dormer: false, seed: 1006 },
-  { id: 'low_007', family: 'weathered_gray', widthCells: 4, depthCells: 5, facadeMaterial: 'weatheredWood', roofMaterial: 'tileRoofRed', trimColor: 0x2a2018, foundationMaterial: 'stoneRough', porch: { present: true, style: 'wraparound' }, chimney: false, dormer: true, seed: 1007 },
-  { id: 'low_008', family: 'weathered_gray', widthCells: 3, depthCells: 4, facadeMaterial: 'weatheredWood', roofMaterial: 'metalRoofDark', trimColor: 0xf2ede2, foundationMaterial: 'concrete', porch: { present: false }, chimney: false, dormer: false, seed: 1008 },
-  { id: 'low_009', family: 'weathered_gray', widthCells: 5, depthCells: 5, facadeMaterial: 'weatheredWood', roofMaterial: 'asphaltShingleBlack', trimColor: 0xe8dcc0, foundationMaterial: 'stoneDark', porch: { present: true, style: 'wraparound' }, chimney: true, dormer: true, seed: 1009 },
-  { id: 'low_010', family: 'weathered_gray', widthCells: 4, depthCells: 4, facadeMaterial: 'weatheredWood', roofMaterial: 'asphaltShingleGray', trimColor: 0x232323, foundationMaterial: 'stoneRough', porch: { present: true, style: 'partial' }, chimney: true, dormer: false, seed: 1010 },
-
-  { id: 'low_011', family: 'earth_brown', widthCells: 4, depthCells: 5, facadeMaterial: 'darkWood', roofMaterial: 'tileRoofBrown', trimColor: 0xe8dcc0, foundationMaterial: 'stoneRough', porch: { present: true, style: 'wraparound' }, chimney: true, dormer: false, seed: 1011 },
-  { id: 'low_012', family: 'earth_brown', widthCells: 3, depthCells: 4, facadeMaterial: 'darkWood', roofMaterial: 'asphaltShingleBlack', trimColor: 0xf2ede2, foundationMaterial: 'stoneDark', porch: { present: true, style: 'partial' }, chimney: false, dormer: false, seed: 1012 },
-  { id: 'low_013', family: 'earth_brown', widthCells: 4, depthCells: 4, facadeMaterial: 'darkWood', roofMaterial: 'metalRoofDark', trimColor: 0x2a2018, foundationMaterial: 'concrete', porch: { present: false }, chimney: true, dormer: false, seed: 1013 },
-  { id: 'low_014', family: 'earth_brown', widthCells: 5, depthCells: 5, facadeMaterial: 'darkWood', roofMaterial: 'tileRoofRed', trimColor: 0xf2ede2, foundationMaterial: 'stoneRough', porch: { present: true, style: 'wraparound' }, chimney: true, dormer: true, seed: 1014 },
-  { id: 'low_015', family: 'earth_brown', widthCells: 4, depthCells: 5, facadeMaterial: 'darkWood', roofMaterial: 'asphaltShingleGray', trimColor: 0xe8dcc0, foundationMaterial: 'stoneDark', porch: { present: true, style: 'partial' }, chimney: true, dormer: false, seed: 1015 },
-
-  { id: 'low_016', family: 'sage_blue', widthCells: 4, depthCells: 4, facadeMaterial: 'paintedBlueWood', roofMaterial: 'asphaltShingleBlack', trimColor: 0xf2ede2, foundationMaterial: 'stoneRough', porch: { present: true, style: 'partial' }, chimney: false, dormer: false, seed: 1016 },
-  { id: 'low_017', family: 'sage_blue', widthCells: 4, depthCells: 5, facadeMaterial: 'paintedBlueWood', roofMaterial: 'asphaltShingleGray', trimColor: 0xf2ede2, foundationMaterial: 'stoneDark', porch: { present: true, style: 'wraparound' }, chimney: true, dormer: true, seed: 1017 },
-  { id: 'low_018', family: 'sage_blue', widthCells: 3, depthCells: 4, facadeMaterial: 'paintedBlueWood', roofMaterial: 'metalRoofDark', trimColor: 0x232323, foundationMaterial: 'concrete', porch: { present: false }, chimney: false, dormer: false, seed: 1018 },
-  { id: 'low_019', family: 'sage_blue', widthCells: 5, depthCells: 5, facadeMaterial: 'paintedBlueWood', roofMaterial: 'tileRoofBrown', trimColor: 0xe8dcc0, foundationMaterial: 'stoneRough', porch: { present: true, style: 'wraparound' }, chimney: true, dormer: false, seed: 1019 },
-  { id: 'low_020', family: 'sage_blue', widthCells: 4, depthCells: 4, facadeMaterial: 'paintedBlueWood', roofMaterial: 'asphaltShingleBlack', trimColor: 0xf2ede2, foundationMaterial: 'stoneDark', porch: { present: true, style: 'partial' }, chimney: true, dormer: true, seed: 1020 },
-
-  { id: 'low_021', family: 'cedar_lodge', widthCells: 4, depthCells: 5, facadeMaterial: 'rawWoodCedar', roofMaterial: 'metalRoofDark', trimColor: 0x2a2018, foundationMaterial: 'stoneDark', porch: { present: true, style: 'partial' }, chimney: false, dormer: false, seed: 1021 },
-  { id: 'low_022', family: 'cedar_lodge', widthCells: 3, depthCells: 4, facadeMaterial: 'rawWoodHinoki', roofMaterial: 'asphaltShingleGray', trimColor: 0xf2ede2, foundationMaterial: 'concrete', porch: { present: false }, chimney: false, dormer: false, seed: 1022 },
-  { id: 'low_023', family: 'cedar_lodge', widthCells: 4, depthCells: 4, facadeMaterial: 'rawWoodCedar', roofMaterial: 'tileRoofBrown', trimColor: 0x2a2018, foundationMaterial: 'stoneRough', porch: { present: true, style: 'partial' }, chimney: false, dormer: true, seed: 1023 },
-  { id: 'low_024', family: 'cedar_lodge', widthCells: 5, depthCells: 5, facadeMaterial: 'rawWoodHinoki', roofMaterial: 'asphaltShingleBlack', trimColor: 0xe8dcc0, foundationMaterial: 'stoneDark', porch: { present: true, style: 'wraparound' }, chimney: true, dormer: false, seed: 1024 },
-  { id: 'low_025', family: 'cedar_lodge', widthCells: 4, depthCells: 5, facadeMaterial: 'rawWoodCedar', roofMaterial: 'metalRoofDark', trimColor: 0x232323, foundationMaterial: 'stoneRough', porch: { present: false }, chimney: false, dormer: false, seed: 1025 },
-
-  { id: 'low_026', family: 'stucco', widthCells: 4, depthCells: 4, facadeMaterial: 'plasterWhite', roofMaterial: 'tileRoofRed', trimColor: 0x2a2018, foundationMaterial: 'stoneRough', porch: { present: true, style: 'partial' }, chimney: true, dormer: false, seed: 1026 },
-  { id: 'low_027', family: 'stucco', widthCells: 4, depthCells: 5, facadeMaterial: 'plasterCreamWorn', roofMaterial: 'tileRoofBrown', trimColor: 0xf2ede2, foundationMaterial: 'concrete', porch: { present: true, style: 'wraparound' }, chimney: true, dormer: true, seed: 1027 },
-  { id: 'low_028', family: 'stucco', widthCells: 3, depthCells: 4, facadeMaterial: 'plasterCream', roofMaterial: 'asphaltShingleGray', trimColor: 0x2a2018, foundationMaterial: 'stoneDark', porch: { present: false }, chimney: false, dormer: false, seed: 1028 },
-  { id: 'low_029', family: 'stucco', widthCells: 5, depthCells: 5, facadeMaterial: 'plasterWhite', roofMaterial: 'metalRoofDark', trimColor: 0xf2ede2, foundationMaterial: 'stoneRough', porch: { present: true, style: 'wraparound' }, chimney: true, dormer: true, seed: 1029 },
-  { id: 'low_030', family: 'stucco', widthCells: 4, depthCells: 4, facadeMaterial: 'plasterCreamWorn', roofMaterial: 'tileRoofRed', trimColor: 0xe8dcc0, foundationMaterial: 'concrete', porch: { present: true, style: 'partial' }, chimney: false, dormer: false, seed: 1030 },
+// 外観バリエーション用パレット（10種を作るための素材の組み合わせ。既存のテラスハウス
+// パレットと重複しないよう、低密度住宅らしい戸建て向け素材のみを使用）。
+const LOW_DENSITY_FACADE_PALETTE = [
+  { family: 'classic_white', facadeMaterial: 'paintedWhiteWood', trimColor: 0xf2ede2, foundationMaterial: 'stoneRough' },
+  { family: 'weathered_gray', facadeMaterial: 'weatheredWood', trimColor: 0xf2ede2, foundationMaterial: 'stoneDark' },
+  { family: 'earth_brown', facadeMaterial: 'darkWood', trimColor: 0xe8dcc0, foundationMaterial: 'stoneRough' },
+  { family: 'sage_blue', facadeMaterial: 'paintedBlueWood', trimColor: 0xf2ede2, foundationMaterial: 'stoneDark' },
+  { family: 'cedar_lodge', facadeMaterial: 'rawWoodCedar', trimColor: 0x2a2018, foundationMaterial: 'stoneRough' },
+  { family: 'cedar_hinoki', facadeMaterial: 'rawWoodHinoki', trimColor: 0xf2ede2, foundationMaterial: 'concrete' },
+  { family: 'stucco_white', facadeMaterial: 'plasterWhite', trimColor: 0x2a2018, foundationMaterial: 'stoneRough' },
+  { family: 'stucco_cream', facadeMaterial: 'plasterCream', trimColor: 0xf2ede2, foundationMaterial: 'concrete' },
+  { family: 'stucco_worn', facadeMaterial: 'plasterCreamWorn', trimColor: 0x2a2018, foundationMaterial: 'stoneDark' },
+  { family: 'blue_dark_trim', facadeMaterial: 'paintedBlueWood', trimColor: 0x232323, foundationMaterial: 'concrete' },
 ];
+const LOW_DENSITY_ROOF_PALETTE = ['asphaltShingleBlack', 'asphaltShingleGray', 'tileRoofBrown', 'tileRoofRed', 'metalRoofDark'];
+
+// 小さいセル(2x3等)ではポーチ／煙突／ドーマーを詰め込むと破綻するため、床面積に応じて
+// 出現条件を絞る（buildLowDensityHouse 側でも同じしきい値で二重にガードする）。
+function _lowDensityFeaturesForSize(w, d, i) {
+  const area = w * d, shortSide = Math.min(w, d);
+  return {
+    porch: area >= 12 ? { present: true, style: i % 3 === 0 && shortSide >= 4 ? 'wraparound' : 'partial' } : { present: false },
+    chimney: area >= 9 && i % 2 === 0,
+    dormer: area >= 16 && i % 3 === 1,
+    floors: 1,
+  };
+}
+
+export const LOW_DENSITY_HOUSES = LOW_DENSITY_SIZE_CLASSES.flatMap((sizeKey, sizeIdx) => {
+  const [a, b] = sizeKey.split('x').map(Number);
+  return Array.from({ length: 10 }, (_, i) => {
+    const palette = LOW_DENSITY_FACADE_PALETTE[i % LOW_DENSITY_FACADE_PALETTE.length];
+    const roofMaterial = LOW_DENSITY_ROOF_PALETTE[(i + sizeIdx) % LOW_DENSITY_ROOF_PALETTE.length];
+    const feat = _lowDensityFeaturesForSize(a, b, i);
+    return {
+      id: `low_${sizeKey}_${String(i + 1).padStart(2, '0')}`,
+      sizeKey,
+      // widthCells/depthCells はこの変体データの「基準サイズ」。実際に建てる際は
+      // buildLowDensityHouseForCell がロットの実寸 w/d でこれを上書きするので、
+      // 3x2 選択でも 2x3 選択でも同じ10種プールからそのままの向きで建つ。
+      widthCells: a,
+      depthCells: b,
+      family: palette.family,
+      facadeMaterial: palette.facadeMaterial,
+      roofMaterial,
+      trimColor: palette.trimColor,
+      foundationMaterial: palette.foundationMaterial,
+      porch: feat.porch,
+      chimney: feat.chimney,
+      dormer: feat.dormer,
+      floors: feat.floors,
+      seed: 3000 + sizeIdx * 10 + i,
+    };
+  });
+});
+
+// sizeKey ('2x3' 等) -> このサイズの10種の配列。
+const _lowDensityBySize = new Map();
+for (const h of LOW_DENSITY_HOUSES) {
+  if (!_lowDensityBySize.has(h.sizeKey)) _lowDensityBySize.set(h.sizeKey, []);
+  _lowDensityBySize.get(h.sizeKey).push(h);
+}
+function _lowDensitySizeKey(w, d) { return Math.min(w, d) + 'x' + Math.max(w, d); }
+/** そのセルサイズで建築可能かどうか（メインファイル側 LOW_DENSITY_CELL_SIZES と対応）。 */
+export function isLowDensityHouseSizeAvailable(w, d) { return _lowDensityBySize.has(_lowDensitySizeKey(w, d)); }
+/** そのセルサイズの10種のうち1つの設定を返す（variantIndex は 0-9 の範囲に丸められる）。 */
+export function getLowDensityHouseConfigForCell(w, d, variantIndex = 0) {
+  const arr = _lowDensityBySize.get(_lowDensitySizeKey(w, d));
+  if (!arr || !arr.length) return null;
+  const idx = ((variantIndex % arr.length) + arr.length) % arr.length;
+  return arr[idx];
+}
 
 // ----------------------------------------------------------------------------
 // 5. テラスハウス 20種 データ（res_terrace / 連棟住宅参照）
@@ -243,27 +286,34 @@ export const TERRACE_HOUSES = [
 // 6. 低密度住宅ビルダー
 // ----------------------------------------------------------------------------
 
-const CELL = 2.5; // 1ロットセル(m)。プロジェクト側の実際のグリッド単位に合わせて調整してください。
 const WINDOW_GLASS = () => getSolidMaterial(0x1c2733, { roughness: 0.15, metalness: 0.1 });
 
+/**
+ * config.widthCells/depthCells は「区画セル数 == メートル数」として直接使う（1セル=1m、
+ * メインファイルの PLOT_CELL_SIZE と同じ単位）。旧バージョンにあった CELL=2.5 倍率は、
+ * この住宅ジェネレーターがメインファイルからまだ一度も呼ばれていなかった頃の名残の
+ * 不整合だったので廃止し、選ばれたロットの実寸にそのまま一致させる。
+ * 最小許容セル(2x3=2m x 3m)でも窓や玄関がめり込まないよう、間口/奥行が小さいほど
+ * 窓の個数・サイズ・付帯物を自動的に簡略化する。
+ */
 export function buildLowDensityHouse(config) {
   const group = new THREE.Group();
   group.name = config.id;
 
-  const width = config.widthCells * CELL * 0.9;
-  const depth = config.depthCells * CELL * 0.9;
-  const floorHeight = 3.0;
+  const width = Math.max(1.6, config.widthCells * 0.92);
+  const depth = Math.max(1.6, config.depthCells * 0.92);
+  const floorHeight = 2.9;
   const wallHeight = floorHeight * (config.floors || 1);
-  const ridgeHeight = wallHeight * 0.55;
-  const baseY = 0.4; // 基礎の高さぶんの底上げ
+  const ridgeHeight = wallHeight * 0.5;
+  const baseY = 0.35; // 基礎の高さぶんの底上げ
 
-  const facadeMat = getPBRMaterial(config.facadeMaterial, { repeatX: width / 2, repeatY: wallHeight / 2 });
-  const roofMat = getPBRMaterial(config.roofMaterial, { repeatX: width / 3, repeatY: depth / 3 });
-  const foundationMat = getPBRMaterial(config.foundationMaterial, { repeatX: width / 2, repeatY: 0.5 });
+  const facadeMat = getPBRMaterial(config.facadeMaterial, { repeatX: Math.max(width, 1) / 2, repeatY: wallHeight / 2 });
+  const roofMat = getPBRMaterial(config.roofMaterial, { repeatX: Math.max(width, 1) / 3, repeatY: Math.max(depth, 1) / 3 });
+  const foundationMat = getPBRMaterial(config.foundationMaterial, { repeatX: Math.max(width, 1) / 2, repeatY: 0.5 });
   const trimMat = getSolidMaterial(config.trimColor);
 
   // 基礎
-  const foundation = new THREE.Mesh(new THREE.BoxGeometry(width + 0.3, baseY, depth + 0.3), foundationMat);
+  const foundation = new THREE.Mesh(new THREE.BoxGeometry(width + 0.2, baseY, depth + 0.2), foundationMat);
   foundation.position.y = baseY / 2;
   group.add(foundation);
 
@@ -273,36 +323,44 @@ export function buildLowDensityHouse(config) {
   walls.castShadow = walls.receiveShadow = true;
   group.add(walls);
 
-  // 切妻屋根
-  const roof = makeGableRoof({ width, depth, ridgeHeight, overhang: 0.5, material: roofMat });
+  // 切妻屋根（軒の出は小さい家ほど相対的に抑える）
+  const overhang = Math.min(0.5, Math.min(width, depth) * 0.14);
+  const roof = makeGableRoof({ width, depth, ridgeHeight, overhang, material: roofMat });
   roof.position.y = baseY + wallHeight;
   group.add(roof);
 
-  // 窓 x2（正面左右対称）+ 玄関
+  // 窓：間口が狭い(2m台)場合は中央1つ、それ以外は左右2つ。サイズも間口に応じて縮小。
   const winY = baseY + wallHeight * 0.55;
-  [-width * 0.28, width * 0.28].forEach((x) => {
-    const frame = new THREE.Mesh(new THREE.BoxGeometry(1.05, 1.25, 0.05), trimMat);
+  const winW = Math.min(1.05, width * 0.3), winH = Math.min(1.25, wallHeight * 0.42);
+  const glassW = winW - 0.15, glassH = winH - 0.15;
+  const windowXs = width >= 3.2 ? [-width * 0.28, width * 0.28] : [0];
+  // 玄関を中央以外に配置できるときだけ窓を2つとも中央から離す。中央1窓の場合は玄関を脇へ。
+  const doorX = windowXs.length === 1 ? width * 0.26 : 0;
+  windowXs.forEach((x) => {
+    const frame = new THREE.Mesh(new THREE.BoxGeometry(winW, winH, 0.05), trimMat);
     frame.position.set(x, winY, depth / 2);
     group.add(frame);
-    const glass = new THREE.Mesh(new THREE.BoxGeometry(0.9, 1.1, 0.08), WINDOW_GLASS());
+    const glass = new THREE.Mesh(new THREE.BoxGeometry(glassW, glassH, 0.08), WINDOW_GLASS());
     glass.position.set(x, winY, depth / 2 + 0.02);
     group.add(glass);
   });
-  const door = new THREE.Mesh(new THREE.BoxGeometry(0.9, 1.9, 0.08), getSolidMaterial(0x3a2a1c));
-  door.position.set(0, baseY + 0.95, depth / 2 + 0.02);
+  const doorW = Math.min(0.9, width * 0.32);
+  const door = new THREE.Mesh(new THREE.BoxGeometry(doorW, 1.9, 0.08), getSolidMaterial(0x3a2a1c));
+  door.position.set(doorX, baseY + 0.95, depth / 2 + 0.02);
   group.add(door);
 
-  // 煙突
-  if (config.chimney) {
+  // 煙突（間口3m未満では省略 — 壁からはみ出すため）
+  if (config.chimney && width >= 3) {
     const chimneyMat = getPBRMaterial('brickRed', { repeatX: 0.5, repeatY: 1 });
     const chimneyH = wallHeight * 0.9 + ridgeHeight * 0.6;
-    const chimney = new THREE.Mesh(new THREE.BoxGeometry(0.7, chimneyH, 0.7), chimneyMat);
+    const cw = Math.min(0.7, width * 0.16);
+    const chimney = new THREE.Mesh(new THREE.BoxGeometry(cw, chimneyH, cw), chimneyMat);
     chimney.position.set(width * 0.3, baseY + chimneyH / 2, -depth * 0.2);
     group.add(chimney);
   }
 
-  // ドーマー
-  if (config.dormer) {
+  // ドーマー（十分な奥行・間口がある場合のみ）
+  if (config.dormer && width >= 3.6 && depth >= 4.4) {
     const dw = width * 0.28, dd = depth * 0.22, dh = 0.9;
     const dormerY = baseY + wallHeight + ridgeHeight * 0.35;
     const dormerWall = new THREE.Mesh(new THREE.BoxGeometry(dw, dh, dd), facadeMat);
@@ -316,11 +374,12 @@ export function buildLowDensityHouse(config) {
     group.add(dormerWin);
   }
 
-  // ポーチ
-  if (config.porch && config.porch.present) {
-    const wrap = config.porch.style === 'wraparound';
-    const porchDepth = 1.8;
-    const porchWidth = wrap ? width + 1.0 : width * 0.55;
+  // ポーチ（奥行3.2m未満では省略。前方(道路側の宅地セットバック側)へ張り出すだけなので
+  // 隣接ロットへは食い込まない）
+  if (config.porch && config.porch.present && depth >= 3.2) {
+    const wrap = config.porch.style === 'wraparound' && width >= 4;
+    const porchDepth = Math.min(1.8, Math.max(0.9, depth * 0.3));
+    const porchWidth = wrap ? width + 1.0 : Math.max(1.2, width * 0.55);
     const deckMat = getPBRMaterial('deckWood', { repeatX: porchWidth / 1.5, repeatY: porchDepth / 1.5 });
 
     const floor = new THREE.Mesh(new THREE.BoxGeometry(porchWidth, 0.15, porchDepth), deckMat);
@@ -330,23 +389,36 @@ export function buildLowDensityHouse(config) {
     const colCount = wrap ? 6 : 4;
     for (let i = 0; i < colCount; i++) {
       const t = i / (colCount - 1);
-      const col = new THREE.Mesh(new THREE.CylinderGeometry(0.08, 0.13, 2.3, 8), trimMat);
-      col.position.set(-porchWidth / 2 + t * porchWidth, baseY + 1.3, depth / 2 + porchDepth - 0.1);
+      const col = new THREE.Mesh(new THREE.CylinderGeometry(0.07, 0.11, 2.2, 8), trimMat);
+      col.position.set(-porchWidth / 2 + t * porchWidth, baseY + 1.25, depth / 2 + porchDepth - 0.1);
       group.add(col);
     }
     const porchRoof = new THREE.Mesh(new THREE.BoxGeometry(porchWidth + 0.3, 0.12, porchDepth + 0.3), roofMat);
-    porchRoof.position.set(0, baseY + 2.5, depth / 2 + porchDepth / 2);
+    porchRoof.position.set(0, baseY + 2.4, depth / 2 + porchDepth / 2);
     group.add(porchRoof);
 
-    for (let s = 0; s < 3; s++) {
-      const step = new THREE.Mesh(new THREE.BoxGeometry(1.2 - s * 0.15, 0.15, 0.35), foundationMat);
-      step.position.set(0, baseY - 0.15 * (3 - s) + 0.075, depth / 2 + porchDepth + 0.2 + s * 0.35);
+    const stepCount = porchDepth >= 1.4 ? 3 : 2;
+    for (let s = 0; s < stepCount; s++) {
+      const step = new THREE.Mesh(new THREE.BoxGeometry(Math.min(1.2, porchWidth * 0.8) - s * 0.15, 0.15, 0.32), foundationMat);
+      step.position.set(0, baseY - 0.15 * (stepCount - s) + 0.075, depth / 2 + porchDepth + 0.18 + s * 0.32);
       group.add(step);
     }
   }
 
   group.userData.houseConfig = config;
   return group;
+}
+
+/**
+ * ロットの実際の間口(w)x奥行(d)（メートル、= 選択セル数）から、対応するサイズクラスの
+ * 10種プールの中から1棟選んで建てる。w/d はそのまま使う（8サイズのどちらの向きで
+ * 選択されていても、正規化したクラスから10種を探した上で実寸 w/d で建てる）。
+ * サイズが8種のどれにも一致しない場合は null を返す（呼び出し側で建築を拒否すること）。
+ */
+export function buildLowDensityHouseForCell(w, d, variantIndex = 0) {
+  const base = getLowDensityHouseConfigForCell(w, d, variantIndex);
+  if (!base) return null;
+  return buildLowDensityHouse({ ...base, widthCells: w, depthCells: d });
 }
 
 // ----------------------------------------------------------------------------

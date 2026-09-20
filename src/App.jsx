@@ -1,6 +1,6 @@
 import React, { useRef, useEffect, useState, useCallback, useMemo } from 'react';
 import * as THREE from 'three';
-import { buildTerraceHouse, getTerraceHouseConfig, TERRACE_HOUSES } from './HousingPBR.jsx';
+import { buildTerraceHouse, getTerraceHouseConfig, TERRACE_HOUSES, buildLowDensityHouseForCell } from './HousingPBR.jsx';
 
 const GRID_SIZE = 64;
 const TILE = 6;
@@ -3465,6 +3465,285 @@ function groundMeshHeight(x, z) {
   const hB = fx <= fz ? h00 + (h01 - h00) * fz + (h11 - h01) * fx : h00 + (h10 - h00) * fx + (h11 - h10) * fz;
   return Math.max(hA, hB);
 }
+// ============================================================================
+// Prompt 21H — Road-aligned Plot Cells (道路に平行な区画セル)
+// ============================================================================
+// Replaces the world-axis-aligned 1m Micro-Grid cells as the thing the player SEES and SELECTS
+// when zoning. Every cell is a real ~1m x 1m quad laid out in ROAD coordinates:
+//   column = 1m steps along the road (measured along the strip's own inner edge, so the row next
+//            to the pavement is exactly 1m long even on a curve),
+//   row    = 1m steps away from the pavement (row 0 touches the sidewalk zone).
+// On a straight road a cell is a perfect rectangle parallel/perpendicular to the road, whatever the
+// road's compass heading. On a curve the cell follows the curve (narrower on the inside of the
+// bend). Cells that would fold over themselves, overlap a cell of another road, or reach into
+// another road's pavement/sidewalk are CUT (dropped) instead of being allowed to overlap.
+//
+// Pure geometry: no React / Three scene state. The component turns this layout into overlay
+// meshes, selection, hover and Building placement (see computeRoadsidePlotCells and friends).
+const PLOT_CELL_SIZE = 1;                                   // m — nominal cell edge (along and across the road)
+const PLOT_CELL_GAP = 0.0025;                               // m — visual gap between two neighbouring cells (2.5 mm); each quad is inset by GAP/2 per side
+const PLOT_ROAD_SETBACK = SIDEWALK_WAYPOINT_GAP + 0.05;     // m from the paved edge to row 0's NEAR EDGE — the sidewalk zone is the only thing kept clear (was: cell CENTRE >= gap+0.75)
+const PLOT_ROWS = ROAD_FRONTAGE_STRIP_DEPTH;                // rows per strip (6 -> 6m deep, unchanged)
+const PLOT_KEY_STRIDE = 32;                                 // cellMap key = col * STRIDE + row
+const PLOT_MIN_EDGE = 0.4;                                  // a cell whose edge is squeezed below this (inside of a tight bend) is cut
+const PLOT_MIN_AREA = 0.35;                                 // ... or whose area is below this
+const PLOT_CLEARANCE_TOL = 0.02;                            // m tolerance when testing a cell against road pavement + sidewalk
+const PLOT_OVERLAP_SHRINK = 0.94;                           // cell-vs-cell overlap is tested on cells shrunk to 94% so shared edges never count
+const PLOT_RESERVE_SHRINK = 0.6;                            // a Building reserves (hides) a cell when it overlaps the cell's inner 60%
+const PLOT_HASH_BUCKET = 4;                                 // m — spatial hash bucket used for picking / reservation
+// Prompt 21H: the Tile-shaped (6m) zone tint the legacy Tile cache used to paint under every zoned
+// Tile is what made the designated area look Tile-dependent. The road-aligned cells are the ONLY
+// zone display now; flip this to true to get the old Tile tint back.
+const SHOW_LEGACY_ZONE_TILE_TINT = false;
+
+function _plotBucketKey(i, j) { return (i + 1024) * 4096 + (j + 1024); }
+
+// Strict convex-polygon overlap (separating axis) — polygons are arrays of {x, z}. Touching does not count.
+function _plotPolyOverlap(a, b) {
+  for (const poly of [a, b]) {
+    for (let i = 0; i < poly.length; i++) {
+      const p = poly[i], q = poly[(i + 1) % poly.length];
+      const ax = -(q.z - p.z), az = q.x - p.x;
+      let minA = Infinity, maxA = -Infinity, minB = Infinity, maxB = -Infinity;
+      for (const c of a) { const d = c.x * ax + c.z * az; if (d < minA) minA = d; if (d > maxA) maxA = d; }
+      for (const c of b) { const d = c.x * ax + c.z * az; if (d < minB) minB = d; if (d > maxB) maxB = d; }
+      if (maxA <= minB || maxB <= minA) return false;
+    }
+  }
+  return true;
+}
+function _plotShrinkPoly(poly, k) {
+  let cx = 0, cz = 0;
+  for (const p of poly) { cx += p.x; cz += p.z; }
+  cx /= poly.length; cz /= poly.length;
+  return poly.map((p) => ({ x: cx + (p.x - cx) * k, z: cz + (p.z - cz) * k }));
+}
+// A quad is a valid plot cell only if it is a proper convex quadrilateral (no fold-over) of sane size.
+function _plotQuadValid(poly, sideSign) {
+  let area2 = 0;
+  for (let i = 0; i < 4; i++) { const p = poly[i], q = poly[(i + 1) % 4]; area2 += p.x * q.z - q.x * p.z; }
+  if (area2 * sideSign < PLOT_MIN_AREA * 2) return false;
+  for (let i = 0; i < 4; i++) {
+    const p = poly[i], q = poly[(i + 1) % 4], r = poly[(i + 2) % 4];
+    if (Math.hypot(q.x - p.x, q.z - p.z) < PLOT_MIN_EDGE) return false;
+    const cr = (q.x - p.x) * (r.z - q.z) - (q.z - p.z) * (r.x - q.x);
+    if (cr * sideSign <= 0) return false;
+  }
+  return true;
+}
+
+// Every road (highways and ramps INCLUDED) as short straight pieces, each carrying its own
+// "keep clear" radius = half pavement width + sidewalk zone, bucketed in a spatial hash so a cell
+// corner can be tested against nearby roads in O(few).
+function buildRoadClearanceIndex(network) {
+  const BUCKET = 6;
+  const buckets = new Map();
+  for (const seg of network.segments.values()) {
+    const len = getRoadPointSpacingLength(network, seg);
+    const n = Math.max(2, Math.ceil(len / 0.75));
+    let prev = getRoadPoint(network, seg, 0);
+    for (let k = 1; k <= n; k++) {
+      const p = getRoadPoint(network, seg, k / n);
+      const r = getRoadWidth(seg, (k - 0.5) / n) / 2 + SIDEWALK_WAYPOINT_GAP;
+      const piece = { x0: prev.x, z0: prev.z, x1: p.x, z1: p.z, r };
+      const i0 = Math.floor((Math.min(prev.x, p.x) - r) / BUCKET), i1 = Math.floor((Math.max(prev.x, p.x) + r) / BUCKET);
+      const j0 = Math.floor((Math.min(prev.z, p.z) - r) / BUCKET), j1 = Math.floor((Math.max(prev.z, p.z) + r) / BUCKET);
+      for (let i = i0; i <= i1; i++) for (let j = j0; j <= j1; j++) {
+        const key = _plotBucketKey(i, j);
+        let arr = buckets.get(key);
+        if (!arr) { arr = []; buckets.set(key, arr); }
+        arr.push(piece);
+      }
+      prev = p;
+    }
+  }
+  return { BUCKET, buckets };
+}
+// true if (x,z) lies inside ANY road's pavement or sidewalk zone
+function roadClearanceBlocksPoint(index, x, z) {
+  const arr = index.buckets.get(_plotBucketKey(Math.floor(x / index.BUCKET), Math.floor(z / index.BUCKET)));
+  if (!arr) return false;
+  for (const p of arr) {
+    const dx = p.x1 - p.x0, dz = p.z1 - p.z0;
+    const l2 = dx * dx + dz * dz;
+    let u = l2 > 1e-9 ? ((x - p.x0) * dx + (z - p.z0) * dz) / l2 : 0;
+    u = u < 0 ? 0 : u > 1 ? 1 : u;
+    const qx = p.x0 + dx * u - x, qz = p.z0 + dz * u - z;
+    const lim = p.r - PLOT_CLEARANCE_TOL;
+    if (qx * qx + qz * qz < lim * lim) return true;
+  }
+  return false;
+}
+
+// Maps "metres along the strip's inner edge" -> the road's own t parameter. The inner edge is the
+// centreline offset sideways by `offset`; its arc length is what the 1m columns are measured on.
+function _plotOffsetProfile(network, segment, sideSign, offset) {
+  const centerLen = getRoadPointSpacingLength(network, segment);
+  const N = Math.max(8, Math.ceil(centerLen / 0.25));
+  const ts = new Float64Array(N + 1), cum = new Float64Array(N + 1);
+  let px = 0, pz = 0;
+  for (let i = 0; i <= N; i++) {
+    const t = i / N;
+    const p = getRoadPoint(network, segment, t), n = getRoadNormal(network, segment, t);
+    const x = p.x + n.x * offset * sideSign, z = p.z + n.z * offset * sideSign;
+    ts[i] = t;
+    cum[i] = i === 0 ? 0 : cum[i - 1] + Math.hypot(x - px, z - pz);
+    px = x; pz = z;
+  }
+  const total = cum[N];
+  const sToT = (s) => {
+    if (s <= 0) return 0;
+    if (s >= total) return 1;
+    let lo = 0, hi = N;
+    while (hi - lo > 1) { const mid = (lo + hi) >> 1; if (cum[mid] <= s) lo = mid; else hi = mid; }
+    const span = cum[hi] - cum[lo];
+    const f = span > 1e-9 ? (s - cum[lo]) / span : 0;
+    return ts[lo] + (ts[hi] - ts[lo]) * f;
+  };
+  return { total, sToT };
+}
+
+// Candidate cells (unfiltered geometry) for ONE side of ONE segment. Returns the strip's group record.
+function _plotBuildStripCandidates(network, segment, sideName, sideSign, order, out) {
+  const halfW = getRoadWidth(segment) / 2;
+  const d0 = halfW + PLOT_ROAD_SETBACK;
+  const prof = _plotOffsetProfile(network, segment, sideSign, d0);
+  const ncols = Math.floor(prof.total / PLOT_CELL_SIZE + 1e-6);
+  if (ncols < 1) return null;
+  const startS = (prof.total - ncols * PLOT_CELL_SIZE) / 2; // spread the leftover metres over both ends
+  const gid = segment.id + '|' + sideName;
+  const bt = new Array(ncols + 1), pts = new Array(ncols + 1), elevated = new Array(ncols + 1);
+  for (let c = 0; c <= ncols; c++) {
+    const t = prof.sToT(startS + c * PLOT_CELL_SIZE);
+    const p = getRoadPoint(network, segment, t), n = getRoadNormal(network, segment, t);
+    bt[c] = t;
+    elevated[c] = p.y - terrainHeight(p.x, p.z) > 1.5; // on a bridge / viaduct: nothing to build beside it
+    const col = new Array(PLOT_ROWS + 1);
+    for (let r = 0; r <= PLOT_ROWS; r++) {
+      const dist = d0 + r * PLOT_CELL_SIZE;
+      col[r] = { x: p.x + n.x * dist * sideSign, z: p.z + n.z * dist * sideSign };
+    }
+    pts[c] = col;
+  }
+  for (let c = 0; c < ncols; c++) {
+    if (elevated[c] || elevated[c + 1]) continue;
+    const tan = getRoadTangent(network, segment, (bt[c] + bt[c + 1]) / 2);
+    for (let r = 0; r < PLOT_ROWS; r++) {
+      const poly = [pts[c][r], pts[c + 1][r], pts[c + 1][r + 1], pts[c][r + 1]];
+      if (!_plotQuadValid(poly, sideSign)) continue; // folded / squeezed by a tight bend -> cut
+      let inMap = true;
+      for (const q of poly) if (Math.abs(q.x) > MAP_HALF - 0.01 || Math.abs(q.z) > MAP_HALF - 0.01) { inMap = false; break; }
+      if (!inMap) continue;
+      out.push({ gid, segId: segment.id, side: sideName, sideSign, col: c, row: r, poly, tan: { x: tan.x, z: tan.z }, order });
+    }
+  }
+  return { gid, segId: segment.id, side: sideName, sideSign, halfW, d0, startS, ncols, sToT: prof.sToT, cellMap: new Map() };
+}
+
+// computeRoadPlotLayout: the whole road-aligned plot cell layout for a Road Network.
+//   -> { cells: [...], groups: Map(gid -> strip), hash: Map(bucket -> cells) }
+function computeRoadPlotLayout(network) {
+  const clearance = buildRoadClearanceIndex(network);
+  const candidates = [];
+  const groups = new Map();
+  let order = 0;
+  for (const segment of network.segments.values()) {
+    order++;
+    if (isHighwayDeckRoadType(ROAD_TYPES[segment.roadType])) continue; // no Building Plots beside a highway / ramp
+    for (const sideName of ['left', 'right']) {
+      const g = _plotBuildStripCandidates(network, segment, sideName, sideName === 'left' ? 1 : -1, order, candidates);
+      if (g) groups.set(g.gid, g);
+    }
+  }
+  // Row 0 of every strip claims land first, then row 1 ... — so where two roads meet (a corner, a
+  // joint on a bend, a T) the cells nearest a road win and the outer, overlapping ones are cut.
+  candidates.sort((a, b) => a.row - b.row || a.order - b.order || a.col - b.col);
+  const B = PLOT_HASH_BUCKET;
+  const hash = new Map();
+  const cells = [];
+  const kInset = 1 - PLOT_CELL_GAP / PLOT_CELL_SIZE;
+  for (const cand of candidates) {
+    const poly = cand.poly;
+    let cx = 0, cz = 0;
+    for (const p of poly) { cx += p.x; cz += p.z; }
+    cx /= 4; cz /= 4;
+    // 1) never inside ANY road's pavement / sidewalk zone (corners, edge midpoints and centre)
+    let blocked = roadClearanceBlocksPoint(clearance, cx, cz);
+    for (let i = 0; i < 4 && !blocked; i++) {
+      const p = poly[i], q = poly[(i + 1) % 4];
+      if (roadClearanceBlocksPoint(clearance, p.x, p.z) || roadClearanceBlocksPoint(clearance, (p.x + q.x) / 2, (p.z + q.z) / 2)) blocked = true;
+    }
+    if (blocked) continue;
+    // 2) never overlapping a cell that is already placed (this or another road)
+    let minX = Infinity, maxX = -Infinity, minZ = Infinity, maxZ = -Infinity;
+    for (const p of poly) { if (p.x < minX) minX = p.x; if (p.x > maxX) maxX = p.x; if (p.z < minZ) minZ = p.z; if (p.z > maxZ) maxZ = p.z; }
+    const i0 = Math.floor(minX / B), i1 = Math.floor(maxX / B), j0 = Math.floor(minZ / B), j1 = Math.floor(maxZ / B);
+    const shrunk = _plotShrinkPoly(poly, PLOT_OVERLAP_SHRINK);
+    let overlap = false;
+    for (let i = i0; i <= i1 && !overlap; i++) for (let j = j0; j <= j1 && !overlap; j++) {
+      const arr = hash.get(_plotBucketKey(i, j));
+      if (!arr) continue;
+      for (const o of arr) {
+        if (o.maxX < minX || o.minX > maxX || o.maxZ < minZ || o.minZ > maxZ) continue;
+        if (_plotPolyOverlap(shrunk, o.shrunkPoly)) { overlap = true; break; }
+      }
+    }
+    if (overlap) continue;
+    // accepted -> full record. `corners` is what gets DRAWN (inset by half the gap, Y on the rendered
+    // ground mesh); `poly` (xz) is the exact cell used for picking / building logic.
+    const corners = poly.map((p) => {
+      const x = cx + (p.x - cx) * kInset, z = cz + (p.z - cz) * kInset;
+      return { x, y: groundMeshHeight(x, z), z };
+    });
+    const cell = {
+      id: cand.gid + '|' + cand.col + '|' + cand.row,
+      gid: cand.gid, segId: cand.segId, side: cand.side, sideSign: cand.sideSign, col: cand.col, row: cand.row,
+      poly, shrunkPoly: shrunk, innerPoly: _plotShrinkPoly(poly, PLOT_RESERVE_SHRINK), corners,
+      cx, cz, tan: cand.tan, minX, maxX, minZ, maxZ,
+    };
+    cells.push(cell);
+    groups.get(cand.gid).cellMap.set(cand.col * PLOT_KEY_STRIDE + cand.row, cell);
+    for (let i = i0; i <= i1; i++) for (let j = j0; j <= j1; j++) {
+      const key = _plotBucketKey(i, j);
+      let arr = hash.get(key);
+      if (!arr) { arr = []; hash.set(key, arr); }
+      arr.push(cell);
+    }
+  }
+  return { cells, groups, hash };
+}
+
+// The cell containing (x,z); with tol > 0 falls back to the cell whose centre is nearest within tol metres.
+function pickPlotCellInLayout(layout, x, z, tol = 0) {
+  if (!layout) return null;
+  const arr = layout.hash.get(_plotBucketKey(Math.floor(x / PLOT_HASH_BUCKET), Math.floor(z / PLOT_HASH_BUCKET)));
+  if (arr) {
+    for (const cell of arr) {
+      if (x < cell.minX || x > cell.maxX || z < cell.minZ || z > cell.maxZ) continue;
+      if (pointInPolygon(cell.poly, x, z)) return cell;
+    }
+  }
+  return tol > 0 ? nearestPlotCellInLayout(layout, x, z, tol) : null;
+}
+function nearestPlotCellInLayout(layout, x, z, maxDist) {
+  if (!layout) return null;
+  const B = PLOT_HASH_BUCKET, span = Math.ceil(maxDist / B);
+  const bi = Math.floor(x / B), bj = Math.floor(z / B);
+  let best = null, bd = maxDist;
+  for (let di = -span; di <= span; di++) for (let dj = -span; dj <= span; dj++) {
+    const arr = layout.hash.get(_plotBucketKey(bi + di, bj + dj));
+    if (!arr) continue;
+    for (const cell of arr) {
+      const d = Math.hypot(cell.cx - x, cell.cz - z);
+      if (d < bd) { bd = d; best = cell; }
+    }
+  }
+  return best;
+}
+
+const PLOT_PREVIEW_LIFT = 0.11;                             // m above the rendered ground — drag-selection preview
+const PLOT_HOVER_LIFT = 0.14;                               // m above the rendered ground — single hovered cell
+
 // ---- Prompt 20K Part T: Block Grid Road Tool default spacing (Part T says these stay changeable
 // "将来的に" — no dedicated UI control is added in this pass, so they're plain constants for now). --
 // ---- Prompt 20K-R3 Part D: fixed Building Footprint size limits (max 6x6, min 3x3) -------------
@@ -3931,9 +4210,13 @@ function createParcelAlongFrontage(network, segmentId, side, band, subdivisions 
 // as createParcelAlongFrontage's 8-band overlay parcels, just with one deep strip instead of 8
 // shallow ones so a real building (up to LOT_FOOTPRINT_MAX per edge) is never forced to straddle a
 // band boundary.
-function createBuildingParcelAlongFrontage(network, segmentId, side, subdivisions = 12) {
+function createBuildingParcelAlongFrontage(network, segmentId, side, minSubdivisions = 12) {
   const segment = network.segments.get(segmentId);
   if (!segment) return null;
+  // Prompt 21H: the polygon's edges are straight chords between samples, so on a curve the inner edge
+  // sits up to L^2/(8R) off the true offset curve. A house built flush against the first plot row
+  // must not be refused because of that, so sample at least every ~2m instead of a fixed 12 slices.
+  const subdivisions = Math.max(minSubdivisions, Math.ceil(getRoadPointSpacingLength(network, segment) / 2));
   const halfW = getRoadWidth(segment) / 2;
   const sidewalkDepth = SIDEWALK_WAYPOINT_GAP;
   const innerDist = halfW + sidewalkDepth;
@@ -7361,7 +7644,21 @@ function buildLotGroup(type, w, h, level, frontSign = -1, lotId = 0) {
     return m;
   };
 
-  if (type === 'res_terrace') {
+  if (type === 'res_low') {
+    // HousingPBR integration: low-density houses previously had NO branch here at all and silently
+    // fell through to the generic "res_mid" box below — this is the fix. w/h are already the lot's
+    // exact selected-cell footprint in meters (computeLowDensityPlacement / finalizeLot pass the
+    // selection's real cols x rows straight through, never scaled), and buildLotGroup's caller
+    // already applies the road-aligned world rotation (lot.rotation, any angle) — so all that's
+    // needed here is picking one of the 10 presets for this exact size and, like res_terrace, a
+    // local 180° flip when the entrance needs to face the opposite local Z side.
+    const variantIndex = ((lotId % 10) + 10) % 10;
+    const house = buildLowDensityHouseForCell(w, h, variantIndex);
+    if (house) {
+      if (frontSign < 0) house.rotation.y = Math.PI;
+      group.add(house);
+    }
+  } else if (type === 'res_terrace') {
     // HousingPBR integration: swap the old procedural box+cone body for one of the 20 PBR
     // terrace-house presets (img/ textures via HousingPBR.jsx). frontIsX/frontSign are kept
     // exactly as before to decide the LOCAL orientation of the house inside this lot group —
@@ -7704,6 +8001,13 @@ export default function CityGridIso() {
   // computeRoadsidePlotCells) — null until first built. Primary data stays RoadSegment (roadNetworkRef);
   // this is purely a cache so a zoning/reservation-only change can recolor without recomputing geometry.
   const roadsidePlotCellsRef = useRef(null);
+  // Prompt 21H: road-aligned plot cell layout + its derived state (see computeRoadsidePlotCells).
+  const plotLayoutRef = useRef(null);            // { cells, groups, hash } from computeRoadPlotLayout
+  const plotZoneRef = useRef(new Map());         // cell.id -> TILE_RES / TILE_COM / TILE_IND
+  const plotReservedRef = useRef(new Map());     // cell.id -> buildingId (cell is covered by a Building)
+  const plotFootprintsRef = useRef(new Map());   // buildingId -> { cx, cz, w, d, rot } — source for re-deriving plotReservedRef after a road edit
+  const buildingPlotKeysRef = useRef(new Map()); // buildingId -> [cell.id, ...]
+  const parcelRegistryStampRef = useRef(0);      // bumped every time the Building Parcel registry is rebuilt
   const showMicroGridRef = useRef(false);
   const blockSpacingXRef = useRef(BLOCK_SPACING_X);
   const blockSpacingZRef = useRef(BLOCK_SPACING_Z);
@@ -8746,192 +9050,267 @@ export default function CityGridIso() {
   const isMicroCellZonable = (mx, mz) => !isMicroCellBlocked(mx, mz) && isMicroCellInRoadFrontageStrip(roadNetworkRef.current, mx, mz);
 
   // ============================================================================
-  // Prompt 20K-R4: Road-Aligned 1m Plot Cells (Roadside Plot Strip)
+  // Prompt 21H: Road-Aligned Plot Cells (道路に平行な区画セル)
   // ============================================================================
-  // computeRoadsidePlotCells: pure data, no THREE — one record per 1m Roadside Plot cell, its
-  // position/orientation built ENTIRELY from a RoadSegment's own World Space
-  // getRoadPoint/getRoadTangent/getRoadNormal sampling (§B/§AM — never tileWorldX/tileWorldZ, never
-  // a legacy tx/ty center). This is the actual fix for the reported bug: the OLD
-  // updateMicroGridLines drew a flat 6x6 legacy-Tile rectangle around whatever tile happened to be
-  // hovered; this instead walks every real RoadSegment and produces a persistent, road-tangent-
-  // aligned 1m cell for every valid roadside meter of it, straight or curved alike.
+  // Layout geometry lives in computeRoadPlotLayout (module scope, above). Everything below is the
+  // component side: derived-state refs, cell state (zone / reserved / blocked), drag selection in
+  // ROAD coordinates (column x row of ONE road side — never a world-axis rectangle), and the
+  // Building packing that consumes that selection.
   //
-  // §AC: cells intentionally reuse the EXISTING Micro Grid's own cell index (microCellIndex, via
-  // worldToMicroCell(cx,cz)) as their identity for zone/reservation state — microZoneTypeRef/
-  // microReservedBuildingRef/isMicroCellBlocked (§AQ, never touched) stay the single source of
-  // truth; this function only decides each cell's own real-world quad, never zone data.
-  //
-  // SCOPE NOTE (§M, honestly reported — see chat response): only walks roadNetworkRef's Free Road
-  // segments. Legacy Tile-grid-painted roads have no RoadSegment representation anywhere in this
-  // codebase (they use a separate lightweight buildRoadGraphFromGrid() graph for routing only), and
-  // isMicroCellZonable/getRoadFrontage above ALREADY only recognize Free Road frontage today — so a
-  // legacy-Tile-road-only street currently grants no zoning frontage at all, with or without this
-  // Prompt. Synthesizing an equivalent RoadSegment for every legacy Tile road (so §M's "to the
-  // extent possible" could mean something more than "already true") is real additional scope this
-  // pass does not attempt — NOT confirmed/implemented.
-  const ROAD_PLOT_GAP = SIDEWALK_WAYPOINT_GAP; // §G: start just past the sidewalk zone, not flush on the curb
-  const ROADSIDE_PLOT_ROWS = 6; // §H: exactly 6 rows of 1m each — row index 6 never exists
+  //  * plotLayoutRef      — last computed layout (cells + per-strip cellMap + spatial hash)
+  //  * plotZoneRef        — cell.id -> TILE_RES/COM/IND. Carried over to the new cells (nearest
+  //                         centre within 0.75m) every time the layout is recomputed, so a road edit
+  //                         elsewhere never wipes the zones you already painted.
+  //  * plotReservedRef    — cell.id -> buildingId for every cell a Building footprint covers (the
+  //                         overlay hides those). Recomputed from plotFootprintsRef after a road edit.
+  //  * The legacy 1m world-axis micro grid (microZoneTypeRef / microReservedBuildingRef) and the 6m
+  //    Tile cache are still written to as a SIMULATION compatibility cache (paintPlotCell), but they
+  //    are never drawn or used to pick the area any more.
   const computeRoadsidePlotCells = () => {
-    // Prompt 21F: the cells drawn here are EXACTLY the 1m Micro-Grid cells that zoning selects and
-    // buildings reserve (axis-aligned, world-anchored) — the old road-aligned cells were a different
-    // lattice that got de-duplicated onto micro indices, which is what left holes in the overlay and
-    // made "what you see" differ from "what you select". Candidates are found by sweeping every
-    // non-highway road's sides; each is then confirmed with the same strip predicate selection uses.
-    const network = roadNetworkRef.current;
-    const candidates = new Set();
-    for (const segment of network.segments.values()) {
-      if (isHighwayDeckRoadType(ROAD_TYPES[segment.roadType])) continue; // no Building Plots beside a highway
-      const halfW = getRoadWidth(segment) / 2;
-      const length = getRoadPointSpacingLength(network, segment);
-      const steps = Math.max(2, Math.ceil(length / 0.5));
-      for (let i = 0; i <= steps; i++) {
-        const t = i / steps;
-        const p = getRoadPoint(network, segment, t);
-        if (p.y - terrainHeight(p.x, p.z) > 1.5) continue; // elevated deck — nothing to build beside it
-        const nrm = getRoadNormal(network, segment, t);
-        for (const sideSign of [1, -1]) {
-          for (let dist = halfW + MICRO_CELL_SETBACK - 0.8; dist <= halfW + MICRO_CELL_STRIP_MAX + 0.8; dist += 0.5) {
-            const { mx, mz } = worldToMicroCell(p.x + nrm.x * dist * sideSign, p.z + nrm.z * dist * sideSign);
-            if (microCellInBounds(mx, mz)) candidates.add(microCellIndex(mx, mz));
-          }
-        }
+    const layout = computeRoadPlotLayout(roadNetworkRef.current);
+    const oldLayout = plotLayoutRef.current, oldZone = plotZoneRef.current;
+    const newZone = new Map();
+    if (oldLayout && oldZone.size) {
+      for (const cell of layout.cells) {
+        const old = nearestPlotCellInLayout(oldLayout, cell.cx, cell.cz, 0.75);
+        const zt = old ? oldZone.get(old.id) : 0;
+        if (zt) newZone.set(cell.id, zt);
       }
     }
-    const cells = [];
-    candidates.forEach((microIndex) => {
-      const mx = microIndex % MICRO_GRID_SIZE, mz = Math.floor(microIndex / MICRO_GRID_SIZE);
-      if (!isMicroCellInRoadFrontageStrip(network, mx, mz)) return;
-      const x0 = mx - MAP_HALF, z0 = mz - MAP_HALF;
-      // every corner sits on the RENDERED ground mesh (groundMeshHeight), neighbours share corners
-      // exactly, so there is neither a gap between cells nor a cell sunk below the slope.
-      const corners = [[x0, z0], [x0 + 1, z0], [x0 + 1, z0 + 1], [x0, z0 + 1]].map(([cx, cz]) => ({ x: cx, y: groundMeshHeight(cx, cz), z: cz }));
-      cells.push({ id: 'cell:' + microIndex, mx, mz, microIndex, corners });
-    });
-    return cells;
+    plotZoneRef.current = newZone;
+    plotLayoutRef.current = layout;
+    rebuildPlotReservations();
+    return layout.cells;
   };
-  // getRoadsidePlotCellState: live-read from the existing Micro Grid data model (§AQ) — never
-  // stored on the cell record itself, so a zoning/reservation change never needs the (expensive,
-  // whole-road-network) cell geometry recomputed, only a recolor (see rebuildRoadsidePlotOverlay).
+  const markPlotCellsForFootprint = (buildingId, fp) => {
+    const layout = plotLayoutRef.current; if (!layout) return;
+    const corners = obbCorners(fp.cx, fp.cz, fp.w, fp.d, fp.rot);
+    let minX = Infinity, maxX = -Infinity, minZ = Infinity, maxZ = -Infinity;
+    for (const c of corners) { if (c.x < minX) minX = c.x; if (c.x > maxX) maxX = c.x; if (c.z < minZ) minZ = c.z; if (c.z > maxZ) maxZ = c.z; }
+    const B = PLOT_HASH_BUCKET, seen = new Set(), keys = [];
+    for (let i = Math.floor(minX / B); i <= Math.floor(maxX / B); i++) for (let j = Math.floor(minZ / B); j <= Math.floor(maxZ / B); j++) {
+      const arr = layout.hash.get(_plotBucketKey(i, j));
+      if (!arr) continue;
+      for (const cell of arr) {
+        if (seen.has(cell.id)) continue;
+        seen.add(cell.id);
+        if (cell.maxX < minX || cell.minX > maxX || cell.maxZ < minZ || cell.minZ > maxZ) continue;
+        if (!_plotPolyOverlap(corners, cell.innerPoly)) continue;
+        plotReservedRef.current.set(cell.id, buildingId);
+        keys.push(cell.id);
+      }
+    }
+    buildingPlotKeysRef.current.set(buildingId, keys);
+  };
+  const rebuildPlotReservations = () => {
+    plotReservedRef.current = new Map();
+    buildingPlotKeysRef.current = new Map();
+    for (const [bid, fp] of plotFootprintsRef.current) markPlotCellsForFootprint(bid, fp);
+  };
+  const reservePlotCellsForBuilding = (buildingId, cx, cz, w, d, rot) => {
+    const fp = { cx, cz, w, d, rot: rot || 0 };
+    plotFootprintsRef.current.set(buildingId, fp);
+    markPlotCellsForFootprint(buildingId, fp);
+  };
+  const releasePlotCellsForBuilding = (buildingId) => {
+    plotFootprintsRef.current.delete(buildingId);
+    const keys = buildingPlotKeysRef.current.get(buildingId);
+    if (keys) for (const k of keys) if (plotReservedRef.current.get(k) === buildingId) plotReservedRef.current.delete(k);
+    buildingPlotKeysRef.current.delete(buildingId);
+  };
+
+  // ---- per-cell state --------------------------------------------------------------------------
+  const isPlotCellReserved = (cell) => plotReservedRef.current.has(cell.id);
+  // Highway "no frontage" area: the Building Parcel registry marks the deep strip beside a highway
+  // as not buildable. Cached per cell and re-evaluated whenever the registry is rebuilt (stamp).
+  const isPlotCellInProhibitedParcel = (cell) => {
+    const stamp = parcelRegistryStampRef.current;
+    if (cell.prohibitedStamp !== stamp) {
+      let bad = false;
+      const registry = buildingParcelRegistryRef.current;
+      if (registry) for (const parcel of registry.values()) { if (!parcel.buildable && pointInPolygon(parcel.polygon, cell.cx, cell.cz)) { bad = true; break; } }
+      cell.prohibited = bad; cell.prohibitedStamp = stamp;
+    }
+    return cell.prohibited;
+  };
+  // Legacy Tile-side occupancy that has no World-Space footprint yet (old Tile roads, Education
+  // facilities) + the highway no-frontage area. Live-read, like isMicroCellBlocked was.
+  const isPlotCellBlocked = (cell) => {
+    const tx = Math.floor((cell.cx + MAP_HALF) / TILE), ty = Math.floor((cell.cz + MAP_HALF) / TILE);
+    if (!inBounds(tx, ty)) return true;
+    const ti = idx(tx, ty);
+    if (gridRef.current[ti] === TILE_ROAD) return true;
+    if (eduFacilityIdGridRef.current[ti] !== -1) return true;
+    if (tileBlockedByRoadFootprint(tx, ty)) return true;
+    return isPlotCellInProhibitedParcel(cell);
+  };
+  const isPlotCellOpen = (cell) => !isPlotCellReserved(cell) && !isPlotCellBlocked(cell);
+  // getRoadsidePlotCellState: live-read, never stored on the cell record, so a zoning / reservation
+  // change only needs a recolor (see rebuildRoadsidePlotOverlay), not new geometry.
   const getRoadsidePlotCellState = (cell) => {
-    if (microReservedBuildingRef.current.has(cell.microIndex)) return 'reserved'; // §U: hidden by the renderer
-    if (isMicroCellBlocked(cell.mx, cell.mz)) return 'blocked';
-    const zt = microZoneTypeRef.current[cell.microIndex];
+    if (isPlotCellReserved(cell)) return 'reserved'; // hidden by the renderer
+    if (isPlotCellBlocked(cell)) return 'blocked';
+    const zt = plotZoneRef.current.get(cell.id);
     if (zt === TILE_RES) return 'res';
     if (zt === TILE_COM) return 'com';
     if (zt === TILE_IND) return 'ind';
     return 'available';
   };
 
-  // ---- Prompt 20K-R3 Part Q: auto-build Residential modules from a just-zoned rectangle ----
-  // packZoneIntoModules (Part J/Q/S) + findLotFrontage (Part R/T, reused as-is) + finalizeLot
-  // (existing, untouched) do all the real work — this just calls them in sequence per module,
-  // skipping (not erroring on) any module finalizeLot itself rejects (no frontage, footprint not
-  // clear, etc.) exactly like a manual drag would.
-  // Prompt 20M update: COM now has its own sibling below (packAndBuildCommercialZone /
-  // finalizeCommercialBuilding). Prompt 20N adds IND's own sibling further below
-  // (packAndBuildIndustrialZone / finalizeIndustrialBuilding) — the existing Tile-based IND Growth
-  // Simulation (assignIndustryBuilding from the growth tick) is left fully intact and coexists
-  // with it (lotIdGrid[i]!==-1 already excludes any World Space IND tile from that loop).
-  // ============================================================================
-  // Prompt 21F — Zone -> Building packing driven by the REAL zonable cells
-  // ============================================================================
-  // The old packAndBuild*Zone functions cut the dragged RECTANGLE into modules, never looking at
-  // which of its cells were actually zonable. Two consequences: (1) a rectangle that covered the
-  // road (or a strip on both sides of it) was packed around its own centre — i.e. onto the road —
-  // so every module was refused; (2) the Tile-grid cache had already been flipped to TILE_RES by
-  // projectMicroZoneToTileCache BEFORE building was attempted, and lotFootprintClear treats any
-  // non-empty Tile as occupied — so even a well-placed module was refused. Both are fixed here:
-  // modules are derived per road-frontage strip from the cells that are really open, in road-
-  // aligned coordinates (straight or curved), and commitMicroZoneRect now builds first.
-  const ZONE_MODULE_GAP = 1.0;            // m left between neighbouring modules (must exceed BUILDING_MIN_SEPARATION's 0.75 or lotFootprintClear refuses "just touching")
-  const ZONE_MODULE_INNER_MARGIN = 0.15;  // m kept clear between the sidewalk zone / Parcel edge and a footprint
-  const ZONE_MIN_SELECTION_CELLS = 3;     // a zoning drag must span >= 3 x 3 cells (the smallest Building footprint) — no more 1-cell zones
-  const isCellOpenForZoneBuild = (mx, mz) => {
-    if (isMicroCellBlocked(mx, mz)) return false;
-    const { x, z } = microCellToWorldCenter(mx, mz);
-    const fr = getRoadFrontage(roadNetworkRef.current, x, z);
-    return !!fr && isFrontageDistanceOpenForCell(fr.distanceFromRoadEdge);
-  };
-  // Road-aligned modules (used for RES). Returns [{ candidates: [{cx,cz,w,d,rotationY,frontSign}, ...] }]
-  // where each module lists a few slightly shallower fallbacks to try if the first doesn't fit.
-  const packZonedRoadsideModules = (mx0, mx1, mz0, mz1) => {
-    const network = roadNetworkRef.current;
-    const groups = new Map(); // "segmentId|side" -> { seg, side, len, cols: Map(columnIndex -> [distFromRoadEdge...]) }
-    for (let mz = mz0; mz < mz1; mz++) for (let mx = mx0; mx < mx1; mx++) {
-      if (isMicroCellBlocked(mx, mz)) continue;
-      const { x, z } = microCellToWorldCenter(mx, mz);
-      const fr = getRoadFrontage(network, x, z);
-      if (!fr || !isFrontageDistanceOpenForCell(fr.distanceFromRoadEdge)) continue;
-      const seg = network.segments.get(fr.segmentId);
-      if (!seg) continue;
-      const key = fr.segmentId + '|' + fr.side;
-      let g = groups.get(key);
-      if (!g) { g = { seg, side: fr.side, len: getRoadPointSpacingLength(network, seg), cols: new Map() }; groups.set(key, g); }
-      const col = Math.floor(fr.t * g.len);
-      let arr = g.cols.get(col);
-      if (!arr) { arr = []; g.cols.set(col, arr); }
-      arr.push(fr.distanceFromRoadEdge);
+  // ---- picking / selection (ROAD coordinates) --------------------------------------------------
+  const pickPlotCellNear = (x, z, tol = 0) => pickPlotCellInLayout(plotLayoutRef.current, x, z, tol);
+  // getPlotSelection: the rectangle spanned by the drag-anchor cell and the cell under the pointer,
+  // in (column, row) of the ANCHOR's own road side. Because it is a column x row block of a strip,
+  // it is parallel to the road by construction, straight or curved. The pointer may wander anywhere
+  // (over the road, past the end of the strip): it is clamped to the anchor strip's nearest cell.
+  const getPlotSelection = (anchor, px, pz) => {
+    const layout = plotLayoutRef.current;
+    if (!layout || !anchor) return null;
+    const g = layout.groups.get(anchor.gid);
+    if (!g) return null;
+    let cur = pickPlotCellInLayout(layout, px, pz, 0);
+    if (!cur || cur.gid !== anchor.gid) {
+      let best = null, bd = Infinity;
+      for (const c of g.cellMap.values()) { const d = (c.cx - px) * (c.cx - px) + (c.cz - pz) * (c.cz - pz); if (d < bd) { bd = d; best = c; } }
+      cur = best || anchor;
     }
-    const modules = [];
-    groups.forEach((g) => {
-      // a 1m column along the road is usable when it has >= 3 open cells across (min footprint depth)
-      const cols = Array.from(g.cols.keys()).filter((c) => g.cols.get(c).length >= BUILDING_FOOTPRINT_MIN_D).sort((a, b) => a - b);
-      let i = 0;
-      while (i < cols.length) {
-        let j = i;
-        while (j + 1 < cols.length && cols[j + 1] === cols[j] + 1) j++;
-        const runStart = cols[i], runLen = cols[j] - cols[i] + 1; // metres of continuous open frontage
-        i = j + 1;
-        if (runLen < BUILDING_FOOTPRINT_MIN_W) continue;
-        let count = Math.max(1, Math.ceil((runLen + ZONE_MODULE_GAP) / (BUILDING_FOOTPRINT_MAX_W + ZONE_MODULE_GAP)));
-        let w = (runLen - (count - 1) * ZONE_MODULE_GAP) / count;
-        while (w < BUILDING_FOOTPRINT_MIN_W && count > 1) { count--; w = (runLen - (count - 1) * ZONE_MODULE_GAP) / count; }
-        if (w < BUILDING_FOOTPRINT_MIN_W) continue;
-        w = Math.min(w, BUILDING_FOOTPRINT_MAX_W);
-        for (let k = 0; k < count; k++) {
-          const s0 = runStart + k * (w + ZONE_MODULE_GAP), s1 = s0 + w;
-          let near = Infinity, far = -Infinity;
-          for (let c = Math.floor(s0); c < Math.ceil(s1); c++) {
-            const arr = g.cols.get(c);
-            if (!arr) continue;
-            for (const e of arr) { if (e < near) near = e; if (e > far) far = e; }
-          }
-          if (!isFinite(near)) continue;
-          const inner = Math.max(SIDEWALK_WAYPOINT_GAP, near - 0.5) + ZONE_MODULE_INNER_MARGIN; // footprint's road-side edge, metres from the paved edge
-          const outer = far + 0.5 - ZONE_MODULE_INNER_MARGIN;
-          const tMid = Math.max(0, Math.min(1, ((s0 + s1) / 2) / g.len));
-          const p = getRoadPoint(network, g.seg, tMid), tan = getRoadTangent(network, g.seg, tMid), nrm = getRoadNormal(network, g.seg, tMid);
-          const sideSign = g.side === 'left' ? 1 : -1;
-          const halfW = getRoadWidth(g.seg) / 2;
-          // footprint local +x follows the road tangent, local +z is the left normal (see obbCorners);
-          // the road lies on the -sideSign side of the building, i.e. local z = -sideSign.
-          const rotationY = Math.atan2(-tan.z, tan.x), frontSign = -sideSign;
-          const candidates = [];
-          for (const shrink of [0, 0.6, 1.2]) {
-            const D = Math.min(BUILDING_FOOTPRINT_MAX_D, outer - inner) - shrink;
-            if (D < BUILDING_FOOTPRINT_MIN_D) break;
-            const dist = halfW + inner + D / 2;
-            candidates.push({ cx: p.x + nrm.x * dist * sideSign, cz: p.z + nrm.z * dist * sideSign, w, d: D, rotationY, frontSign });
-          }
-          if (candidates.length) modules.push({ candidates });
-        }
+    const c0 = Math.min(anchor.col, cur.col), c1 = Math.max(anchor.col, cur.col);
+    const r0 = Math.min(anchor.row, cur.row), r1 = Math.max(anchor.row, cur.row);
+    const cells = [];
+    let missing = 0;
+    for (let c = c0; c <= c1; c++) for (let r = r0; r <= r1; r++) {
+      const cell = g.cellMap.get(c * PLOT_KEY_STRIDE + r);
+      if (cell) cells.push(cell); else missing++; // a cut cell (tight bend / other road) — leaves a hole
+    }
+    return { gid: g.gid, group: g, c0, c1, r0, r1, cols: c1 - c0 + 1, rows: r1 - r0 + 1, cells, missing };
+  };
+  // paintPlotCell: the visible zone (plotZoneRef) + the legacy micro-grid cache the Simulation still reads.
+  const paintPlotCell = (cell, zoneType, touchedTiles) => {
+    plotZoneRef.current.set(cell.id, zoneType);
+    const a = Math.floor(cell.minX + MAP_HALF), b = Math.ceil(cell.maxX + MAP_HALF), c = Math.floor(cell.minZ + MAP_HALF), d = Math.ceil(cell.maxZ + MAP_HALF);
+    for (let mz = c; mz < d; mz++) for (let mx = a; mx < b; mx++) {
+      if (!microCellInBounds(mx, mz)) continue;
+      const w = microCellToWorldCenter(mx, mz);
+      if (!pointInPolygon(cell.poly, w.x, w.z)) continue;
+      if (microReservedBuildingRef.current.has(microCellIndex(mx, mz))) continue; // callers only paint cells that are already open (isPlotCellOpen)
+      setMicroZone(mx, mz, zoneType);
+      touchedTiles.add(Math.floor(mx / 6) + ',' + Math.floor(mz / 6));
+    }
+  };
+  const projectTouchedTiles = (touchedTiles, zoneType) => {
+    touchedTiles.forEach((key) => { const [tx, ty] = key.split(',').map(Number); projectMicroZoneToTileCache(tx, ty, zoneType); });
+  };
+  // Default-zone every open roadside cell whose centre is inside the given World Space rectangle as
+  // Residential (used right after Grid / Block roads are generated).
+  const autoZonePlotCellsInBounds = (minX, minZ, maxX, maxZ) => {
+    const layout = plotLayoutRef.current; if (!layout) return;
+    const touched = new Set();
+    for (const cell of layout.cells) {
+      if (cell.cx < minX || cell.cx > maxX || cell.cz < minZ || cell.cz > maxZ) continue;
+      if (plotZoneRef.current.get(cell.id) || !isPlotCellOpen(cell)) continue;
+      paintPlotCell(cell, TILE_RES, touched);
+    }
+    projectTouchedTiles(touched, TILE_RES);
+    threeRef.current?.refreshRoadsidePlotOverlayColors?.();
+  };
+
+  // ============================================================================
+  // Prompt 21H — Zone -> Building packing driven by the SELECTED plot cells
+  // ============================================================================
+  const ZONE_MODULE_GAP = 1.0;            // m left between neighbouring modules (must exceed BUILDING_MIN_SEPARATION's 0.75 or lotFootprintClear refuses "just touching")
+  const ZONE_MODULE_INNER_MARGIN = 0.02;  // m kept clear between the cell edge and a footprint
+  const ZONE_MIN_SELECTION_CELLS = 3;     // a zoning drag must span >= 3 x 3 cells (the smallest Building footprint) — no more 1-cell zones
+  // Road-aligned modules (used for RES density tiers above low). One module = a run of columns of
+  // the selection that all have >= 3 open rows in a row; returns [{ candidates: [{cx,cz,w,d,rotationY,frontSign}, ...] }].
+  const packZonedRoadsideModules = (sel) => {
+    const network = roadNetworkRef.current, g = sel.group;
+    const seg = network.segments.get(g.segId);
+    if (!seg) return [];
+    const colInfo = new Map(); // column -> { near, far } (row indices, far exclusive): the longest open run of rows
+    for (let c = sel.c0; c <= sel.c1; c++) {
+      let best = null, runStart = -1;
+      for (let r = sel.r0; r <= sel.r1 + 1; r++) {
+        const cell = r <= sel.r1 ? g.cellMap.get(c * PLOT_KEY_STRIDE + r) : null;
+        const open = !!cell && isPlotCellOpen(cell);
+        if (open && runStart < 0) runStart = r;
+        if (!open && runStart >= 0) { if (!best || r - runStart > best.far - best.near) best = { near: runStart, far: r }; runStart = -1; }
       }
-    });
+      if (best && best.far - best.near >= BUILDING_FOOTPRINT_MIN_D) colInfo.set(c, best);
+    }
+    const cols = Array.from(colInfo.keys()).sort((a, b) => a - b);
+    const modules = [];
+    const sideSign = g.sideSign, halfW = getRoadWidth(seg) / 2;
+    let i = 0;
+    while (i < cols.length) {
+      let j = i;
+      while (j + 1 < cols.length && cols[j + 1] === cols[j] + 1) j++;
+      const runStart = cols[i], runLen = cols[j] - cols[i] + 1; // metres of continuous open frontage
+      i = j + 1;
+      if (runLen < BUILDING_FOOTPRINT_MIN_W) continue;
+      let count = Math.max(1, Math.ceil((runLen + ZONE_MODULE_GAP) / (BUILDING_FOOTPRINT_MAX_W + ZONE_MODULE_GAP)));
+      let w = (runLen - (count - 1) * ZONE_MODULE_GAP) / count;
+      while (w < BUILDING_FOOTPRINT_MIN_W && count > 1) { count--; w = (runLen - (count - 1) * ZONE_MODULE_GAP) / count; }
+      if (w < BUILDING_FOOTPRINT_MIN_W) continue;
+      w = Math.min(w, BUILDING_FOOTPRINT_MAX_W);
+      for (let k = 0; k < count; k++) {
+        const s0 = runStart + k * (w + ZONE_MODULE_GAP), s1 = s0 + w;
+        let near = -Infinity, far = Infinity; // rows that are open under EVERY column the module touches
+        for (let c = Math.floor(s0); c < Math.ceil(s1 - 1e-6); c++) {
+          const info = colInfo.get(c);
+          if (!info) { near = Infinity; break; }
+          if (info.near > near) near = info.near;
+          if (info.far < far) far = info.far;
+        }
+        if (!isFinite(near) || !isFinite(far) || far - near < BUILDING_FOOTPRINT_MIN_D) continue;
+        const inner = PLOT_ROAD_SETBACK + near + ZONE_MODULE_INNER_MARGIN; // footprint's road-side edge, metres from the paved edge
+        const outer = PLOT_ROAD_SETBACK + far - ZONE_MODULE_INNER_MARGIN;
+        const tMid = g.sToT(g.startS + (s0 + s1) / 2 * PLOT_CELL_SIZE);
+        const p = getRoadPoint(network, seg, tMid), tan = getRoadTangent(network, seg, tMid), nrm = getRoadNormal(network, seg, tMid);
+        // footprint local +x follows the road tangent, local +z is the left normal (see obbCorners);
+        // the road lies on the -sideSign side of the building, i.e. local z = -sideSign.
+        const rotationY = Math.atan2(-tan.z, tan.x), frontSign = -sideSign;
+        const candidates = [];
+        for (const shrink of [0, 0.6, 1.2]) {
+          const D = Math.min(BUILDING_FOOTPRINT_MAX_D, outer - inner) - shrink;
+          if (D < BUILDING_FOOTPRINT_MIN_D) break;
+          const dist = halfW + inner + D / 2;
+          candidates.push({ cx: p.x + nrm.x * dist * sideSign, cz: p.z + nrm.z * dist * sideSign, w, d: D, rotationY, frontSign });
+        }
+        if (candidates.length) modules.push({ candidates });
+      }
+    }
     return modules;
   };
-  // Tile-locked modules (used for COM / IND, whose Store/Workplace identity is single legacy-Tile
-  // only — see finalizeCommercialBuilding): within every 6m Tile touched by the selection, the
+  // 1m micro cells whose centre lies inside the given plot cells (COM / IND only — their Store /
+  // Workplace identity is still a single legacy Tile, so they are packed on that Tile lattice).
+  const microMaskForPlotCells = (cells) => {
+    const set = new Set();
+    let mx0 = Infinity, mx1 = -Infinity, mz0 = Infinity, mz1 = -Infinity;
+    for (const cell of cells) {
+      const a = Math.floor(cell.minX + MAP_HALF), b = Math.ceil(cell.maxX + MAP_HALF), c = Math.floor(cell.minZ + MAP_HALF), d = Math.ceil(cell.maxZ + MAP_HALF);
+      for (let mz = c; mz < d; mz++) for (let mx = a; mx < b; mx++) {
+        if (!microCellInBounds(mx, mz)) continue;
+        const w = microCellToWorldCenter(mx, mz);
+        if (!pointInPolygon(cell.poly, w.x, w.z)) continue;
+        set.add(microCellIndex(mx, mz));
+        if (mx < mx0) mx0 = mx; if (mx > mx1) mx1 = mx; if (mz < mz0) mz0 = mz; if (mz > mz1) mz1 = mz;
+      }
+    }
+    return { set, mx0, mx1, mz0, mz1 };
+  };
+  // Tile-locked modules (used for COM / IND): within every 6m Tile touched by the selection, the
   // largest fully-open rectangle (>= 4 x 4 cells, so >= 3m after the 0.5m clearance inset on each
   // side that keeps neighbouring Tiles' buildings 1m apart).
-  const packZonedTileModules = (mx0, mx1, mz0, mz1) => {
+  const packZonedTileModules = (mask) => {
     const out = [];
-    const tx0 = Math.floor(mx0 / 6), tx1 = Math.floor((mx1 - 1) / 6), tz0 = Math.floor(mz0 / 6), tz1 = Math.floor((mz1 - 1) / 6);
+    if (!mask || mask.set.size === 0) return out;
+    const tx0 = Math.floor(mask.mx0 / 6), tx1 = Math.floor(mask.mx1 / 6), tz0 = Math.floor(mask.mz0 / 6), tz1 = Math.floor(mask.mz1 / 6);
     for (let ty = tz0; ty <= tz1; ty++) for (let tx = tx0; tx <= tx1; tx++) {
       if (!inBounds(tx, ty)) continue;
       const open = new Uint8Array(36);
       for (let dz = 0; dz < 6; dz++) for (let dx = 0; dx < 6; dx++) {
         const mx = tx * 6 + dx, mz = ty * 6 + dz;
-        if (mx >= mx0 && mx < mx1 && mz >= mz0 && mz < mz1 && isCellOpenForZoneBuild(mx, mz)) open[dz * 6 + dx] = 1;
+        if (mask.set.has(microCellIndex(mx, mz)) && !isMicroCellBlocked(mx, mz)) open[dz * 6 + dx] = 1;
       }
       let best = null;
       for (let z0 = 0; z0 < 6; z0++) for (let z1 = z0 + 4; z1 <= 6; z1++) for (let x0 = 0; x0 < 6; x0++) for (let x1 = x0 + 4; x1 <= 6; x1++) {
@@ -8947,15 +9326,10 @@ export default function CityGridIso() {
     }
     return out;
   };
-  // World-space rect (as commitMicroZoneRect passes it) -> micro-cell bounds
-  const zoneRectToCells = (minX, minZ, maxX, maxZ) => ({
-    mx0: Math.round(minX + MAP_HALF), mx1: Math.round(maxX + MAP_HALF), mz0: Math.round(minZ + MAP_HALF), mz1: Math.round(maxZ + MAP_HALF),
-  });
-  const packAndBuildResidentialZone = (minX, minZ, maxX, maxZ) => {
-    const { mx0, mx1, mz0, mz1 } = zoneRectToCells(minX, minZ, maxX, maxZ);
+  const packAndBuildResidentialZone = (sel) => {
     const tier = residentialDensityTier(popRef.current);
     const type = legacyLotTypeForDensityTier(tier);
-    const modules = packZonedRoadsideModules(mx0, mx1, mz0, mz1);
+    const modules = packZonedRoadsideModules(sel);
     let built = 0;
     zoneBuildTypeRef.current = TILE_RES;
     try {
@@ -8969,11 +9343,10 @@ export default function CityGridIso() {
     } finally { zoneBuildTypeRef.current = null; }
     return built;
   };
-  // COM / IND: same geometry source (real open cells), Tile-locked, then the existing
-  // findLotFrontage + finalizeCommercialBuilding / finalizeIndustrialBuilding path (unchanged).
-  const packAndBuildTileLockedZone = (zoneType, finalizeFn, minX, minZ, maxX, maxZ) => {
-    const { mx0, mx1, mz0, mz1 } = zoneRectToCells(minX, minZ, maxX, maxZ);
-    const modules = packZonedTileModules(mx0, mx1, mz0, mz1);
+  // COM / IND: same selection, Tile-locked, then the existing findLotFrontage +
+  // finalizeCommercialBuilding / finalizeIndustrialBuilding path (unchanged).
+  const packAndBuildTileLockedZone = (zoneType, finalizeFn, sel) => {
+    const modules = packZonedTileModules(microMaskForPlotCells(sel.cells));
     let built = 0;
     zoneBuildTypeRef.current = zoneType;
     try {
@@ -8985,37 +9358,49 @@ export default function CityGridIso() {
     } finally { zoneBuildTypeRef.current = null; }
     return built;
   };
-  const packAndBuildCommercialZone = (minX, minZ, maxX, maxZ) => packAndBuildTileLockedZone(TILE_COM, finalizeCommercialBuilding, minX, minZ, maxX, maxZ);
-  const packAndBuildIndustrialZone = (minX, minZ, maxX, maxZ) => packAndBuildTileLockedZone(TILE_IND, finalizeIndustrialBuilding, minX, minZ, maxX, maxZ);
-  // ---- Prompt 21F: LOW-DENSITY residential = exactly the selected cells --------------------------
-  // A low-density house may only be created from a cell selection of one of these sizes (unordered,
-  // so 3x2 == 2x3): 2x2 2x3 2x4 2x5 2x6 3x3 3x4 3x5 3x6 4x4 4x5 4x6. The house then occupies EXACTLY
-  // the selected cells (no Tile, no re-packing): its footprint is the selected rectangle, turned to
-  // face the road it fronts (rotation is only ever a multiple of 90 degrees, so it stays on the cells).
-  const LOW_DENSITY_CELL_SIZES = ['2x2', '2x3', '2x4', '2x5', '2x6', '3x3', '3x4', '3x5', '3x6', '4x4', '4x5', '4x6'];
+  const packAndBuildCommercialZone = (sel) => packAndBuildTileLockedZone(TILE_COM, finalizeCommercialBuilding, sel);
+  const packAndBuildIndustrialZone = (sel) => packAndBuildTileLockedZone(TILE_IND, finalizeIndustrialBuilding, sel);
+  // ---- LOW-DENSITY residential = exactly the selected cells --------------------------------------
+  // A low-density house may only be created from a cell selection of one of these EXACT 8 sizes
+  // (unordered, so 3x2 == 2x3): 3x2 3x3 3x4 3x5 3x6 4x4 4x5 4x6 (any other size, including the
+  // smaller 2x2/2x4/2x5/2x6 the tool used to allow, is now refused/shown red — see
+  // isLowDensityCellSelection below). The house then occupies EXACTLY the selected cells: its
+  // footprint is the selected block, turned to the road's own direction at that spot (Prompt 21H:
+  // any angle, not just multiples of 90 degrees) with its entrance on the road side. HousingPBR.jsx
+  // provides 10 real PBR house models for each of these 8 sizes (buildLowDensityHouseForCell), one
+  // of which buildLotGroup's res_low branch picks and builds at the lot's exact w x d footprint.
+  const LOW_DENSITY_CELL_SIZES = ['2x3', '3x3', '3x4', '3x5', '3x6', '4x4', '4x5', '4x6'];
   const isLowDensityCellSelection = (wc, hc) => LOW_DENSITY_CELL_SIZES.includes(Math.min(wc, hc) + 'x' + Math.max(wc, hc));
   const isLowDensityResidentialNow = () => residentialDensityTier(popRef.current) === 'res_low';
   // Geometry + Parcel check only (cheap). Returns null if the selection can't be a house.
-  const computeLowDensityPlacement = (mx0, mx1, mz0, mz1) => {
-    const wc = mx1 - mx0, hc = mz1 - mz0;
-    if (!isLowDensityCellSelection(wc, hc)) return null;
-    for (let mz = mz0; mz < mz1; mz++) for (let mx = mx0; mx < mx1; mx++) if (!isCellOpenForZoneBuild(mx, mz)) return null; // every selected cell must be open
-    const cx = (mx0 + mx1) / 2 - MAP_HALF, cz = (mz0 + mz1) / 2 - MAP_HALF;
-    const fr = getRoadFrontage(roadNetworkRef.current, cx, cz);
-    if (!fr) return null;
-    const dx = fr.roadPoint.x - cx, dz = fr.roadPoint.z - cz;
-    let rotationY, frontSign, w, d;
-    if (Math.abs(dx) > Math.abs(dz)) { // road lies east/west of the house
-      rotationY = dx > 0 ? -Math.PI / 2 : Math.PI / 2; frontSign = -1; w = hc; d = wc;
-    } else {                           // road lies north/south
-      rotationY = 0; frontSign = dz < 0 ? -1 : 1; w = wc; d = hc;
+  const computeLowDensityPlacement = (sel) => {
+    if (!sel || sel.missing > 0 || !sel.cells.length) return null;
+    if (!isLowDensityCellSelection(sel.cols, sel.rows)) return null;
+    for (const cell of sel.cells) if (!isPlotCellOpen(cell)) return null; // every selected cell must be open
+    const g = sel.group;
+    let cx = 0, cz = 0;
+    for (const cell of sel.cells) { cx += cell.cx; cz += cell.cz; }
+    cx /= sel.cells.length; cz /= sel.cells.length;
+    // direction of the selected block along the road: chord from its first to its last column (== the
+    // road tangent on a straight road, the best-fit direction on a curve)
+    const first = g.cellMap.get(sel.c0 * PLOT_KEY_STRIDE + sel.r0), last = g.cellMap.get(sel.c1 * PLOT_KEY_STRIDE + sel.r0);
+    let tx = last.cx - first.cx, tz = last.cz - first.cz;
+    if (Math.hypot(tx, tz) < 0.5) { tx = first.tan.x; tz = first.tan.z; }
+    const tl = Math.hypot(tx, tz) || 1; tx /= tl; tz /= tl;
+    const rotationY = Math.atan2(-tz, tx), sideSign = g.sideSign, frontSign = -sideSign;
+    const nx = -tz, nz = tx; // left normal
+    const w = sel.cols, d = sel.rows;
+    // On the outside of a bend the straight footprint's road-side edge can dip a few cm into the
+    // sidewalk strip; nudge the house AWAY from the road (never toward it) until it fits a Parcel.
+    for (let shift = 0; shift <= 0.5001; shift += 0.05) {
+      const px = cx + nx * sideSign * shift, pz = cz + nz * sideSign * shift;
+      if (findParcelForFootprint(buildingParcelRegistryRef.current, px, pz, w, d, rotationY)) return { cx: px, cz: pz, w, d, rotationY, frontSign };
     }
-    if (!findParcelForFootprint(buildingParcelRegistryRef.current, cx, cz, w, d, rotationY)) return null;
-    return { cx, cz, w, d, rotationY, frontSign };
+    return null;
   };
   // Full check used by the preview (so red == "this would really be refused") and by the builder.
-  const canBuildLowDensityHouse = (mx0, mx1, mz0, mz1) => {
-    const pl = computeLowDensityPlacement(mx0, mx1, mz0, mz1);
+  const canBuildLowDensityHouse = (sel) => {
+    const pl = computeLowDensityPlacement(sel);
     if (!pl) return null;
     zoneBuildTypeRef.current = TILE_RES;
     try {
@@ -9024,8 +9409,8 @@ export default function CityGridIso() {
     if (!computeBuildingGrading(pl.cx, pl.cz, pl.w, pl.d, pl.rotationY).buildable) return null;
     return pl;
   };
-  const buildLowDensityHouse = (mx0, mx1, mz0, mz1) => {
-    const pl = canBuildLowDensityHouse(mx0, mx1, mz0, mz1);
+  const buildLowDensityHouse = (sel) => {
+    const pl = canBuildLowDensityHouse(sel);
     if (!pl) return 0;
     const type = legacyLotTypeForDensityTier('res_low');
     zoneBuildTypeRef.current = TILE_RES;
@@ -9074,14 +9459,16 @@ export default function CityGridIso() {
     const cells = getMicroCellsForFootprint(cx, cz, w, h, rotationY);
     for (const ci of cells) microReservedBuildingRef.current.set(ci, buildingId);
     buildingMicroCellsRef.current.set(buildingId, cells);
+    reservePlotCellsForBuilding(buildingId, cx, cz, w, h, rotationY); // Prompt 21H: hide the road-aligned plot cells this Building covers
     // Prompt 20K-R4: a newly-reserved cell should stop showing as an available/zoned Roadside Plot
     // (§U — reserved cells render hidden) the instant the Building goes up, not just on the next
     // unrelated road edit.
     threeRef.current?.refreshRoadsidePlotOverlayColors?.();
   };
   const releaseMicroCellsForBuilding = (buildingId) => {
+    releasePlotCellsForBuilding(buildingId); // Prompt 21H: give the road-aligned plot cells back
     const cells = buildingMicroCellsRef.current.get(buildingId);
-    if (!cells) return;
+    if (!cells) { threeRef.current?.refreshRoadsidePlotOverlayColors?.(); return; }
     for (const ci of cells) if (microReservedBuildingRef.current.get(ci) === buildingId) microReservedBuildingRef.current.delete(ci);
     buildingMicroCellsRef.current.delete(buildingId);
     threeRef.current?.refreshRoadsidePlotOverlayColors?.(); // Prompt 20K-R4 (§27/TEST28 mirror): released cells become visible/available again
@@ -10441,45 +10828,62 @@ export default function CityGridIso() {
     dragRef.current.rectValid = valid;
   }, [lotFootprintClear, findLotFrontage, pickTerraceOrientation]);
 
-  // ---- Prompt 20K Part H/I/J: Rectangle Zoning drag preview ----
+  // ---- Prompt 21H: Rectangle Zoning drag preview — ROAD-aligned ----
   // ax/az = drag anchor (World Space, raw click point), cx/cz = current pointer World Space point.
-  // Snaps both corners to the 1m micro grid (Part J: 10.3〜28.7 → 10〜29) — this snapping applies
-  // ONLY to this zoning rectangle, never to Free Road geometry itself (Part J 禁止事項).
+  // The anchor picks a plot cell; the pointer is mapped onto that cell's own road side (see
+  // getPlotSelection), so the selection is a column x row block PARALLEL to the road — not a
+  // world-axis rectangle and not a 6m Tile. The preview draws exactly the selected cells.
   const updateMicroZonePreview = (tool, ax, az, cx, cz) => {
-    const t = threeRef.current; if (!t || !t.microZonePreviewMesh) return;
+    const t = threeRef.current; if (!t || !t.plotSelectionMesh) return;
     const zoneType = tool === 'zone_res' ? TILE_RES : tool === 'zone_com' ? TILE_COM : tool === 'zone_ind' ? TILE_IND : null;
-    if (!zoneType) { t.microZonePreviewMesh.visible = false; dragRef.current.microRect = null; return; }
-    const minXi = Math.floor(Math.min(ax, cx)), maxXi = Math.ceil(Math.max(ax, cx));
-    const minZi = Math.floor(Math.min(az, cz)), maxZi = Math.ceil(Math.max(az, cz));
-    const clamp = (v) => Math.max(0, Math.min(MICRO_GRID_SIZE, v));
-    const mx0 = clamp(minXi + MAP_HALF), mx1 = clamp(maxXi + MAP_HALF);
-    const mz0 = clamp(minZi + MAP_HALF), mz1 = clamp(maxZi + MAP_HALF);
-    let total = 0, validCount = 0;
-    for (let mz = mz0; mz < mz1; mz++) for (let mx = mx0; mx < mx1; mx++) { total++; if (isMicroCellZonable(mx, mz)) validCount++; }
-    // Prompt 21F: a zoning drag must span at least 3 x 3 cells (the smallest Building footprint) and
-    // contain at least that many zonable cells — a bare click / 1-cell sliver can no longer create
-    // a "zone" that no Building could ever stand on.
+    const hide = () => { t.plotSelectionMesh.visible = false; dragRef.current.microRect = null; };
+    if (!zoneType) { hide(); return; }
+    let anchor = dragRef.current.plotAnchor;
+    if (anchor === undefined) { anchor = pickPlotCellNear(ax, az, 2) || null; dragRef.current.plotAnchor = anchor; }
+    if (!anchor) { hide(); return; }
+    const sel = getPlotSelection(anchor, cx, cz);
+    if (!sel || !sel.cells.length) { hide(); return; }
+    let openCount = 0;
+    const openFlags = sel.cells.map((cell) => { const o = isPlotCellOpen(cell); if (o) openCount++; return o; });
     let valid;
     if (zoneType === TILE_RES && isLowDensityResidentialNow()) {
       // Low density: the selection IS the house — must be one of the allowed cell sizes AND really buildable.
-      valid = total > 0 && isLowDensityCellSelection(mx1 - mx0, mz1 - mz0) && validCount === total && !!canBuildLowDensityHouse(mx0, mx1, mz0, mz1);
+      valid = sel.missing === 0 && openCount === sel.cells.length && isLowDensityCellSelection(sel.cols, sel.rows) && !!canBuildLowDensityHouse(sel);
     } else {
-      const bigEnough = (mx1 - mx0) >= ZONE_MIN_SELECTION_CELLS && (mz1 - mz0) >= ZONE_MIN_SELECTION_CELLS;
-      valid = bigEnough && total > 0 && validCount >= ZONE_MIN_SELECTION_CELLS * ZONE_MIN_SELECTION_CELLS;
+      // a zoning drag must span at least 3 x 3 cells (the smallest Building footprint) and contain
+      // at least that many open cells — a bare click / 1-cell sliver can never hold a Building.
+      valid = sel.cols >= ZONE_MIN_SELECTION_CELLS && sel.rows >= ZONE_MIN_SELECTION_CELLS && openCount >= ZONE_MIN_SELECTION_CELLS * ZONE_MIN_SELECTION_CELLS;
     }
-    dragRef.current.microRect = { mx0, mx1, mz0, mz1, valid };
-    const cx0 = mx0 - MAP_HALF, cx1 = mx1 - MAP_HALF, cz0 = mz0 - MAP_HALF, cz1 = mz1 - MAP_HALF;
-    const centerX = (cx0 + cx1) / 2, centerZ = (cz0 + cz1) / 2;
-    const w = Math.max(cx1 - cx0, 0.01), h = Math.max(cz1 - cz0, 0.01);
-    // Prompt 21F: sit above the HIGHEST point of the rendered ground under the rectangle (corners,
-    // edge midpoints, centre) so the preview isn't swallowed by a slope.
-    let topY = -Infinity;
-    for (const [px, pz] of [[cx0, cz0], [cx1, cz0], [cx1, cz1], [cx0, cz1], [centerX, cz0], [centerX, cz1], [cx0, centerZ], [cx1, centerZ], [centerX, centerZ]]) topY = Math.max(topY, groundMeshHeight(px, pz));
-    t.microZonePreviewMesh.position.set(centerX, topY + 0.35, centerZ);
-    t.microZonePreviewMesh.scale.set(w, 1, h);
-    const zoneColor = zoneType === TILE_RES ? 0x5a90d8 : zoneType === TILE_COM ? 0xe0b060 : 0x9b6fdc;
-    t.microZonePreviewMesh.material.color.set(valid ? zoneColor : 0xe05a4f);
-    t.microZonePreviewMesh.visible = total > 0;
+    dragRef.current.microRect = { sel, valid };
+    const zc = new THREE.Color(zoneType === TILE_RES ? 0x5a90d8 : zoneType === TILE_COM ? 0xe0b060 : 0x9b6fdc);
+    const red = new THREE.Color(0xe05a4f);
+    const positions = [], colors = [];
+    sel.cells.forEach((cell, i) => {
+      if (isPlotCellReserved(cell)) return; // a house already stands here
+      const col = valid && openFlags[i] ? zc : red;
+      const [c0, c1, c2, c3] = cell.corners;
+      for (const c of [c0, c1, c2, c0, c2, c3]) { positions.push(c.x, c.y + PLOT_PREVIEW_LIFT, c.z); colors.push(col.r, col.g, col.b); }
+    });
+    t.plotSelectionMesh.geometry.dispose();
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+    geo.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+    t.plotSelectionMesh.geometry = geo;
+    t.plotSelectionMesh.visible = positions.length > 0;
+  };
+  // Hover highlight for the zoning tools: the ONE road-aligned cell under the cursor (replaces the
+  // 6m Tile-sized hover square, which is what made the designated area feel Tile-shaped).
+  const updatePlotHover = (x, z) => {
+    const t = threeRef.current; if (!t || !t.plotHoverMesh) return;
+    const tool = toolRef.current;
+    const isZoneTool = tool === 'zone_res' || tool === 'zone_com' || tool === 'zone_ind';
+    if (!isZoneTool || dragRef.current.mode === 'microzone') { t.plotHoverMesh.visible = false; return; }
+    const cell = pickPlotCellNear(x, z, 0);
+    if (!cell || isPlotCellReserved(cell)) { t.plotHoverMesh.visible = false; return; }
+    const attr = t.plotHoverMesh.geometry.attributes.position;
+    for (let i = 0; i < 4; i++) attr.setXYZ(i, cell.corners[i].x, cell.corners[i].y + PLOT_HOVER_LIFT, cell.corners[i].z);
+    attr.needsUpdate = true;
+    t.plotHoverMesh.visible = true;
   };
 
   // ---- Prompt 20K Part S/X/Y: Block Grid Road Tool drag-rectangle preview ----
@@ -12741,20 +13145,7 @@ export default function CityGridIso() {
       // caps) exist, scan the SAME rectangle for cells inside a (now-real, non-highway) road's
       // frontage strip and not otherwise blocked, and default-zone them RES. Bounded to just the
       // dragged rectangle, one-time cost on tool commit (not a per-frame scan).
-      if (created > 0) {
-        const clamp = (v) => Math.max(0, Math.min(MICRO_GRID_SIZE, v));
-        const mx0 = clamp(Math.floor(minX + MAP_HALF)), mx1 = clamp(Math.ceil(maxX + MAP_HALF));
-        const mz0 = clamp(Math.floor(minZ + MAP_HALF)), mz1 = clamp(Math.ceil(maxZ + MAP_HALF));
-        const touchedTiles = new Set();
-        for (let mz = mz0; mz < mz1; mz++) {
-          for (let mx = mx0; mx < mx1; mx++) {
-            if (!isMicroCellZonable(mx, mz)) continue; // Prompt 20K-R3 Part O: folds in the 6m roadside-strip depth cap
-            setMicroZone(mx, mz, TILE_RES);
-            touchedTiles.add(`${Math.floor(mx / 6)},${Math.floor(mz / 6)}`);
-          }
-        }
-        touchedTiles.forEach((key) => { const [tx, ty] = key.split(',').map(Number); projectMicroZoneToTileCache(tx, ty, TILE_RES); });
-      }
+      if (created > 0) autoZonePlotCellsInBounds(minX, minZ, maxX, maxZ); // Prompt 21H: default-zone the new road-aligned cells RES
       return { segmentsCreated: created, segmentsSkipped: skipped };
     }
 
@@ -12763,18 +13154,7 @@ export default function CityGridIso() {
     // given World Space rectangle for micro cells now inside a road's frontage strip and default-
     // zones them RES, exactly like placeBlockGridRoads' own tail block.
     function applyRoadsideZoningForBounds(minX, minZ, maxX, maxZ) {
-      const clamp = (v) => Math.max(0, Math.min(MICRO_GRID_SIZE, v));
-      const mx0 = clamp(Math.floor(minX + MAP_HALF)), mx1 = clamp(Math.ceil(maxX + MAP_HALF));
-      const mz0 = clamp(Math.floor(minZ + MAP_HALF)), mz1 = clamp(Math.ceil(maxZ + MAP_HALF));
-      const touchedTiles = new Set();
-      for (let mz = mz0; mz < mz1; mz++) {
-        for (let mx = mx0; mx < mx1; mx++) {
-          if (!isMicroCellZonable(mx, mz)) continue;
-          setMicroZone(mx, mz, TILE_RES);
-          touchedTiles.add(`${Math.floor(mx / 6)},${Math.floor(mz / 6)}`);
-        }
-      }
-      touchedTiles.forEach((key) => { const [tx, ty] = key.split(',').map(Number); projectMicroZoneToTileCache(tx, ty, TILE_RES); });
+      autoZonePlotCellsInBounds(minX, minZ, maxX, maxZ); // Prompt 21H: road-aligned plot cells, not the world-axis micro grid
     }
     // Part K — "Road Spacing" UI toggle: when spacingMode is 'edge' (道路端間距離), the authored
     // Block Width/Depth are curb-to-curb, so this adds the chosen road type's own paved width to
@@ -13220,6 +13600,11 @@ export default function CityGridIso() {
       const isZoneTool = toolRef.current === 'zone_res' || toolRef.current === 'zone_com' || toolRef.current === 'zone_ind';
       if (isZoneTool && !roadsidePlotCellsRef.current) rebuildRoadsidePlotOverlay();
       roadsidePlotOverlayMesh.visible = isZoneTool;
+      if (!isZoneTool) { // Prompt 21H: the hover cell / drag preview only exist while a zoning tool is active
+        const tr = threeRef.current;
+        if (tr?.plotHoverMesh) tr.plotHoverMesh.visible = false;
+        if (tr?.plotSelectionMesh) tr.plotSelectionMesh.visible = false;
+      }
     }
 
     // ---- Building Placement Parcel Registry (Prompt 18) ----
@@ -13235,6 +13620,10 @@ export default function CityGridIso() {
           if (parcel) buildingParcelRegistryRef.current.set(parcel.id, parcel);
         }
       }
+      // Prompt 21H: the plot overlay is rebuilt BEFORE this registry (see every call site), so the
+      // "highway no-frontage" flag it cached per cell is stale — bump the stamp and recolor.
+      parcelRegistryStampRef.current++;
+      if (roadsidePlotCellsRef.current) writeRoadsidePlotOverlayColors();
     }
 
     // ---- roads: sidewalk base -> curb rim -> asphalt hub/arms (auto-tiling via rotation) ----
@@ -13570,6 +13959,28 @@ export default function CityGridIso() {
     const microGridLineMesh = new THREE.LineSegments(new THREE.BufferGeometry(), new THREE.LineBasicMaterial({ color: 0x7fe0a8, transparent: true, opacity: 0.4 }));
     microGridLineMesh.visible = false;
     scene.add(microGridLineMesh);
+    // ---- Prompt 21H: road-aligned zoning drag preview + hovered cell ----
+    // plotSelectionPreviewMesh: the cells of the current drag selection (vertex-coloured: zone colour
+    // when valid, red when not) — replaces microZonePreviewMesh's single world-axis box for zoning.
+    // plotHoverMesh: ONE quad re-pointed at the cell under the cursor (replaces the 6m Tile hover
+    // square while a zoning tool is active).
+    const plotSelectionPreviewMesh = new THREE.Mesh(
+      new THREE.BufferGeometry(),
+      new THREE.MeshBasicMaterial({ vertexColors: true, transparent: true, opacity: 0.62, depthWrite: false, side: THREE.DoubleSide, polygonOffset: true, polygonOffsetFactor: -4, polygonOffsetUnits: -4 })
+    );
+    plotSelectionPreviewMesh.visible = false;
+    plotSelectionPreviewMesh.frustumCulled = false;
+    scene.add(plotSelectionPreviewMesh);
+    const plotHoverGeo = new THREE.BufferGeometry();
+    plotHoverGeo.setAttribute('position', new THREE.Float32BufferAttribute(new Float32Array(12), 3));
+    plotHoverGeo.setIndex([0, 1, 2, 0, 2, 3]);
+    const plotHoverMesh = new THREE.Mesh(
+      plotHoverGeo,
+      new THREE.MeshBasicMaterial({ color: 0xfff2a8, transparent: true, opacity: 0.55, depthWrite: false, side: THREE.DoubleSide, polygonOffset: true, polygonOffsetFactor: -5, polygonOffsetUnits: -5 })
+    );
+    plotHoverMesh.visible = false;
+    plotHoverMesh.frustumCulled = false;
+    scene.add(plotHoverMesh);
 
     // ---- Prompt 20K Part Y: Block Grid Road Tool drag-rectangle ghost preview ----
     // Transparent blue when valid, red when the rectangle is too small to hold a single block
@@ -13785,6 +14196,8 @@ export default function CityGridIso() {
       roadSelectPreviewMesh, setRoadSelectionHighlight,
       // Prompt 20K — Micro Zoning rectangle preview + grid-line overlay.
       microZonePreviewMesh, microGridLineMesh,
+      // Prompt 21H — road-aligned zoning drag preview + hovered plot cell.
+      plotSelectionMesh: plotSelectionPreviewMesh, plotHoverMesh,
       // Prompt 20K Part Y — Block Grid Road Tool ghost preview.
       blockGridPreviewMesh,
     };
@@ -14006,6 +14419,9 @@ export default function CityGridIso() {
         } else if (isZoneType(v)) {
           const lvl = level[i];
           if (lvl === 0) {
+            // Prompt 21H: the 6m Tile-shaped zone tint is what made the designated area look
+            // Tile-dependent — the road-aligned plot cells are the only zone display now.
+            if (!SHOW_LEGACY_ZONE_TILE_TINT) continue;
             const eligible = hasConnectedRoadNeighbor(tx, ty);
             const mesh = eligible ? zoneTint[v] : zoneTintDim[v];
             const count = eligible ? tintCounts[v]++ : dimCounts[v]++;
@@ -16981,23 +17397,21 @@ export default function CityGridIso() {
     if (count >= 18) applyTool(tx, ty);
   };
 
-  // ---- Prompt 20K Part H (commit): called from onPointerUp once a zone_res/com/ind rectangle
-  // drag finishes. Blocked cells (Part K) are skipped individually rather than rejecting the whole
-  // rectangle, so a mostly-clear drag that clips a road/building still zones everything else. ----
+  // ---- Prompt 21H (commit): called from onPointerUp once a zone_res/com/ind drag finishes. The
+  // selection is the road-aligned cell block computed by updateMicroZonePreview; only cells that are
+  // still open get painted. ----
   const commitMicroZoneRect = (tool) => {
     const rect = dragRef.current.microRect;
     if (!rect || !rect.valid) return;
+    const sel = rect.sel;
     const zoneType = tool === 'zone_res' ? TILE_RES : tool === 'zone_com' ? TILE_COM : TILE_IND;
-    const wx0 = rect.mx0 - MAP_HALF, wz0 = rect.mz0 - MAP_HALF, wx1 = rect.mx1 - MAP_HALF, wz1 = rect.mz1 - MAP_HALF;
-    // Prompt 21F: BUILD FIRST, paint/project the zone second. projectMicroZoneToTileCache flips the
-    // legacy Tile cache to TILE_RES/COM/IND, and lotFootprintClear used to treat any non-empty Tile
-    // as occupied — so with the old order the zone itself blocked every building it was drawn for.
-    // Prompt 20K-R3 Part Q / 20M / 20N: attempt real Building creation on the just-zoned area
-    // (the Tile-based IND/COM Growth Simulation still runs unmodified and coexists with it).
+    // BUILD FIRST, paint/project the zone second. projectMicroZoneToTileCache flips the legacy Tile
+    // cache to TILE_RES/COM/IND, and lotFootprintClear treats any non-empty Tile as occupied — so
+    // with the old order the zone itself blocked every building it was drawn for.
     let built = 0;
-    if (zoneType === TILE_RES) built = isLowDensityResidentialNow() ? buildLowDensityHouse(rect.mx0, rect.mx1, rect.mz0, rect.mz1) : packAndBuildResidentialZone(wx0, wz0, wx1, wz1);
-    else if (zoneType === TILE_COM) built = packAndBuildCommercialZone(wx0, wz0, wx1, wz1);
-    else built = packAndBuildIndustrialZone(wx0, wz0, wx1, wz1);
+    if (zoneType === TILE_RES) built = isLowDensityResidentialNow() ? buildLowDensityHouse(sel) : packAndBuildResidentialZone(sel);
+    else if (zoneType === TILE_COM) built = packAndBuildCommercialZone(sel);
+    else built = packAndBuildIndustrialZone(sel);
     // A Residential drag that could not seat a single house leaves NO blue "zone" behind — a zone
     // that never gets a building was the reported symptom. (COM/IND keep painting: their Tile-based
     // growth simulation can still fill a zoned Tile later.)
@@ -17005,13 +17419,11 @@ export default function CityGridIso() {
       threeRef.current?.refreshRoadsidePlotOverlayColors?.();
       return;
     }
-    for (let mz = rect.mz0; mz < rect.mz1; mz++) for (let mx = rect.mx0; mx < rect.mx1; mx++) { if (isMicroCellZonable(mx, mz)) setMicroZone(mx, mz, zoneType); }
-    const tx0 = Math.floor(rect.mx0 / 6), tx1 = Math.floor(Math.max(rect.mx0, rect.mx1 - 1) / 6);
-    const tz0 = Math.floor(rect.mz0 / 6), tz1 = Math.floor(Math.max(rect.mz0, rect.mz1 - 1) / 6);
-    for (let ty = tz0; ty <= tz1; ty++) for (let tx = tx0; tx <= tx1; tx++) projectMicroZoneToTileCache(tx, ty, zoneType);
-    // Prompt 20K-R4: the just-painted cells' zone color (and any Building just placed on them)
-    // changed, but the Roadside Plot cell geometry itself didn't move — a colors-only recolor is
-    // enough, no full road-network rebuild needed (§S/§X).
+    const touched = new Set();
+    for (const cell of sel.cells) { if (isPlotCellOpen(cell)) paintPlotCell(cell, zoneType, touched); }
+    projectTouchedTiles(touched, zoneType);
+    // the just-painted cells' zone colour (and any Building just placed on them) changed, but the
+    // cell geometry itself didn't move — a colors-only recolor is enough.
     threeRef.current?.refreshRoadsidePlotOverlayColors?.();
   };
 
@@ -17046,6 +17458,9 @@ export default function CityGridIso() {
     const t = threeRef.current; if (!t) return;
     if (inBounds(tx, ty)) { t.hoverMesh.position.set(tileWorldX(tx), terrainHeight(tileWorldX(tx), tileWorldZ(ty)) + ROAD_TOP_Y + 0.05, tileWorldZ(ty)); t.hoverMesh.visible = true; }
     else t.hoverMesh.visible = false;
+    // Prompt 21H: while a zoning tool is active the 6m Tile-sized hover square is hidden — the hovered
+    // road-aligned cell (updatePlotHover) is the cursor instead.
+    if (toolRef.current === 'zone_res' || toolRef.current === 'zone_com' || toolRef.current === 'zone_ind') t.hoverMesh.visible = false;
     updateMicroGridLines(tx, ty);
     // Prompt 20K-R4 §R/§S/§T: the persistent, road-aligned Roadside Plot Overlay's visibility is
     // driven purely by which tool is active, not by cursor position — this call is cheap (a single
@@ -17383,6 +17798,7 @@ export default function CityGridIso() {
     }
     hoverTileRef.current = { tx, ty };
     updateHoverMesh(tx, ty);
+    updatePlotHover(point.x, point.z); // Prompt 21H: road-aligned cell under the cursor (zoning tools only)
     setHud((h) => ({ ...h, tileX: inBounds(tx, ty) ? tx : null, tileY: inBounds(tx, ty) ? ty : null }));
   }, [raycastGround, worldToTile, applyTool, updateHoverMesh, updateLotPreview, updateRoadSelectPreview]);
 
@@ -17519,6 +17935,7 @@ export default function CityGridIso() {
       // Prompt 20K Part H commit — mirrors the 'lot' branch's shape exactly.
       const t = threeRef.current;
       if (t?.microZonePreviewMesh) t.microZonePreviewMesh.visible = false;
+      if (t?.plotSelectionMesh) t.plotSelectionMesh.visible = false;
       if (dragRef.current.microRect && dragRef.current.microRect.valid) commitMicroZoneRect(toolRef.current);
       dragRef.current = { dragging: false, painting: false, anchor: null, startX: 0, startY: 0 };
       return;
