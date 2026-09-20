@@ -2475,6 +2475,60 @@ function smoothRoadJointAtNode(network, nodeId) {
   return { touchedSegmentIds: [A.id, B.id, fillet.id], newNodeIds: [n1.id, n2.id], removedNodeId: N, filletSegmentId: fillet.id };
 }
 
+
+// ============================================================================
+// Prompt 21F — Automatic T-connection (道路の端が別の道路の側面に着いたら交差点にする)
+// Free Roads only connected at existing RoadNodes, so a road drawn (even exactly at a right angle)
+// onto the SIDE of another road merely touched it — no shared node, no junction, no traffic link.
+// findRoadBodyForTConnection finds the plain Free Road body near a point; the draw tool snaps the
+// draft end/start onto its centreline and, on placement, splitRoadSegmentPreservingCurve cuts that
+// road at the point so both halves and the new road share one real RoadNode (=> a real T junction:
+// junction surface, intersection markers, routable for cars).
+// ============================================================================
+function findRoadBodyForTConnection(network, x, z, opts = {}) {
+  const { maxExtra = TILE * 0.5, minEndArc = 3, excludeSegmentIds = [], elevation } = opts;
+  let best = null;
+  for (const seg of network.segments.values()) {
+    if (excludeSegmentIds.includes(seg.id)) continue;
+    if (!_isPlainJointSegment(network, seg)) continue;
+    const halfW = getRoadWidth(seg) / 2;
+    const hit = closestPointOnRoadSegment(network, seg, x, z);
+    if (hit.distance > halfW + maxExtra) continue;
+    const len = getRoadPointSpacingLength(network, seg);
+    if (len < minEndArc * 2 + 1) continue;
+    const tMin = minEndArc / len;
+    if (hit.t < tMin || hit.t > 1 - tMin) continue; // too close to an end — the ordinary node snap handles that
+    const elevAt = seg.elevation.start + (seg.elevation.end - seg.elevation.start) * hit.t;
+    if (elevation !== undefined && Math.abs(elevAt - elevation) > 1.5) continue; // a flyover, not a junction
+    if (!best || hit.distance < best.distance) best = { seg, t: hit.t, point: hit.point, distance: hit.distance };
+  }
+  return best;
+}
+// Like splitRoadSegmentAt, but keeps the road's real curve (De Casteljau) and its features.
+function splitRoadSegmentPreservingCurve(network, segId, t) {
+  const seg = network.segments.get(segId);
+  if (!seg) return null;
+  const a = network.nodes.get(seg.startNodeId), b = network.nodes.get(seg.endNodeId);
+  if (!a || !b) return null;
+  const p = getRoadPoint(network, seg, t);
+  let curveA = null, curveB = null;
+  if (seg.curve && seg.curve.controlPoint) {
+    const { c1, c2 } = splitQuadraticBezier(a.position, seg.curve.controlPoint, b.position, t);
+    curveA = { controlPoint: { x: c1.x, y: 0, z: c1.z } };
+    curveB = { controlPoint: { x: c2.x, y: 0, z: c2.z } };
+  }
+  const eMid = seg.elevation.start + (seg.elevation.end - seg.elevation.start) * t;
+  const node = addRoadNodeToNetwork(network, makeRoadNode(p.x, p.y, p.z));
+  network.segments.delete(seg.id);
+  a.connectedSegmentIds = a.connectedSegmentIds.filter((id) => id !== seg.id);
+  b.connectedSegmentIds = b.connectedSegmentIds.filter((id) => id !== seg.id);
+  const segA = addRoadSegmentToNetwork(network, makeRoadSegment(seg.startNodeId, node.id, { roadType: seg.roadType, curve: curveA, elevation: { start: seg.elevation.start, end: eMid } }));
+  const segB = addRoadSegmentToNetwork(network, makeRoadSegment(node.id, seg.endNodeId, { roadType: seg.roadType, curve: curveB, elevation: { start: eMid, end: seg.elevation.end } }));
+  if (seg.features && seg.features.length) { segA.features = seg.features.map((f) => ({ ...f })); segB.features = seg.features.map((f) => ({ ...f })); }
+  if (seg.laneMovements) { segA.laneMovements = JSON.parse(JSON.stringify(seg.laneMovements)); segB.laneMovements = JSON.parse(JSON.stringify(seg.laneMovements)); }
+  return { node, segA, segB, removedSegmentId: seg.id, startNodeId: seg.startNodeId, endNodeId: seg.endNodeId };
+}
+
 // createJunctionPreset — Part J-Q. Generates a full, real RoadNode/RoadSegment topology for one
 // of the 7 presets, anchored at `anchor` ({x,z}) and rotated by `rotation` (radians, World Space —
 // never a Tile-center snap, Part S). Returns { nodes:[], segments:[] } of everything newly
@@ -2990,7 +3044,10 @@ const FREE_ROAD_OVERLAP_MAX_RUN = 3; // consecutive too-close samples tolerated 
 // clearance for traffic underneath easily exceeds this, while anything shallower is still treated
 // as a genuine overlap exactly as before.
 const FREE_ROAD_FLYOVER_MIN_CLEARANCE = 4;
-function checkFreeRoadSegmentOverlap(candidateNetwork, candidateSegment, targetGraph) {
+// Prompt 21F: opts.startOnSegmentId / endOnSegmentId — the candidate's start/end is a T-connection
+// onto the BODY of that existing segment (it will be split at that point when placed), so that one
+// segment is treated as sharing the endpoint exactly like a real shared node would.
+function checkFreeRoadSegmentOverlap(candidateNetwork, candidateSegment, targetGraph, opts = {}) {
   const halfWCandidate = getRoadWidth(candidateSegment) / 2;
   const startNodeId = candidateSegment.startNodeId, endNodeId = candidateSegment.endNodeId;
   const startPos = candidateNetwork.nodes.get(startNodeId)?.position;
@@ -3000,8 +3057,8 @@ function checkFreeRoadSegmentOverlap(candidateNetwork, candidateSegment, targetG
     if (existingSeg.id === candidateSegment.id) return;
     const existingHalfW = getRoadWidth(existingSeg) / 2;
     const minSeparation = halfWCandidate + existingHalfW - FREE_ROAD_OVERLAP_TOLERANCE;
-    const sharesStart = existingSeg.startNodeId === startNodeId || existingSeg.endNodeId === startNodeId;
-    const sharesEnd = existingSeg.startNodeId === endNodeId || existingSeg.endNodeId === endNodeId;
+    const sharesStart = existingSeg.startNodeId === startNodeId || existingSeg.endNodeId === startNodeId || opts.startOnSegmentId === existingSeg.id;
+    const sharesEnd = existingSeg.startNodeId === endNodeId || existingSeg.endNodeId === endNodeId || opts.endOnSegmentId === existingSeg.id;
     const junctionRadius = Math.max(halfWCandidate, existingHalfW) * 1.6;
     let run = 0, maxRunHere = 0;
     for (let i = 0; i <= FREE_ROAD_OVERLAP_SAMPLES; i++) {
@@ -3378,10 +3435,35 @@ function getMicroCellPolygon(mx, mz) {
 // cells with this yet (Part G's full always-on strip visualization is NOT implemented — see report
 // — only the query itself, usable by a future caller).
 const ROAD_FRONTAGE_STRIP_DEPTH = 6; // meters (Part D initial value)
+// Prompt 21F: a 1m cell is only OFFERED (overlay / selection / building) when the WHOLE cell lies
+// beyond the sidewalk zone, whatever the road's angle: cell centre at least SIDEWALK_WAYPOINT_GAP
+// plus half a cell diagonal (0.71) from the paved edge. Without this the first row of cells poked
+// into the sidewalk, so a house built exactly on those cells fell outside its Parcel and was refused.
+const MICRO_CELL_SETBACK = SIDEWALK_WAYPOINT_GAP + 0.75;
+const MICRO_CELL_STRIP_MAX = ROAD_FRONTAGE_STRIP_DEPTH + (MICRO_CELL_SETBACK - SIDEWALK_WAYPOINT_GAP);
+function isFrontageDistanceOpenForCell(distanceFromRoadEdge) {
+  return distanceFromRoadEdge >= MICRO_CELL_SETBACK && distanceFromRoadEdge < MICRO_CELL_STRIP_MAX;
+}
 function isMicroCellInRoadFrontageStrip(network, mx, mz) {
   const { x, z } = microCellToWorldCenter(mx, mz);
   const frontage = getRoadFrontage(network, x, z);
-  return !!frontage && frontage.distanceFromRoadEdge < ROAD_FRONTAGE_STRIP_DEPTH;
+  return !!frontage && isFrontageDistanceOpenForCell(frontage.distanceFromRoadEdge);
+}
+// groundMeshHeight: height of the ACTUAL rendered ground mesh at (x,z). The Ground mesh has one
+// vertex per 6m Tile corner (see the groundGeo build), so between vertices it is flat triangles —
+// NOT the smooth terrainHeight() noise. Anything laid "on the ground" from terrainHeight() samples
+// (zoning cells, previews) therefore sank below the mesh on every slope, which showed up as cells
+// vanishing and gaps between them. This returns the max of the two possible diagonal triangulations
+// of the surrounding Tile quad, i.e. always on or just above whichever triangle is really drawn.
+function groundMeshHeight(x, z) {
+  const gx = (x + MAP_HALF) / TILE, gz = (z + MAP_HALF) / TILE;
+  const ix = Math.max(0, Math.min(GRID_SIZE - 1, Math.floor(gx))), iz = Math.max(0, Math.min(GRID_SIZE - 1, Math.floor(gz)));
+  const fx = Math.max(0, Math.min(1, gx - ix)), fz = Math.max(0, Math.min(1, gz - iz));
+  const H = (a, b) => terrainHeight((ix + a) * TILE - MAP_HALF, (iz + b) * TILE - MAP_HALF);
+  const h00 = H(0, 0), h10 = H(1, 0), h01 = H(0, 1), h11 = H(1, 1);
+  const hA = fx + fz <= 1 ? h00 + (h10 - h00) * fx + (h01 - h00) * fz : h11 + (h01 - h11) * (1 - fx) + (h10 - h11) * (1 - fz);
+  const hB = fx <= fz ? h00 + (h01 - h00) * fz + (h11 - h01) * fx : h00 + (h10 - h00) * fx + (h11 - h10) * fz;
+  return Math.max(hA, hB);
 }
 // ---- Prompt 20K Part T: Block Grid Road Tool default spacing (Part T says these stay changeable
 // "将来的に" — no dedicated UI control is added in this pass, so they're plain constants for now). --
@@ -8619,7 +8701,9 @@ export default function CityGridIso() {
     if (!inBounds(tx, ty)) return true;
     const ti = idx(tx, ty);
     if (gridRef.current[ti] === TILE_ROAD) return true;
-    if (lotIdGridRef.current[ti] !== -1) return true;
+    // Prompt 21F: NO tile-level lot ownership test here any more — a house only blocks the 1m cells
+    // it really covers (microReservedBuildingRef, checked below), not the whole 6m Tile around it.
+    // (That tile-wide block was what made zoning cells vanish next to every building.)
     if (eduFacilityIdGridRef.current[ti] !== -1) return true;
     if (tileBlockedByRoadFootprint(tx, ty)) return true;
     if (microReservedBuildingRef.current.has(microCellIndex(mx, mz))) return true; // Part K: Building footprint, via the real Part O/P reservation cache
@@ -8688,58 +8772,41 @@ export default function CityGridIso() {
   const ROAD_PLOT_GAP = SIDEWALK_WAYPOINT_GAP; // §G: start just past the sidewalk zone, not flush on the curb
   const ROADSIDE_PLOT_ROWS = 6; // §H: exactly 6 rows of 1m each — row index 6 never exists
   const computeRoadsidePlotCells = () => {
+    // Prompt 21F: the cells drawn here are EXACTLY the 1m Micro-Grid cells that zoning selects and
+    // buildings reserve (axis-aligned, world-anchored) — the old road-aligned cells were a different
+    // lattice that got de-duplicated onto micro indices, which is what left holes in the overlay and
+    // made "what you see" differ from "what you select". Candidates are found by sweeping every
+    // non-highway road's sides; each is then confirmed with the same strip predicate selection uses.
     const network = roadNetworkRef.current;
-    const cells = [];
-    const seenMicroIndex = new Set(); // §AF: first segment to claim a Micro Cell wins — no duplicates
+    const candidates = new Set();
     for (const segment of network.segments.values()) {
-      if (isHighwayDeckRoadType(ROAD_TYPES[segment.roadType])) continue; // §L: no Building Plots beside a highway
+      if (isHighwayDeckRoadType(ROAD_TYPES[segment.roadType])) continue; // no Building Plots beside a highway
       const halfW = getRoadWidth(segment) / 2;
-      // Arc length by sampling (exact for a straight segment, a good approximation for the
-      // quadratic-bezier curve case at 1m-cell scale — §I "不自然なgapを作らない" doesn't need
-      // sub-centimeter precision, just no visible seam between columns).
-      let length = 0;
-      let prev = getRoadPoint(network, segment, 0);
-      const LEN_SAMPLES = 24;
-      for (let i = 1; i <= LEN_SAMPLES; i++) {
-        const p = getRoadPoint(network, segment, i / LEN_SAMPLES);
-        length += Math.hypot(p.x - prev.x, p.z - prev.z);
-        prev = p;
-      }
-      const numCols = Math.max(1, Math.round(length)); // §I: ~1m per column along the segment
-      for (const side of ['left', 'right']) {
-        const sideSign = side === 'left' ? 1 : -1;
-        for (let col = 0; col < numCols; col++) {
-          const t = (col + 0.5) / numCols;
-          const p = getRoadPoint(network, segment, t);
-          // §AO: a column where the road deck itself sits well above the ground it would otherwise
-          // cast a Plot onto (an elevated/highway-style structure) gets no Plot cells at all — there
-          // is no way to build at deck height, and the bare ground far below isn't "roadside" to it.
-          if (p.y - terrainHeight(p.x, p.z) > 1.5) continue;
-          const tan = getRoadTangent(network, segment, t);
-          const nrm = getRoadNormal(network, segment, t);
-          for (let row = 0; row < ROADSIDE_PLOT_ROWS; row++) {
-            const dist = halfW + ROAD_PLOT_GAP + row + 0.5; // §H: row centers, 1m apart, 6 rows only
-            const cx = p.x + nrm.x * dist * sideSign, cz = p.z + nrm.z * dist * sideSign;
-            const { mx, mz } = worldToMicroCell(cx, cz);
-            if (!microCellInBounds(mx, mz)) continue;
-            const microIndex = microCellIndex(mx, mz);
-            if (seenMicroIndex.has(microIndex)) continue; // §AF dedupe against a nearby second segment
-            if (isInsideRoadFootprint(network, cx, cz)) continue; // §AE: junction/crossing pavement, not land
-            seenMicroIndex.add(microIndex);
-            const half = 0.5;
-            const corner = (dt, dn) => ({
-              x: cx + tan.x * dt * half + nrm.x * sideSign * dn * half,
-              z: cz + tan.z * dt * half + nrm.z * sideSign * dn * half,
-            });
-            // §F: 4 world-space corners from center ± tangent*0.5 ± normal*0.5; §AN: each corner's
-            // own Y sampled from terrainHeight() individually, never one flat shared plane height.
-            const corners = [corner(-1, -1), corner(1, -1), corner(1, 1), corner(-1, 1)]
-              .map((c) => ({ x: c.x, y: terrainHeight(c.x, c.z), z: c.z }));
-            cells.push({ id: `roadPlot:${segment.id}:${side}:${row}:${col}`, mx, mz, microIndex, corners });
+      const length = getRoadPointSpacingLength(network, segment);
+      const steps = Math.max(2, Math.ceil(length / 0.5));
+      for (let i = 0; i <= steps; i++) {
+        const t = i / steps;
+        const p = getRoadPoint(network, segment, t);
+        if (p.y - terrainHeight(p.x, p.z) > 1.5) continue; // elevated deck — nothing to build beside it
+        const nrm = getRoadNormal(network, segment, t);
+        for (const sideSign of [1, -1]) {
+          for (let dist = halfW + MICRO_CELL_SETBACK - 0.8; dist <= halfW + MICRO_CELL_STRIP_MAX + 0.8; dist += 0.5) {
+            const { mx, mz } = worldToMicroCell(p.x + nrm.x * dist * sideSign, p.z + nrm.z * dist * sideSign);
+            if (microCellInBounds(mx, mz)) candidates.add(microCellIndex(mx, mz));
           }
         }
       }
     }
+    const cells = [];
+    candidates.forEach((microIndex) => {
+      const mx = microIndex % MICRO_GRID_SIZE, mz = Math.floor(microIndex / MICRO_GRID_SIZE);
+      if (!isMicroCellInRoadFrontageStrip(network, mx, mz)) return;
+      const x0 = mx - MAP_HALF, z0 = mz - MAP_HALF;
+      // every corner sits on the RENDERED ground mesh (groundMeshHeight), neighbours share corners
+      // exactly, so there is neither a gap between cells nor a cell sunk below the slope.
+      const corners = [[x0, z0], [x0 + 1, z0], [x0 + 1, z0 + 1], [x0, z0 + 1]].map(([cx, cz]) => ({ x: cx, y: groundMeshHeight(cx, cz), z: cz }));
+      cells.push({ id: 'cell:' + microIndex, mx, mz, microIndex, corners });
+    });
     return cells;
   };
   // getRoadsidePlotCellState: live-read from the existing Micro Grid data model (§AQ) — never
@@ -8783,7 +8850,7 @@ export default function CityGridIso() {
     if (isMicroCellBlocked(mx, mz)) return false;
     const { x, z } = microCellToWorldCenter(mx, mz);
     const fr = getRoadFrontage(roadNetworkRef.current, x, z);
-    return !!fr && fr.distanceFromRoadEdge < ROAD_FRONTAGE_STRIP_DEPTH;
+    return !!fr && isFrontageDistanceOpenForCell(fr.distanceFromRoadEdge);
   };
   // Road-aligned modules (used for RES). Returns [{ candidates: [{cx,cz,w,d,rotationY,frontSign}, ...] }]
   // where each module lists a few slightly shallower fallbacks to try if the first doesn't fit.
@@ -8794,7 +8861,7 @@ export default function CityGridIso() {
       if (isMicroCellBlocked(mx, mz)) continue;
       const { x, z } = microCellToWorldCenter(mx, mz);
       const fr = getRoadFrontage(network, x, z);
-      if (!fr || fr.distanceFromRoadEdge >= ROAD_FRONTAGE_STRIP_DEPTH) continue;
+      if (!fr || !isFrontageDistanceOpenForCell(fr.distanceFromRoadEdge)) continue;
       const seg = network.segments.get(fr.segmentId);
       if (!seg) continue;
       const key = fr.segmentId + '|' + fr.side;
@@ -8920,6 +8987,53 @@ export default function CityGridIso() {
   };
   const packAndBuildCommercialZone = (minX, minZ, maxX, maxZ) => packAndBuildTileLockedZone(TILE_COM, finalizeCommercialBuilding, minX, minZ, maxX, maxZ);
   const packAndBuildIndustrialZone = (minX, minZ, maxX, maxZ) => packAndBuildTileLockedZone(TILE_IND, finalizeIndustrialBuilding, minX, minZ, maxX, maxZ);
+  // ---- Prompt 21F: LOW-DENSITY residential = exactly the selected cells --------------------------
+  // A low-density house may only be created from a cell selection of one of these sizes (unordered,
+  // so 3x2 == 2x3): 2x2 2x3 2x4 2x5 2x6 3x3 3x4 3x5 3x6 4x4 4x5 4x6. The house then occupies EXACTLY
+  // the selected cells (no Tile, no re-packing): its footprint is the selected rectangle, turned to
+  // face the road it fronts (rotation is only ever a multiple of 90 degrees, so it stays on the cells).
+  const LOW_DENSITY_CELL_SIZES = ['2x2', '2x3', '2x4', '2x5', '2x6', '3x3', '3x4', '3x5', '3x6', '4x4', '4x5', '4x6'];
+  const isLowDensityCellSelection = (wc, hc) => LOW_DENSITY_CELL_SIZES.includes(Math.min(wc, hc) + 'x' + Math.max(wc, hc));
+  const isLowDensityResidentialNow = () => residentialDensityTier(popRef.current) === 'res_low';
+  // Geometry + Parcel check only (cheap). Returns null if the selection can't be a house.
+  const computeLowDensityPlacement = (mx0, mx1, mz0, mz1) => {
+    const wc = mx1 - mx0, hc = mz1 - mz0;
+    if (!isLowDensityCellSelection(wc, hc)) return null;
+    for (let mz = mz0; mz < mz1; mz++) for (let mx = mx0; mx < mx1; mx++) if (!isCellOpenForZoneBuild(mx, mz)) return null; // every selected cell must be open
+    const cx = (mx0 + mx1) / 2 - MAP_HALF, cz = (mz0 + mz1) / 2 - MAP_HALF;
+    const fr = getRoadFrontage(roadNetworkRef.current, cx, cz);
+    if (!fr) return null;
+    const dx = fr.roadPoint.x - cx, dz = fr.roadPoint.z - cz;
+    let rotationY, frontSign, w, d;
+    if (Math.abs(dx) > Math.abs(dz)) { // road lies east/west of the house
+      rotationY = dx > 0 ? -Math.PI / 2 : Math.PI / 2; frontSign = -1; w = hc; d = wc;
+    } else {                           // road lies north/south
+      rotationY = 0; frontSign = dz < 0 ? -1 : 1; w = wc; d = hc;
+    }
+    if (!findParcelForFootprint(buildingParcelRegistryRef.current, cx, cz, w, d, rotationY)) return null;
+    return { cx, cz, w, d, rotationY, frontSign };
+  };
+  // Full check used by the preview (so red == "this would really be refused") and by the builder.
+  const canBuildLowDensityHouse = (mx0, mx1, mz0, mz1) => {
+    const pl = computeLowDensityPlacement(mx0, mx1, mz0, mz1);
+    if (!pl) return null;
+    zoneBuildTypeRef.current = TILE_RES;
+    try {
+      if (!lotFootprintClear(pl.cx, pl.cz, pl.w, pl.d, pl.rotationY)) return null;
+    } finally { zoneBuildTypeRef.current = null; }
+    if (!computeBuildingGrading(pl.cx, pl.cz, pl.w, pl.d, pl.rotationY).buildable) return null;
+    return pl;
+  };
+  const buildLowDensityHouse = (mx0, mx1, mz0, mz1) => {
+    const pl = canBuildLowDensityHouse(mx0, mx1, mz0, mz1);
+    if (!pl) return 0;
+    const type = legacyLotTypeForDensityTier('res_low');
+    zoneBuildTypeRef.current = TILE_RES;
+    try {
+      return finalizeLot(type, pl.cx, pl.cz, pl.w, pl.d, pl.frontSign, pl.rotationY, { skipRoadAccess: true }) ? 1 : 0;
+    } finally { zoneBuildTypeRef.current = null; }
+  };
+
   // getMicroCellsForFootprint: real oriented-rectangle containment (obbCorners + pointInPolygon,
   // the same primitives Building Placement Parcels already use — Prompt 17/18), never a plain AABB.
   const getMicroCellsForFootprint = (cx, cz, w, h, rotationY = 0) => {
@@ -9470,7 +9584,11 @@ export default function CityGridIso() {
     // one (the other Building's own size is left un-grown, so the padding IS the actual min gap).
     for (const other of lotsRef.current.values()) {
       const otherRotation = other.footprint.rotation || other.rotation || 0;
-      if (obbOverlap(cx, cz, w + BUILDING_MIN_SEPARATION, h + BUILDING_MIN_SEPARATION, rotation, other.position.x, other.position.z, other.footprint.width, other.footprint.depth, otherRotation)) return false;
+      // Prompt 21F: zone/cell-driven placement is exact to the 1m cell — neighbours may touch (the
+      // micro-cell reservation, not a 0.75m buffer, is what separates them) — so no padding, and a
+      // hair of negative pad so two footprints sharing an edge aren't reported as overlapping.
+      const pad = zoneBuildTypeRef.current != null ? -0.02 : BUILDING_MIN_SEPARATION;
+      if (obbOverlap(cx, cz, w + pad, h + pad, rotation, other.position.x, other.position.z, other.footprint.width, other.footprint.depth, otherRotation)) return false;
     }
     return true;
   }, []);
@@ -9728,11 +9846,16 @@ export default function CityGridIso() {
     const grading = computeBuildingGrading(centerX, centerZ, width, depth, rotationY);
     if (!grading.buildable) return false;
     const mapHalf = (GRID_SIZE * TILE) / 2;
-    const halfW = width / 2, halfD = depth / 2;
-    const gx = Math.floor((centerX - halfW + mapHalf) / TILE);
-    const gy = Math.floor((centerZ - halfD + mapHalf) / TILE);
-    const w = Math.ceil((centerX + halfW + mapHalf) / TILE) - gx;
-    const h = Math.ceil((centerZ + halfD + mapHalf) / TILE) - gy;
+    // Prompt 21F: legacy Tile bookkeeping is rasterized from the ROTATED footprint's real bounds
+    // (identical to before for rotation 0), so a house turned to face an east/west road no longer
+    // claims the wrong Tiles. It is a compatibility cache only — placement never reads it any more.
+    const rc = obbCorners(centerX, centerZ, width, depth, rotationY || 0);
+    const bx0 = Math.min(...rc.map((c) => c.x)) + 1e-6, bx1 = Math.max(...rc.map((c) => c.x)) - 1e-6;
+    const bz0 = Math.min(...rc.map((c) => c.z)) + 1e-6, bz1 = Math.max(...rc.map((c) => c.z)) - 1e-6;
+    const gx = Math.floor((bx0 + mapHalf) / TILE);
+    const gy = Math.floor((bz0 + mapHalf) / TILE);
+    const w = Math.ceil((bx1 + mapHalf) / TILE) - gx;
+    const h = Math.ceil((bz1 + mapHalf) / TILE) - gy;
     if (gx < 0 || gy < 0 || gx + w > GRID_SIZE || gy + h > GRID_SIZE) return false;
     const grid = gridRef.current, lotIdGrid = lotIdGridRef.current;
     const id = lotIdCounterRef.current++;
@@ -10336,13 +10459,23 @@ export default function CityGridIso() {
     // Prompt 21F: a zoning drag must span at least 3 x 3 cells (the smallest Building footprint) and
     // contain at least that many zonable cells — a bare click / 1-cell sliver can no longer create
     // a "zone" that no Building could ever stand on.
-    const bigEnough = (mx1 - mx0) >= ZONE_MIN_SELECTION_CELLS && (mz1 - mz0) >= ZONE_MIN_SELECTION_CELLS;
-    const valid = bigEnough && total > 0 && validCount >= ZONE_MIN_SELECTION_CELLS * ZONE_MIN_SELECTION_CELLS;
+    let valid;
+    if (zoneType === TILE_RES && isLowDensityResidentialNow()) {
+      // Low density: the selection IS the house — must be one of the allowed cell sizes AND really buildable.
+      valid = total > 0 && isLowDensityCellSelection(mx1 - mx0, mz1 - mz0) && validCount === total && !!canBuildLowDensityHouse(mx0, mx1, mz0, mz1);
+    } else {
+      const bigEnough = (mx1 - mx0) >= ZONE_MIN_SELECTION_CELLS && (mz1 - mz0) >= ZONE_MIN_SELECTION_CELLS;
+      valid = bigEnough && total > 0 && validCount >= ZONE_MIN_SELECTION_CELLS * ZONE_MIN_SELECTION_CELLS;
+    }
     dragRef.current.microRect = { mx0, mx1, mz0, mz1, valid };
     const cx0 = mx0 - MAP_HALF, cx1 = mx1 - MAP_HALF, cz0 = mz0 - MAP_HALF, cz1 = mz1 - MAP_HALF;
     const centerX = (cx0 + cx1) / 2, centerZ = (cz0 + cz1) / 2;
     const w = Math.max(cx1 - cx0, 0.01), h = Math.max(cz1 - cz0, 0.01);
-    t.microZonePreviewMesh.position.set(centerX, terrainHeight(centerX, centerZ) + 0.6, centerZ);
+    // Prompt 21F: sit above the HIGHEST point of the rendered ground under the rectangle (corners,
+    // edge midpoints, centre) so the preview isn't swallowed by a slope.
+    let topY = -Infinity;
+    for (const [px, pz] of [[cx0, cz0], [cx1, cz0], [cx1, cz1], [cx0, cz1], [centerX, cz0], [centerX, cz1], [cx0, centerZ], [cx1, centerZ], [centerX, centerZ]]) topY = Math.max(topY, groundMeshHeight(px, pz));
+    t.microZonePreviewMesh.position.set(centerX, topY + 0.35, centerZ);
     t.microZonePreviewMesh.scale.set(w, 1, h);
     const zoneColor = zoneType === TILE_RES ? 0x5a90d8 : zoneType === TILE_COM ? 0xe0b060 : 0x9b6fdc;
     t.microZonePreviewMesh.material.color.set(valid ? zoneColor : 0xe05a4f);
@@ -11691,7 +11824,7 @@ export default function CityGridIso() {
       clearFreeRoadPreview();
       const d = freeRoadDraftRef.current;
       if (!d) return;
-      const startMat = d.startNodeId ? freeRoadNodeMarkerSnappedMat : freeRoadNodeMarkerMat;
+      const startMat = (d.startNodeId || d.startSnapSegment) ? freeRoadNodeMarkerSnappedMat : freeRoadNodeMarkerMat;
       const startMarker = new THREE.Mesh(freeRoadNodeMarkerGeo, startMat);
       startMarker.position.set(d.startPos.x, d.startPos.y + 0.2, d.startPos.z);
       freeRoadPreviewGroup.add(startMarker);
@@ -11700,7 +11833,10 @@ export default function CityGridIso() {
       const { network, segment } = draftPreviewSegment();
       // Part D — live overlap feedback while dragging, using the SAME check finalize enforces, so
       // what the player sees red is exactly what would be rejected on click (spec §14).
-      d.invalid = checkFreeRoadSegmentOverlap(network, segment, roadGraphRef.current).overlapping;
+      d.invalid = checkFreeRoadSegmentOverlap(network, segment, roadGraphRef.current, {
+        startOnSegmentId: d.startSnapSegment ? d.startSnapSegment.segId : undefined,
+        endOnSegmentId: d.endSnapSegment ? d.endSnapSegment.segId : undefined,
+      }).overlapping;
       // Prompt 21A Part K — advisory grade-warning band (yellow at 70%+ of the type's own max
       // grade), independent of the overlap check above; never itself blocks placement (the
       // elevation offset is already clamped to the cap by clampFreeRoadElevationForDraft), so
@@ -11712,11 +11848,11 @@ export default function CityGridIso() {
       const geo = buildRoadSegmentGeometry(network, segment, 24);
       const mat = d.invalid ? freeRoadPreviewInvalidMat
         : d.gradeWarning ? freeRoadPreviewWarningMat
-        : (d.isAngleSnapped || d.endSnapNodeId || d.snapType) ? freeRoadPreviewSnappedMat
+        : (d.isAngleSnapped || d.endSnapNodeId || d.endSnapSegment || d.snapType) ? freeRoadPreviewSnappedMat
         : freeRoadPreviewMat;
       const ribbon = new THREE.Mesh(geo, mat);
       freeRoadPreviewGroup.add(ribbon);
-      if (d.endSnapNodeId) {
+      if (d.endSnapNodeId || d.endSnapSegment) {
         const endMarker = new THREE.Mesh(freeRoadNodeMarkerGeo, freeRoadNodeMarkerSnappedMat);
         endMarker.position.set(d.endPreviewPos.x, d.endPreviewPos.y + 0.2, d.endPreviewPos.z);
         freeRoadPreviewGroup.add(endMarker);
@@ -11743,7 +11879,7 @@ export default function CityGridIso() {
     // info too if it already has a road (e.g. starting a Free Road off an existing Tile road end).
     function startFreeRoadDraft(point, chainInfo = null) {
       const prevElevation = freeRoadDraftRef.current ? freeRoadDraftRef.current.elevationOffset : 0;
-      let startNodeId = null, startPos, chainTangent = null, chainMirrorControl = null;
+      let startNodeId = null, startPos, chainTangent = null, chainMirrorControl = null, startSnapSegment = null;
       if (chainInfo && chainInfo.position) {
         startNodeId = chainInfo.nodeId;
         startPos = { x: chainInfo.position.x, y: chainInfo.position.y, z: chainInfo.position.z };
@@ -11758,10 +11894,21 @@ export default function CityGridIso() {
           chainTangent = info.tangent;
           chainMirrorControl = info.mirrorControl;
         } else {
-          startPos = { x: point.x, y: terrainHeight(point.x, point.z), z: point.z };
+          // Prompt 21F: no node nearby — a click on the BODY of an existing Free Road starts a
+          // T-connection there (the road is split at that point when the new segment is placed).
+          const body = findRoadBodyForTConnection(roadNetworkRef.current, point.x, point.z, { elevation: prevElevation });
+          if (body) {
+            startPos = { x: body.point.x, y: body.point.y, z: body.point.z };
+            startSnapSegment = { segId: body.seg.id, t: body.t };
+            const bt = getRoadTangent(roadNetworkRef.current, body.seg, body.t);
+            chainTangent = null; chainMirrorControl = null; void bt;
+          } else {
+            startPos = { x: point.x, y: terrainHeight(point.x, point.z), z: point.z };
+          }
         }
       }
       freeRoadDraftRef.current = {
+        startSnapSegment, endSnapSegment: null,
         startPos,
         startNodeId, // exact RoadNode id this draft starts from, or null = will mint a fresh node
         startElevation: prevElevation, // chain: continue from previous end height
@@ -11810,10 +11957,21 @@ export default function CityGridIso() {
       const endSnap = findGraphNodeNear(snapped.x, snapped.z, FREE_ROAD_SNAP_DIST);
       if (endSnap && endSnap.id !== d.startNodeId) {
         d.endSnapNodeId = endSnap.id;
+        d.endSnapSegment = null;
         d.endPreviewPos = { x: endSnap.position.x, y: endSnap.position.y, z: endSnap.position.z };
       } else {
         d.endSnapNodeId = null;
-        d.endPreviewPos = { x: snapped.x, y: terrainHeight(snapped.x, snapped.z), z: snapped.z };
+        // Prompt 21F: no node in range — snap onto the BODY of a nearby Free Road (auto T-junction).
+        const body = findRoadBodyForTConnection(roadNetworkRef.current, snapped.x, snapped.z, {
+          excludeSegmentIds: d.startSnapSegment ? [d.startSnapSegment.segId] : [], elevation: d.elevationOffset,
+        });
+        if (body) {
+          d.endSnapSegment = { segId: body.seg.id, t: body.t };
+          d.endPreviewPos = { x: body.point.x, y: body.point.y, z: body.point.z };
+        } else {
+          d.endSnapSegment = null;
+          d.endPreviewPos = { x: snapped.x, y: terrainHeight(snapped.x, snapped.z), z: snapped.z };
+        }
       }
       // Part E — the endpoint (and therefore the segment's horizontal length) just moved, so an
       // elevationOffset that was previously within the max-grade limit might not be anymore;
@@ -11869,18 +12027,24 @@ export default function CityGridIso() {
       // falls back to a fresh distance search / minting a brand-new node when nothing was live-
       // resolved (e.g. Escape/tool-switch edge cases reusing this path indirectly never happens,
       // but keeps this function safe to call defensively).
-      const startNode = (d.startNodeId && graph.nodes.get(d.startNodeId))
+      // Prompt 21F: an end that sits on the BODY of an existing Free Road (draft.*SnapSegment) is a
+      // T-connection — it gets a temporary node for the overlap check below and only becomes a real
+      // shared RoadNode (the existing road is split there) once the placement is accepted.
+      let startOnSeg = (!d.startNodeId && d.startSnapSegment && network.segments.has(d.startSnapSegment.segId)) ? d.startSnapSegment : null;
+      let endOnSeg = (!d.endSnapNodeId && d.endSnapSegment && network.segments.has(d.endSnapSegment.segId)) ? d.endSnapSegment : null;
+      if (startOnSeg && endOnSeg && startOnSeg.segId === endOnSeg.segId) endOnSeg = null; // both ends on one road — connect the start only
+      let startNode = startOnSeg ? makeRoadNode(d.startPos.x, d.startPos.y, d.startPos.z) : ((d.startNodeId && graph.nodes.get(d.startNodeId))
         || findGraphNodeNear(d.startPos.x, d.startPos.z, FREE_ROAD_SNAP_DIST)
-        || addRoadNodeToNetwork(network, makeRoadNode(d.startPos.x, d.startPos.y, d.startPos.z));
-      const endNode = (d.endSnapNodeId && graph.nodes.get(d.endSnapNodeId))
+        || addRoadNodeToNetwork(network, makeRoadNode(d.startPos.x, d.startPos.y, d.startPos.z)));
+      let endNode = endOnSeg ? makeRoadNode(d.endPreviewPos.x, d.endPreviewPos.y, d.endPreviewPos.z) : ((d.endSnapNodeId && graph.nodes.get(d.endSnapNodeId))
         || findGraphNodeNear(d.endPreviewPos.x, d.endPreviewPos.z, FREE_ROAD_SNAP_DIST)
-        || addRoadNodeToNetwork(network, makeRoadNode(d.endPreviewPos.x, d.endPreviewPos.y, d.endPreviewPos.z));
+        || addRoadNodeToNetwork(network, makeRoadNode(d.endPreviewPos.x, d.endPreviewPos.y, d.endPreviewPos.z)));
       if (startNode.id === endNode.id) { cancelFreeRoadDraft(); return null; } // snapped onto the same node at both ends
       // A node borrowed from the unified graph (Tile-derived, or an already-placed Free segment)
       // may not be registered in the free network's OWN node map yet — register it now so this
       // segment's addRoadSegmentToNetwork call below can push its connectedSegmentIds correctly.
-      if (!network.nodes.has(startNode.id)) addRoadNodeToNetwork(network, startNode);
-      if (!network.nodes.has(endNode.id)) addRoadNodeToNetwork(network, endNode);
+      if (!startOnSeg && !network.nodes.has(startNode.id)) addRoadNodeToNetwork(network, startNode);
+      if (!endOnSeg && !network.nodes.has(endNode.id)) addRoadNodeToNetwork(network, endNode);
       const candidateSegment = makeRoadSegment(startNode.id, endNode.id, {
         roadType: freeRoadTypeRef.current,
         curve: computeDraftCurve(d),
@@ -11891,7 +12055,9 @@ export default function CityGridIso() {
       // junction connection at a shared node stays allowed — see checkFreeRoadSegmentOverlap's own
       // node-exclusion handling (Test 12).
       const checkNet = { nodes: new Map([[startNode.id, startNode], [endNode.id, endNode]]), segments: new Map(), intersections: new Map() };
-      const overlap = checkFreeRoadSegmentOverlap(checkNet, candidateSegment, graph);
+      const overlap = checkFreeRoadSegmentOverlap(checkNet, candidateSegment, graph, {
+        startOnSegmentId: startOnSeg ? startOnSeg.segId : undefined, endOnSegmentId: endOnSeg ? endOnSeg.segId : undefined,
+      });
       if (overlap.overlapping) {
         // §14/§15: existing roads are left completely untouched, no cost is taken, and the draft
         // is NOT cleared — the player can keep dragging to find a valid path, or hit Escape.
@@ -11899,6 +12065,20 @@ export default function CityGridIso() {
         updateFreeRoadPreview();
         return draftStatusSnapshot(d);
       }
+      // Prompt 21F: accepted — now actually cut the road(s) being T-connected onto and use the
+      // resulting real node as this segment's endpoint.
+      const splitForT = (snap) => {
+        const sp = splitRoadSegmentPreservingCurve(network, snap.segId, snap.t);
+        if (!sp) return null;
+        retireCarsOnNodePair(sp.startNodeId, sp.endNodeId);
+        removeFreeRoadSegmentMesh(sp.removedSegmentId);
+        rebuildFreeRoadSegmentMesh(sp.segA);
+        rebuildFreeRoadSegmentMesh(sp.segB);
+        return sp.node;
+      };
+      if (startOnSeg) { const n = splitForT(startOnSeg); if (n) { startNode = n; candidateSegment.startNodeId = n.id; } }
+      if (endOnSeg) { const n = splitForT(endOnSeg); if (n) { endNode = n; candidateSegment.endNodeId = n.id; } }
+      if (startNode.id === endNode.id || !network.nodes.has(startNode.id) || !network.nodes.has(endNode.id)) { cancelFreeRoadDraft(); return null; }
       const segment = addRoadSegmentToNetwork(network, candidateSegment);
       rebuildFreeRoadSegmentMesh(segment);
       // Prompt 21F: a freshly drawn road that meets exactly one other road at either end forms a
@@ -12464,6 +12644,23 @@ export default function CityGridIso() {
     // the given nodes and re-mesh every segment it touched (the two shortened roads + the new
     // fillet). Returns true if anything changed. Callers still own the usual post-edit refresh
     // (junction caps / supports / parcels / graph), exactly as they already do after any edit.
+    // Prompt 21F: cars address the road by (fromNodeId, toNodeId). When an edit removes a node or
+    // splits/shortens the segment between two nodes, any car still using the old pair is retired (it
+    // respawns cleanly) instead of being left pointing at a road that no longer exists.
+    function retireCarsOnNodes(nodeIds) {
+      const set = new Set(nodeIds);
+      cars.forEach((c) => {
+        if (!c.active) return;
+        if (set.has(c.fromNodeId) || set.has(c.toNodeId) || set.has(c.nextNodeId)) c.active = false;
+      });
+    }
+    function retireCarsOnNodePair(a, b) {
+      cars.forEach((c) => {
+        if (!c.active) return;
+        const f = c.fromNodeId, t = c.toNodeId, n = c.nextNodeId;
+        if ((f === a && t === b) || (f === b && t === a) || (t === a && n === b) || (t === b && n === a)) c.active = false;
+      });
+    }
     function smoothJointsAtNodes(nodeIds) {
       const network = roadNetworkRef.current;
       const touched = new Set();
@@ -12472,6 +12669,7 @@ export default function CityGridIso() {
         const r = smoothRoadJointAtNode(network, id);
         if (!r) return;
         any = true;
+        retireCarsOnNodes([r.removedNodeId]);
         r.touchedSegmentIds.forEach((sid) => touched.add(sid));
       });
       touched.forEach((sid) => { const seg = network.segments.get(sid); if (seg) rebuildFreeRoadSegmentMesh(seg); });
@@ -12969,12 +13167,12 @@ export default function CityGridIso() {
     // never from bare cursor movement (§X).
     const roadsidePlotOverlayMesh = new THREE.Mesh(
       new THREE.BufferGeometry(),
-      new THREE.MeshBasicMaterial({ vertexColors: true, transparent: true, opacity: 0.45, depthWrite: false, side: THREE.DoubleSide })
+      new THREE.MeshBasicMaterial({ vertexColors: true, transparent: true, opacity: 0.45, depthWrite: false, side: THREE.DoubleSide, polygonOffset: true, polygonOffsetFactor: -3, polygonOffsetUnits: -3 })
     );
     roadsidePlotOverlayMesh.name = 'roadsidePlotOverlayMesh';
     roadsidePlotOverlayMesh.visible = false;
     scene.add(roadsidePlotOverlayMesh);
-    const ROADSIDE_PLOT_LIFT = 0.08; // just above the sidewalk/terrain so it never z-fights the ground
+    const ROADSIDE_PLOT_LIFT = 0.07; // just above the sidewalk/terrain so it never z-fights the ground
     const roadsidePlotColors = {
       available: new THREE.Color(0x7fe0a8), // §U: pale green — same green already used for a valid drag preview
       blocked: new THREE.Color(0xe05a4f),   // §U: red — same red already used for an invalid drag preview
@@ -16547,6 +16745,10 @@ export default function CityGridIso() {
     const ndc = new THREE.Vector2(((clientX - rect.left) / rect.width) * 2 - 1, -((clientY - rect.top) / rect.height) * 2 + 1);
     t.raycaster.setFromCamera(ndc, t.camera);
     for (const mesh of t.allChassisMeshes) {
+      // Prompt 21F: InstancedMesh caches its bounding sphere the FIRST time it is raycast, but the cars
+      // move every frame — a stale sphere made the ray miss every car, so the click fell through to
+      // the road-edit picker. Force it to be recomputed from the current instance matrices.
+      mesh.boundingSphere = null; mesh.boundingBox = null;
       const hits = t.raycaster.intersectObject(mesh);
       if (hits.length) {
         const hitPoint = hits[0].point;
@@ -16559,7 +16761,17 @@ export default function CityGridIso() {
         if (best) return best;
       }
     }
-    return null;
+    // Fallback (also makes small/far cars easy to click): nearest active car within ~26px on screen.
+    let best = null, bestPx = 26;
+    const v = new THREE.Vector3();
+    t.cars.forEach((c) => {
+      if (!c.active) return;
+      v.set(c.worldX, (c.worldY || 0) + 0.6, c.worldZ).project(t.camera);
+      if (v.z > 1) return;
+      const px = Math.hypot(((v.x + 1) / 2) * rect.width + rect.left - clientX, ((1 - v.y) / 2) * rect.height + rect.top - clientY);
+      if (px < bestPx) { bestPx = px; best = c; }
+    });
+    return best;
   }, []);
 
   const raycastPed = useCallback((clientX, clientY) => {
@@ -16783,7 +16995,7 @@ export default function CityGridIso() {
     // Prompt 20K-R3 Part Q / 20M / 20N: attempt real Building creation on the just-zoned area
     // (the Tile-based IND/COM Growth Simulation still runs unmodified and coexists with it).
     let built = 0;
-    if (zoneType === TILE_RES) built = packAndBuildResidentialZone(wx0, wz0, wx1, wz1);
+    if (zoneType === TILE_RES) built = isLowDensityResidentialNow() ? buildLowDensityHouse(rect.mx0, rect.mx1, rect.mz0, rect.mz1) : packAndBuildResidentialZone(wx0, wz0, wx1, wz1);
     else if (zoneType === TILE_COM) built = packAndBuildCommercialZone(wx0, wz0, wx1, wz1);
     else built = packAndBuildIndustrialZone(wx0, wz0, wx1, wz1);
     // A Residential drag that could not seat a single house leaves NO blue "zone" behind — a zone
