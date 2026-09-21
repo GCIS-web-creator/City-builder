@@ -951,7 +951,7 @@ function speedForRoadType(rt) {
 // loop) — so it naturally scales with however steep a hand-drawn Free Road or ramp actually is,
 // with no dependency on road TYPE the way speedForRoadType's maxSpeed table is.
 const SLOPE_SPEED_FREE_GRADE = 0.02; // grades gentler than 2% are imperceptible -> no speed effect at all
-const SLOPE_SPEED_FULL_GRADE = 0.16; // grade at which the slowdown bottoms out (matches the loosened MAX_RAMP_GRADE below, so the very steepest placeable ramp is exactly where the reduction maxes out)
+const SLOPE_SPEED_FULL_GRADE = 0.09; // Prompt 27 Part B — matches the retightened MAX_RAMP_GRADE below, so the very steepest placeable ramp is exactly where the reduction maxes out
 const SLOPE_MIN_SPEED_MULT = 0.4; // slowest an uphill grade will ever scale a car's target speed to (relative to its flat-ground speed) — never all the way to a stop, just a real climbing-speed loss
 function slopeSpeedMultiplier(grade) {
   // Only UPHILL (grade > 0, climbing in the car's own direction of travel) costs speed — a real
@@ -1540,7 +1540,7 @@ function splitRoadSegmentAt(network, segmentId, t, opts = {}) {
 // A separate, non-drivable painted gore wedge (Part F/S — see buildGorePolygonPoints) is computed
 // alongside; it is bare geometry only, never a RoadSegment (Part F), and is handed back to the
 // caller for the render layer to turn into a decorative Mesh (see rebuildGoreMesh).
-const MAX_RAMP_GRADE = 0.16; // Part L: ramps never grade steeper than ~16% (loosened from the original ~7% cap so ramps can climb/descend real elevation changes without being rejected); too-steep placements are still rejected outright, not bent to fit
+const MAX_RAMP_GRADE = 0.09; // Prompt 27 Part B — retightened from 0.16 (which had been loosened from an original ~7% cap in Part L to stop placements being rejected). 16% reads as absurdly steep for a highway ramp in practice (the "急勾配すぎる" report) — 9% is still generous versus a real-world ~6-8% ramp max, but no longer a near-cliff. Placements that need a steeper connection than this are still rejected outright, same as before; a tunnel fallback for those cases doesn't exist yet (separate feature, not implemented here).
 // Prompt 20H-R4 Part J/K: chance an OUTER-lane car offers itself the ramp candidate at a real
 // Diverge node (see pickNextSegmentAtNode's lane-aware ramp filter below) — never every car, and
 // never an inner/middle-lane car at all (Part I: "inner → mainline / middle → mainline / outer →
@@ -3946,6 +3946,27 @@ function _gradeIdOrder(id) {
   const m = /(\d+)/.exec(String(id));
   return m ? Number(m[1]) : _gradeFnv([String(id).length]);
 }
+// Prompt 27 Part A — a ramp/bridge segment's elevation is a straight lerp between its two ends
+// (getRoadPoint's elevAtT), so a descending ramp (e.g. 15m -> 0m) touches genuine ground level
+// only in a short sub-range near its t=0 or t=1 end, not "nowhere along its whole length". The old
+// isRoadSegmentAtGrade check required BOTH ends near zero, so any such segment was excluded from
+// terrain grading in its ENTIRETY — including the short stretch right where it actually meets the
+// ground and hands off to an ordinary (graded, flattened) road. Natural terrain right there is
+// essentially never already flush with the graded road it's joining, so the visible road surface
+// (roadBaseY = graded terrain + elevAtT) jumped by whatever that natural-vs-graded height gap was,
+// exactly at the ramp/highway's own ground touchdown point — the reported "道が途中でがくんと下が
+// る" cliff. Returns the sub-range(s) of t in [0,1] where |elevAtT| stays under `tol` — usually one
+// short interval near whichever end is close to 0 (elevation is linear in t, so there is at most
+// one crossing region unless the segment never approaches 0 at all, in which case it's empty).
+function _atGradeTRanges(elevStart, elevEnd, tol) {
+  const atStart = Math.abs(elevStart) < tol, atEnd = Math.abs(elevEnd) < tol;
+  if (atStart && atEnd) return [[0, 1]];
+  const slope = elevEnd - elevStart;
+  if (Math.abs(slope) < 1e-6) return atStart ? [[0, 1]] : [];
+  const tHi = (tol - elevStart) / slope, tLo = (-tol - elevStart) / slope;
+  const t0 = Math.max(0, Math.min(tHi, tLo)), t1 = Math.min(1, Math.max(tHi, tLo));
+  return t0 < t1 ? [[t0, t1]] : [];
+}
 // Builds the per-call grade-feature list for terrainRegrade(): one 'poly' feature per at-grade
 // free-road segment and one 'rect' feature per Tile road. `roadTiles` = [{ tx, ty }] (tile coords).
 // Only cheap params are hashed here; centre-line sampling (the expensive part) happens lazily in
@@ -3954,7 +3975,12 @@ function collectRoadGradeFeatures(network, roadTiles) {
   const feats = [];
   if (network) {
     network.segments.forEach((seg) => {
-      if (!isRoadSegmentAtGrade(seg)) return;
+      // Prompt 27 Part A — was `if (!isRoadSegmentAtGrade(seg)) return;` (whole-segment, see the
+      // note above _atGradeTRanges). Now grades whichever t sub-range(s) actually sit near ground
+      // level, which for a normal flat road is still the entire [0,1] range (unchanged behaviour)
+      // and for a ramp/bridge is just its short near-zero approach, if it has one at all.
+      const tRanges = _atGradeTRanges(seg.elevation.start, seg.elevation.end, ROAD_AT_GRADE_TOL);
+      if (!tRanges.length) return;
       const { aPos, bPos } = _roadEndPositions(network, seg);
       const c = seg.curve && seg.curve.controlPoint;
       const wMax = Math.max(getRoadWidth(seg, 0), getRoadWidth(seg, 0.5), getRoadWidth(seg, 1));
@@ -3963,16 +3989,18 @@ function collectRoadGradeFeatures(network, roadTiles) {
       if (c) { xs.push(c.x); zs.push(c.z); }
       const reach = W + ROAD_GRADE_REACH;
       const bbox = [Math.min(...xs) - reach, Math.min(...zs) - reach, Math.max(...xs) + reach, Math.max(...zs) + reach];
-      const sig = _gradeFnv([_gradeIdOrder(seg.id), aPos.x, aPos.z, bPos.x, bPos.z, c ? c.x : 0, c ? c.z : 0, c ? 1 : 0, W]);
+      const sig = _gradeFnv([_gradeIdOrder(seg.id), aPos.x, aPos.z, bPos.x, bPos.z, c ? c.x : 0, c ? c.z : 0, c ? 1 : 0, W, tRanges[0][0], tRanges[0][1]]);
       feats.push({
         sig, order: _gradeIdOrder(seg.id), bbox,
         build() {
-          let approx = Math.hypot(bPos.x - aPos.x, bPos.z - aPos.z);
-          if (c) approx = Math.hypot(c.x - aPos.x, c.z - aPos.z) + Math.hypot(bPos.x - c.x, bPos.z - c.z);
+          const [t0, t1] = tRanges[0];
+          let approx = Math.hypot(bPos.x - aPos.x, bPos.z - aPos.z) * (t1 - t0);
+          if (c) approx = (Math.hypot(c.x - aPos.x, c.z - aPos.z) + Math.hypot(bPos.x - c.x, bPos.z - c.z)) * (t1 - t0);
           const n = Math.max(2, Math.min(600, Math.ceil(approx / 1.5)));
           const pts = new Float64Array((n + 1) * 3);
           for (let i = 0; i <= n; i++) {
-            const q = getRoadPointXZ(network, seg, i / n);
+            const tt = t0 + (t1 - t0) * (i / n);
+            const q = getRoadPointXZ(network, seg, tt);
             pts[i * 3] = q.x; pts[i * 3 + 1] = q.z; pts[i * 3 + 2] = roadGradeHeight(q.x, q.z);
           }
           return { kind: 'poly', pts, W };
@@ -9271,7 +9299,20 @@ export default function CityGridIso() {
       });
       return isRampJunction ? NODE_RAMP_JUNCTION : NODE_T;
     }
-    if (ids.length >= 4) return NODE_CROSS;
+    if (ids.length >= 4) {
+      // Prompt 27 Part C — the 3-way branch above already excludes any node touched by a ramp-
+      // class segment from ever becoming a signaled/crosswalk intersection (NODE_RAMP_JUNCTION);
+      // this 4+-way branch never had that same check, so a ramp merging into an existing 3-way
+      // junction (making it 4-way) still got classified as a plain NODE_CROSS — drawing full
+      // traffic-signal poles and zebra crosswalk stripes across a shallow-angle ramp approach,
+      // which is what the jagged/overlapping crosswalk-stripe and stray-signal-pole reports were.
+      const graph4 = roadGraphRef.current;
+      const isRampJunction4 = ids.some((sid) => {
+        const s = graph4.segments.get(sid);
+        return s && isRampRoadType(ROAD_TYPES[s.roadType]);
+      });
+      return isRampJunction4 ? NODE_RAMP_JUNCTION : NODE_CROSS;
+    }
     const graph = roadGraphRef.current;
     const otherNode = (seg) => graph.nodes.get(seg.startNodeId === node.id ? seg.endNodeId : seg.startNodeId);
     const [s1, s2] = ids.map((id) => graph.segments.get(id));
@@ -13656,10 +13697,27 @@ export default function CityGridIso() {
       if (!pending || !pending.continuationOfNodeId) return { ok: false, reason: 'no-pending' };
       const network = roadNetworkRef.current;
       const snapNode = findGraphNodeNear(point.x, point.z, FREE_ROAD_SNAP_DIST);
-      const endpointOpts = (snapNode && network.nodes.get(snapNode.id)) ? { endpointNodeId: snapNode.id } : { endpointPoint: { x: point.x, z: point.z } };
+      let endpointOpts;
+      if (snapNode && network.nodes.get(snapNode.id)) endpointOpts = { endpointNodeId: snapNode.id };
+      else {
+        // Prompt 26 Part A — same fix as finishHighwayRampPlacement above: prefer cutting a real
+        // T-junction into the ordinary road's body over a floating dead-end node.
+        const body = findRoadBodyForTConnection(network, point.x, point.z, {});
+        if (body && !ROAD_TYPES[body.seg.roadType]?.highway) {
+          const sp = splitRoadSegmentPreservingCurve(network, body.seg.id, body.t);
+          if (sp) {
+            retireCarsOnNodePair(sp.startNodeId, sp.endNodeId);
+            removeFreeRoadSegmentMesh(sp.removedSegmentId);
+            rebuildFreeRoadSegmentMesh(sp.segA);
+            rebuildFreeRoadSegmentMesh(sp.segB);
+            endpointOpts = { endpointNodeId: sp.node.id };
+          } else endpointOpts = { endpointPoint: { x: point.x, z: point.z } };
+        } else endpointOpts = { endpointPoint: { x: point.x, z: point.z } };
+      }
       const result = continueRampHead(network, pending.continuationOfNodeId, endpointOpts, false);
       if (!result.ok) { console.warn(`[ramp-head] continuation rejected: ${result.reason}`, result.detail || ''); return result; }
       result.continuationSegments.forEach((seg) => rebuildFreeRoadSegmentMesh(seg));
+      if (result.farNode) smoothJointsAtNodes([result.farNode.id]);
       _refreshAfterNetworkEdit();
       return result;
     }
@@ -14355,7 +14413,28 @@ export default function CityGridIso() {
       const snapNode = findGraphNodeNear(point.x, point.z, FREE_ROAD_SNAP_DIST);
       const connOpts = { direction: pending.direction, side: pending.side, rampType: 'highway_ramp_1' };
       if (snapNode && network.nodes.get(snapNode.id)) connOpts.endpointNodeId = snapNode.id;
-      else connOpts.endpointPoint = { x: point.x, z: point.z };
+      else {
+        // Prompt 26 Part A — no existing node nearby: before minting a bare floating terminal
+        // node (the old behaviour, which let the ramp dead-end inside an ordinary road's own
+        // paved width with no shared node, so through-traffic on that road had nothing to route
+        // around it with), reuse the exact same "T-connection" primitive Free Road drawing already
+        // uses (Prompt 21F, findRoadBodyForTConnection/splitRoadSegmentPreservingCurve) to check
+        // whether the click landed on the BODY of an ordinary (non-highway) road. If so, cut that
+        // road there first and land the ramp on the real shared node this produces — the road's
+        // through lanes stay intact on both sides of the new node, and the ramp forms a genuine,
+        // routable T/Y junction instead of overlapping the road's centerline with no connection.
+        const body = findRoadBodyForTConnection(network, point.x, point.z, {});
+        if (body && !ROAD_TYPES[body.seg.roadType]?.highway) {
+          const sp = splitRoadSegmentPreservingCurve(network, body.seg.id, body.t);
+          if (sp) {
+            retireCarsOnNodePair(sp.startNodeId, sp.endNodeId);
+            removeFreeRoadSegmentMesh(sp.removedSegmentId);
+            rebuildFreeRoadSegmentMesh(sp.segA);
+            rebuildFreeRoadSegmentMesh(sp.segB);
+            connOpts.endpointNodeId = sp.node.id;
+          } else connOpts.endpointPoint = { x: point.x, z: point.z };
+        } else connOpts.endpointPoint = { x: point.x, z: point.z };
+      }
       const result = createHighwayRampConnection(network, pending.highwaySegmentId, pending.t, connOpts);
       clearRampPreview();
       if (!result.ok) {
@@ -14410,6 +14489,10 @@ export default function CityGridIso() {
         result.counterpart.headSegments.forEach((seg) => rebuildFreeRoadSegmentMesh(seg));
         rebuildGoreMesh(result.counterpart.goreKeySegmentId, result.counterpart.gorePoints);
       }
+      // Prompt 26 Part A — if the ground endpoint just formed a fresh T-connection (above), round
+      // it off the same way a freshly drawn Free Road joint is (Prompt 21F), instead of leaving a
+      // kinked/torn seam where the ramp meets the road's edge.
+      if (result.endNode) smoothJointsAtNodes([result.endNode.id]);
       _refreshAfterNetworkEdit();
       return result;
     }
@@ -16598,7 +16681,20 @@ export default function CityGridIso() {
 
     let raf;
     const clock = new THREE.Clock();
+    // Prompt 26 Part B — the sun's shadow camera spans the whole map (se above), so the shadow
+    // pass was being fully recomputed at full resolution every single frame regardless of camera
+    // position/zoom, which is one of the biggest fixed per-frame GPU costs in this scene (see the
+    // "重すぎる" report). Recomputing it every 3rd frame instead cuts that cost by roughly two
+    // thirds while staying visually indistinguishable (a shadow lagging by up to 2 frames is
+    // imperceptible at normal play speed). This only throttles the shadow MAP recompute — the
+    // color pass (everything else, including cars/buildings themselves) still renders every
+    // frame at full rate, so motion itself stays perfectly smooth.
+    renderer.shadowMap.autoUpdate = false;
+    let _shadowFrameCounter = 0;
+    const SHADOW_UPDATE_EVERY_N_FRAMES = 3;
     const animate = () => {
+      if (_shadowFrameCounter % SHADOW_UPDATE_EVERY_N_FRAMES === 0) renderer.shadowMap.needsUpdate = true;
+      _shadowFrameCounter++;
       const dt = Math.min(clock.getDelta(), 0.1);
       const elapsed = clock.getElapsedTime();
       const keys = keysRef.current;
@@ -16635,6 +16731,16 @@ export default function CityGridIso() {
       // the sun (and its shadow frustum) travels with the view so shadows stay sharp anywhere on the big map
       sun.position.set(target.x + SUN_OFFSET.x, camGroundY + SUN_OFFSET.y, target.z + SUN_OFFSET.z);
       sun.target.position.set(target.x, camGroundY, target.z);
+      // Prompt 26 Part B — zoomed out far enough (overview/俯瞰 view) individual shadows are a few
+      // screen pixels and add nothing visually, but the shadow pass still costs the same either
+      // way, so this is pure waste exactly in the situation reported as heaviest. Below zoom 0.9
+      // (out past roughly "see several districts at once") the shadow pass is skipped outright;
+      // fog is also pulled in so distant geometry fades rather than needing to be drawn crisply
+      // all the way to the horizon. Both relax back to normal the moment the player zooms back in.
+      const zoomedOut = zoomRef.current < 0.9;
+      if (renderer.shadowMap.enabled !== !zoomedOut) renderer.shadowMap.enabled = !zoomedOut;
+      scene.fog.near = zoomedOut ? 180 : 300;
+      scene.fog.far = zoomedOut ? 700 : 1400;
 
       // ---- traffic signal phase cycle: ns green -> ns yellow -> ew green -> ew yellow -> ns ...
       // Each lens mesh's material always exists (red/yellow/green all rendered every frame); only
