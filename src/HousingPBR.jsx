@@ -649,18 +649,42 @@ let _texFetcher = null; // tests can inject (url) => Promise<{ image, flipY } | 
 export function __setHouseTextureFetcher(fn) { _texFetcher = fn; }
 const _texMax = () => (typeof window !== 'undefined' && window.__HOUSE_TEX_MAX__) || 1024;
 
+// Fallback decoder: <img>.decode() + canvas down-scale. Used when createImageBitmap refuses a file
+// (unusual JPEG flavours). Runs on the main thread, so it is only the second choice.
+async function _decodeViaImageElement(blob, max) {
+  const u = URL.createObjectURL(blob);
+  try {
+    const img = new Image(); img.decoding = 'async'; img.src = u; await img.decode();
+    const k = Math.min(1, max / Math.max(img.naturalWidth, img.naturalHeight));
+    const w = Math.max(1, Math.round(img.naturalWidth * k)), h = Math.max(1, Math.round(img.naturalHeight * k));
+    const c = document.createElement('canvas'); c.width = w; c.height = h;
+    const g = c.getContext('2d'); g.imageSmoothingQuality = 'high'; g.drawImage(img, 0, 0, w, h);
+    return { image: c, flipY: true, w, h };
+  } finally { URL.revokeObjectURL(u); }
+}
+
 async function _defaultFetchTexture(url) {
   if (typeof fetch === 'function' && typeof createImageBitmap === 'function') {
     const res = await fetch(url);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const blob = await res.blob();
     // A dev server that answers a missing file with index.html (HTTP 200) is caught here.
-    if (blob.type && !blob.type.startsWith('image/')) throw new Error(`not an image (content-type "${blob.type}")`);
+    if (blob.type && !blob.type.startsWith('image/')) throw new Error(`file not found (server returned "${blob.type}")`);
+    if (blob.size < 2000) throw new Error(`file is only ${blob.size} bytes (empty / Git LFS pointer?)`);
     const base = { imageOrientation: 'flipY', premultiplyAlpha: 'none', colorSpaceConversion: 'none' };
-    let bmp;
-    try { bmp = await createImageBitmap(blob, { ...base, resizeWidth: _texMax(), resizeQuality: 'high' }); }
-    catch (e) { bmp = await createImageBitmap(blob, base); } // browser without resize options: full-size decode
-    return { image: bmp, flipY: false, w: bmp.width, h: bmp.height };
+    try {
+      const bmp = await createImageBitmap(blob, { ...base, resizeWidth: _texMax(), resizeQuality: 'high' });
+      return { image: bmp, flipY: false, w: bmp.width, h: bmp.height };
+    } catch (e1) { /* fall through */ }
+    try {
+      const bmp = await createImageBitmap(blob, base); // browser without resize options: full-size decode
+      return { image: bmp, flipY: false, w: bmp.width, h: bmp.height };
+    } catch (e2) { /* fall through */ }
+    if (typeof Image !== 'undefined' && typeof document !== 'undefined') {
+      try { return await _decodeViaImageElement(blob, _texMax()); }
+      catch (e3) { throw new Error(`cannot be decoded by the browser at all (${blob.size} bytes, ${blob.type}) - file is probably corrupt/truncated`); }
+    }
+    throw new Error(`cannot be decoded (${blob.size} bytes)`);
   }
   return new Promise((resolve, reject) => _textureLoader.load(url, (t) => resolve({ texture: t }), undefined, (e) => reject(e && e.message ? e : new Error('image load error'))));
 }
