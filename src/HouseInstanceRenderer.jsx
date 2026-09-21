@@ -1,16 +1,18 @@
 // ============================================================================
-// HouseInstanceRenderer.jsx  (Prompt 24A)
+// HouseInstanceRenderer.jsx  (Prompt 24A-R2)
 // ----------------------------------------------------------------------------
-// House = a light data record.  Drawing = shared merged geometry + shared material + InstancedMesh.
+// House = a light data record.  Drawing = shared module geometry + shared material + InstancedMesh.
 //   record : { id, archetype:{w,d,variantIndex}, position, rotationY, scale, level, seed, skirt }
 //   Renderer keeps NO Group / Mesh per house. THREE objects are per BUCKET:
 //     bucket key = sector | lod | geometryKey | materialKey     (many houses -> one InstancedMesh)
-//   houseRenderRefs: house.refs = Map(bucket -> instanceIndex); bucket.owners[instanceIndex] = house.
+//   One house owns SEVERAL instances (one per module of its kit: wall, roof, windows, columns ...),
+//   possibly several in the same bucket (e.g. 4 window frames = 4 instances of the shared unit box).
+//   Ownership: house.insts = [inst], inst = { house, b, slot }, bucket.owners[slot] = inst.
 //   Add / remove / LOD move / level change = instance-slot bookkeeping only (swap-remove), never
-//   geometry creation or dispose. Geometry is created once per archetype-part-LOD in HousingPBR.jsx.
+//   geometry creation or dispose. Geometry is created once per module key in HousingPBR.jsx.
 // ============================================================================
 import * as THREE from 'three';
-import { getHouseArchetype, getHouseLodParts, getHouseGeometryStats, getHouseMaterialStats, getSolidMaterial } from './HousingPBR.jsx';
+import { getHouseArchetype, getHouseLodParts, getHouseGeometryStats, getHouseMaterialStats, getSolidMaterial, disposeHouseSharedResources, HOUSE_STATS } from './HousingPBR.jsx';
 
 // World-space sector size per LOD. Near LODs use small sectors (tight frustum culling); far LODs use big
 // ones (everything is on screen when zoomed out anyway) so far houses collapse into a handful of buckets.
@@ -22,16 +24,24 @@ const LOD_EXAM_PER_FRAME = 800;         // houses re-evaluated per frame after a
 const LOD_MOVES_PER_FRAME = 64;         // max LOD bucket moves per frame
 const PENDING_PER_FRAME = 96;           // queued (bulk) houses placed per frame
 const PENDING_BUDGET_MS = 5;
+const INITIAL_CAPACITY = 16;
 
-// Shadow policy per LOD (part -> flag). LOD3: none.
-const CAST = [{ wall: 1, roof: 1 }, { wall: 1, roof: 1 }, { roof: 1 }, {}];
-const RECV = [{ wall: 1, roof: 1, foundation: 1, deck: 1 }, { wall: 1, roof: 1, foundation: 1 }, { wall: 1, roof: 1, porchroof: 1 }, {}];
+// Shadow policy per LOD (part -> flag). Small detail parts (trim, glass, columns, rails ...) neither cast nor
+// receive: they are a few cm thick and would only cost shadow-pass draw calls.
+const CAST = [
+  { wall: 1, roof: 1, porchroof: 1, chimney: 1, dormerwall: 1, dormerroof: 1 },
+  { wall: 1, roof: 1 }, { roof: 1 }, {},
+];
+const RECV = [
+  { wall: 1, roof: 1, porchroof: 1, foundation: 1, deck: 1, steps: 1, chimney: 1, door: 1, dormerwall: 1, dormerroof: 1 },
+  { wall: 1, roof: 1, foundation: 1 }, { wall: 1, roof: 1, porchroof: 1 }, {},
+];
 
-const IS_DEV = (() => { try { return !!(import.meta && import.meta.env && import.meta.env.DEV); } catch (e) { return false; } })();
+const _now = () => (typeof performance !== 'undefined' ? performance.now() : Date.now());
 
 const _Y = new THREE.Vector3(0, 1, 0);
 const _q = new THREE.Quaternion(), _p = new THREE.Vector3(), _s = new THREE.Vector3();
-const _pv = new THREE.Matrix4(), _frustum = new THREE.Frustum(), _box = new THREE.Box3();
+const _pv = new THREE.Matrix4(), _frustum = new THREE.Frustum();
 const _noRaycast = () => {};
 let _skirtGeo = null;
 const _WHITE = [1, 1, 1];
@@ -40,9 +50,6 @@ function _rng(seed) { // mulberry32
   let a = (Math.imul((seed | 0) ^ 0x9e3779b9, 2654435761) >>> 0) || 1;
   return () => { a = (a + 0x6d2b79f5) >>> 0; let t = a; t = Math.imul(t ^ (t >>> 15), t | 1); t ^= t + Math.imul(t ^ (t >>> 7), t | 61); return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
 }
-// Level -> visual bucket style. All occupied levels currently share the same house (the legacy
-// builder ignored level too), but level changes go through the same remove/add-instance path so a
-// per-level style can be added here without touching the renderer.
 function levelStyle(level) { return level > 0 ? 'std' : 'none'; }
 
 export function createHouseInstanceRenderer(scene) {
@@ -52,12 +59,13 @@ export function createHouseInstanceRenderer(scene) {
   const sectors = new Map();
   const archUse = new Map();          // archetype id -> house count
   const pending = [];
-  const stats = { updateMs: 0, lastPlaceMs: 0, frame: 0, tick: 0 };
+  const stats = { updateMs: 0, lastPlaceMs: 0, frame: 0, houseCreateMs: 0, instanceWriteMs: 0, instanceUpdateMs: 0, addCalls: 0 };
   let ctx = null;                     // last view context (for initial LOD of new houses)
   let viewSig = '';
   let lodCursor = 0, lodRemaining = 0;
   let lastCamera = null;
   let emptyBuckets = 0;               // buckets currently holding 0 instances (pruned in batches)
+  let forcedLod = null;               // dev/stress: force every house to one LOD
 
   // ---------- sectors / buckets ----------
   function _sector(x, z, lodIdx) {
@@ -85,10 +93,10 @@ export function createHouseInstanceRenderer(scene) {
     return mesh;
   }
   function _bucket(sector, lodKey, geoKey, geometry, matKey, material, part, cast, recv, tinted) {
-    const key = `${sector.key}|${lodKey}|${geoKey}|${matKey}`;
+    const key = `${sector.key}|${lodKey}|${geoKey}|${matKey}${tinted ? '+t' : ''}`;
     let b = buckets.get(key);
     if (b) return b;
-    b = { key, sector, geometry, material, part, tinted: !!tinted, cast: !!cast, recv: !!recv, count: 0, capacity: 8, owners: [], mesh: null };
+    b = { key, sector, geometry, material, part, tinted: !!tinted, cast: !!cast, recv: !!recv, count: 0, capacity: INITIAL_CAPACITY, owners: [], mesh: null };
     b.mesh = _makeMesh(b, b.capacity);
     emptyBuckets++; // decremented by the first _bucketAdd
     scene.add(b.mesh);
@@ -108,25 +116,23 @@ export function createHouseInstanceRenderer(scene) {
   function _bucketAdd(b, house, matrix, tint) {
     if (b.count === b.capacity) _grow(b);
     if (b.count === 0) emptyBuckets = Math.max(0, emptyBuckets - 1);
-    const slot = b.count++;
-    b.owners[slot] = house; house.refs.set(b, slot);
+    const slot = b.count++, inst = { house, b, slot };
+    b.owners[slot] = inst;
     b.mesh.instanceMatrix.array.set(matrix.elements, slot * 16);
     if (b.tinted) b.mesh.instanceColor.array.set(tint, slot * 3);
     b.mesh.count = b.count;
     b.mesh.instanceMatrix.needsUpdate = true; if (b.tinted) b.mesh.instanceColor.needsUpdate = true;
     b.mesh.visible = b.sector.visible;
+    return inst;
   }
-  function _bucketRemove(b, house) {
-    const slot = house.refs.get(b); if (slot === undefined) return;
-    const last = b.count - 1;
+  function _bucketRemove(inst) {
+    const b = inst.b, slot = inst.slot, last = b.count - 1;
     if (slot !== last) { // swap-remove: move the last instance into the vacated slot
-      const ma = b.mesh.instanceMatrix.array;
-      ma.copyWithin(slot * 16, last * 16, last * 16 + 16);
+      b.mesh.instanceMatrix.array.copyWithin(slot * 16, last * 16, last * 16 + 16);
       if (b.tinted) b.mesh.instanceColor.array.copyWithin(slot * 3, last * 3, last * 3 + 3);
-      const moved = b.owners[last]; b.owners[slot] = moved; moved.refs.set(b, slot);
+      const moved = b.owners[last]; b.owners[slot] = moved; moved.slot = slot;
     }
     b.owners[last] = undefined; b.count = last; b.mesh.count = last;
-    house.refs.delete(b);
     b.mesh.instanceMatrix.needsUpdate = true; if (b.tinted) b.mesh.instanceColor.needsUpdate = true;
     if (last === 0) { b.mesh.visible = false; emptyBuckets++; }
   }
@@ -145,33 +151,34 @@ export function createHouseInstanceRenderer(scene) {
   }
   const _tm = new THREE.Matrix4(), _tc = [1, 1, 1];
   function _attachParts(h, lod) {
-    const parts = getHouseLodParts(h.arch, lod);
+    const t0 = _now();
+    const parts = getHouseLodParts(h.arch, lod);   // cached on the archetype; module geometry comes from the shared cache
     const sector = _sector(h.position.x, h.position.z, lod);
     for (const p of parts) {
       const b = _bucket(sector, lod, p.geoKey, p.geometry, p.matKey, p.material, p.part, CAST[lod][p.part], RECV[lod][p.part], p.tinted);
       const m = p.local ? _tm.multiplyMatrices(h.matrix, p.local) : h.matrix;
       let c = _WHITE;
       if (p.tinted) { c = _tc; const base = p.color || _WHITE; c[0] = base[0] * h.tint[0]; c[1] = base[1] * h.tint[1]; c[2] = base[2] * h.tint[2]; }
-      _bucketAdd(b, h, m, c);
-      h.partBuckets.push(b);
+      h.insts.push(_bucketAdd(b, h, m, c));
     }
     h.lod = lod;
+    stats.instanceWriteMs += _now() - t0;
   }
   function _detachParts(h) {
-    for (const b of h.partBuckets) _bucketRemove(b, h);
-    h.partBuckets.length = 0;
+    for (let i = 0; i < h.insts.length; i++) _bucketRemove(h.insts[i]);
+    h.insts.length = 0;
   }
   function _attachSkirt(h) {
     if (!h.skirt) return;
     if (!_skirtGeo) _skirtGeo = new THREE.BoxGeometry(1, 1, 1);
     const color = h.skirt.retaining ? 0x5b5750 : 0x8a8378;
     const b = _bucket(_sector(h.position.x, h.position.z, 4), 'S', 'skirt', _skirtGeo, `solid:${color}`, getSolidMaterial(color, { roughness: 0.95, metalness: 0 }), 'skirt', true, true, false);
-    _bucketAdd(b, h, h.skirtMatrix, _WHITE);
-    h.skirtBucket = b;
+    h.skirtInst = _bucketAdd(b, h, h.skirtMatrix, _WHITE);
   }
-  function _detachSkirt(h) { if (h.skirtBucket) { _bucketRemove(h.skirtBucket, h); h.skirtBucket = null; } }
+  function _detachSkirt(h) { if (h.skirtInst) { _bucketRemove(h.skirtInst); h.skirtInst = null; } }
 
   function _lodFor(h, c, cur) {
+    if (forcedLod !== null) return forcedLod;
     if (!c) return cur;
     let m, T;
     if (c.ortho) { m = c.viewH + 0.5 * Math.hypot(h.position.x - c.fx, h.position.z - c.fz); T = ORTHO_T; }
@@ -183,7 +190,7 @@ export function createHouseInstanceRenderer(scene) {
   }
 
   function _place(h) {
-    h.lod = ctx ? _lodFor(h, ctx, 0) : 0;
+    h.lod = ctx || forcedLod !== null ? _lodFor(h, ctx, 0) : 0;
     _attachParts(h, h.lod);
     _attachSkirt(h);
     h.placed = true;
@@ -194,38 +201,49 @@ export function createHouseInstanceRenderer(scene) {
     const a = rec.archetype;
     const arch = a.id ? a : getHouseArchetype(a.w, a.d, a.variantIndex || 0);
     if (!arch) throw new Error(`no low-density house archetype for ${a.w}x${a.d}`);
-    getHouseLodParts(arch, 0); // build + validate the shared LOD0 geometry NOW (throws here, not later inside a frame)
     const rnd = _rng(rec.seed == null ? 1 : rec.seed);
     const v = 0.9 + rnd() * 0.13; // subtle per-house tint (seed-driven; NOT per-house geometry)
-    const h = existing || { id: rec.id, refs: new Map(), partBuckets: [], skirtBucket: null, matrix: new THREE.Matrix4(), skirtMatrix: new THREE.Matrix4(), placed: false, lod: 0, listIndex: -1 };
+    const h = existing || { id: rec.id, insts: [], skirtInst: null, matrix: new THREE.Matrix4(), skirtMatrix: new THREE.Matrix4(), placed: false, lod: 0, listIndex: -1 };
     h.arch = arch; h.level = rec.level ?? 1; h.style = levelStyle(h.level); h.seed = rec.seed ?? 0;
     h.position = { x: rec.position.x, y: rec.position.y, z: rec.position.z };
     h.rotationY = rec.rotationY || 0; h.scale = rec.scale || 1;
     h.sy = 0.97 + rnd() * 0.07; // height jitter only: footprint stays inside the lot
     h.tint = [v * (0.985 + rnd() * 0.03), v, v * (0.985 + rnd() * 0.03)];
     h.skirt = rec.skirt ? { ...rec.skirt } : null;
+    // Part 19: lightweight feature flags come from the archetype (porch / chimney / dormer / wraparound)
+    h.features = arch.features;
     _composeMatrices(h);
     return h;
+  }
+
+  function _unregister(h) {
+    houses.delete(h.id);
+    if (h.listIndex >= 0) { const last = houseList.pop(); if (last !== h) { houseList[h.listIndex] = last; last.listIndex = h.listIndex; } }
+    const n = (archUse.get(h.arch.id) || 1) - 1; if (n <= 0) archUse.delete(h.arch.id); else archUse.set(h.arch.id, n);
   }
 
   /** Add a house. immediate=true places its instances now (cheap slot writes); false queues it for batched placement. */
   function addHouse(rec, opts = {}) {
     if (houses.has(rec.id)) return updateHouse(rec);
-    const t0 = performance.now();
+    const t0 = _now();
     const h = _buildRecord(rec, null);
     houses.set(h.id, h); h.listIndex = houseList.push(h) - 1;
     archUse.set(h.arch.id, (archUse.get(h.arch.id) || 0) + 1);
-    if (opts.immediate === false) pending.push(h); else _place(h);
-    stats.lastPlaceMs = performance.now() - t0;
+    if (opts.immediate === false) pending.push(h);
+    else {
+      try { _place(h); }
+      catch (err) { _detachParts(h); _detachSkirt(h); _unregister(h); throw err; } // throws for a geometry/material failure -> caller rolls the lot back
+    }
+    stats.lastPlaceMs = _now() - t0; stats.houseCreateMs += stats.lastPlaceMs; stats.addCalls++;
     return h.id;
   }
+  /** Bulk add: records are queued and placed a few per frame (flushPending, time-budgeted). Archetype kits are built once, on first use. */
+  function addHouses(recs) { return recs.map((r) => addHouse(r, { immediate: false })); }
   function removeHouse(id) {
     const h = houses.get(id); if (!h) return false;
     if (h.placed) { _detachParts(h); _detachSkirt(h); }
     else { const i = pending.indexOf(h); if (i >= 0) pending.splice(i, 1); }
-    houses.delete(id);
-    const last = houseList.pop(); if (last !== h) { houseList[h.listIndex] = last; last.listIndex = h.listIndex; }
-    const n = (archUse.get(h.arch.id) || 1) - 1; if (n <= 0) archUse.delete(h.arch.id); else archUse.set(h.arch.id, n);
+    _unregister(h);
     return true;
   }
   /** Re-sync an existing house after a level / grading / archetype change. No geometry is created or disposed. */
@@ -239,15 +257,15 @@ export function createHouseInstanceRenderer(scene) {
       const n = (archUse.get(prevArch) || 1) - 1; if (n <= 0) archUse.delete(prevArch); else archUse.set(prevArch, n);
       archUse.set(h.arch.id, (archUse.get(h.arch.id) || 0) + 1);
     }
-    if (wasPlaced) { _place(h); } // level / skirt / transform change = remove instance + add instance (slot bookkeeping only)
+    if (wasPlaced) _place(h); // level / skirt / transform change = remove instances + add instances (slot bookkeeping only)
     return h.id;
   }
   const setLevel = (id, level) => { const h = houses.get(id); if (!h || h.level === level) return; h.level = level; if (levelStyle(level) !== h.style) { h.style = levelStyle(level); if (h.placed) { _detachParts(h); _attachParts(h, h.lod); } } };
   const hasHouse = (id) => houses.has(id);
 
   function flushPending(budgetMs = PENDING_BUDGET_MS) {
-    const t0 = performance.now(); let n = 0;
-    while (pending.length && n < PENDING_PER_FRAME && performance.now() - t0 < budgetMs) { _place(pending.shift()); n++; }
+    const t0 = _now(); let n = 0;
+    while (pending.length && n < PENDING_PER_FRAME && _now() - t0 < budgetMs) { _place(pending.shift()); n++; }
     return n;
   }
 
@@ -259,7 +277,7 @@ export function createHouseInstanceRenderer(scene) {
 
   /** Call once per frame with the camera that is about to render. */
   function update(camera, opts = {}) {
-    const t0 = performance.now();
+    const t0 = _now();
     lastCamera = camera;
     flushPending();
     ctx = _makeCtx(camera, opts);
@@ -272,7 +290,7 @@ export function createHouseInstanceRenderer(scene) {
       const vis = _frustum.intersectsBox(s.box);
       if (vis !== s.visible) { s.visible = vis; s.buckets.forEach((b) => { b.mesh.visible = vis && b.count > 0; }); }
     });
-    // batched LOD pass: bucket moves only, capped per frame
+    // batched LOD pass: bucket moves only (cached kits -> no geometry generation), capped per frame
     if (lodRemaining > 0 && houseList.length) {
       const exam = Math.min(LOD_EXAM_PER_FRAME, lodRemaining); let done = 0, moves = 0;
       while (done < exam && moves < LOD_MOVES_PER_FRAME) {
@@ -285,8 +303,9 @@ export function createHouseInstanceRenderer(scene) {
       lodRemaining -= done;
     }
     if (emptyBuckets > 48) _prune();
-    stats.updateMs = performance.now() - t0;
-    if (IS_DEV && typeof window !== 'undefined' && (++stats.frame % 30) === 0) window.__HOUSE_RENDER_STATS__ = getStats();
+    stats.updateMs = _now() - t0;
+    stats.instanceUpdateMs = stats.updateMs;
+    if (typeof window !== 'undefined' && (++stats.frame % 30) === 0) window.__HOUSE_RENDER_STATS__ = getStats(); // cheap: a few loops every 30 frames
   }
 
   function _prune() { // drop empty buckets (their instance buffers only) so the scene graph does not accumulate dead meshes
@@ -295,62 +314,75 @@ export function createHouseInstanceRenderer(scene) {
   }
 
   function getStats() {
-    const inst = [0, 0, 0, 0]; let visibleMeshes = 0, instances = 0;
-    buckets.forEach((b) => { if (b.count > 0) { if (b.mesh.visible) visibleMeshes++; instances += b.count; } });
+    const inst = [0, 0, 0, 0]; let visibleMeshes = 0, instances = 0, live = 0;
+    buckets.forEach((b) => { if (b.count > 0) { live++; if (b.mesh.visible) visibleMeshes++; instances += b.count; } });
     houseList.forEach((h) => { if (h.placed) inst[h.lod]++; });
     const g = getHouseGeometryStats(), m = getHouseMaterialStats();
     return {
       houseCount: houses.size, pendingHouses: pending.length, archetypeCount: archUse.size, archetypeCacheSize: g.archetypeCount,
-      geometryCount: g.geometryCount, materialCount: m.totalMaterials, textureCount: m.totalTextures, sharedTextureCount: m.sharedTextures,
-      meshCount: buckets.size, drawCallsVisible: visibleMeshes, instanceCount: instances, housesByLOD: inst,
-      sectors: sectors.size, updateMs: +stats.updateMs.toFixed(3), lastPlaceMs: +stats.lastPlaceMs.toFixed(3),
+      geometryCount: g.geometryCount, geometryHit: g.geometryHit, geometryMiss: g.geometryMiss, geometryCreateMs: g.geometryCreateMs,
+      materialCount: m.totalMaterials, materialHit: m.materialHit, materialMiss: m.materialMiss, materialCreateMs: m.materialCreateMs,
+      textureCount: m.totalTextures, textureRequested: m.textureRequested, textureCacheHit: m.textureCacheHit,
+      texturesReady: m.texturesReady, texturesFailed: m.texturesFailed, texturesPending: m.texturesPending, textureBytesEstMB: m.textureBytesEstMB, failedTextures: m.failedTextures,
+      bucketCount: buckets.size, liveBuckets: live, instancedMeshCount: buckets.size, drawCallsVisible: visibleMeshes, instanceCount: instances,
+      instancesPerHouse: houses.size ? +(instances / houses.size).toFixed(1) : 0,
+      housesByLOD: inst, sectors: sectors.size,
+      houseCreateMs: +stats.houseCreateMs.toFixed(3), instanceWriteMs: +stats.instanceWriteMs.toFixed(3), instanceUpdateMs: +stats.instanceUpdateMs.toFixed(3),
+      updateMs: +stats.updateMs.toFixed(3), lastPlaceMs: +stats.lastPlaceMs.toFixed(3),
     };
   }
 
-  /** Consistency check (dev/test): every ref points at an owner slot holding the right matrix. Returns mismatch count. */
+  /** Consistency check (dev/test): every instance sits in its owner slot with the right matrix. Returns mismatch count. */
   function verify() {
     let bad = 0; const m = new THREE.Matrix4();
     houses.forEach((h) => {
       if (!h.placed) return;
       const parts = getHouseLodParts(h.arch, h.lod);
-      if (h.partBuckets.length !== parts.length) bad++;
-      h.partBuckets.forEach((b, i) => {
-        const slot = h.refs.get(b);
-        if (slot === undefined || b.owners[slot] !== h || slot >= b.count) { bad++; return; }
-        const p = parts[i]; const exp = p.local ? m.multiplyMatrices(h.matrix, p.local) : h.matrix;
-        const arr = b.mesh.instanceMatrix.array;
-        for (let k = 0; k < 16; k++) if (Math.abs(arr[slot * 16 + k] - exp.elements[k]) > 1e-5) { bad++; break; }
+      if (h.insts.length !== parts.length) bad++;
+      h.insts.forEach((inst, i) => {
+        if (inst.b.owners[inst.slot] !== inst || inst.slot >= inst.b.count || inst.house !== h) { bad++; return; }
+        const p = parts[i]; if (!p) return; const exp = p.local ? m.multiplyMatrices(h.matrix, p.local) : h.matrix;
+        const arr = inst.b.mesh.instanceMatrix.array;
+        for (let k = 0; k < 16; k++) if (Math.abs(arr[inst.slot * 16 + k] - exp.elements[k]) > 1e-4) { bad++; break; }
       });
     });
-    buckets.forEach((b) => { for (let i = 0; i < b.count; i++) { const o = b.owners[i]; if (!o || o.refs.get(b) !== i) bad++; } });
+    buckets.forEach((b) => { for (let i = 0; i < b.count; i++) { const o = b.owners[i]; if (!o || o.slot !== i || o.b !== b) bad++; } });
     return bad;
   }
 
-  function dispose() {
-    buckets.forEach((b) => { scene.remove(b.mesh); b.mesh.dispose(); }); // shared geometry / materials are never disposed here
-    buckets.clear(); sectors.clear(); houses.clear(); houseList.length = 0; pending.length = 0; archUse.clear();
+  /** Renderer shutdown. Shared geometry / materials / textures are disposed ONLY when opts.disposeShared is true. */
+  function dispose(opts = {}) {
+    buckets.forEach((b) => { scene.remove(b.mesh); b.mesh.dispose(); });
+    buckets.clear(); sectors.clear(); houses.clear(); houseList.length = 0; pending.length = 0; archUse.clear(); emptyBuckets = 0;
+    if (opts.disposeShared) { disposeHouseSharedResources(); if (_skirtGeo) { _skirtGeo.dispose(); _skirtGeo = null; } }
   }
 
-  /** Dev benchmark: places N synthetic houses (all 11 sizes, both orientations), measures placement + one update(). */
-  function benchmark(counts = [1, 2, 10, 100, 500, 1000, 2000, 5000], camera = lastCamera, keep = false) {
+  const setForcedLod = (l) => { forcedLod = l; viewSig = ''; lodRemaining = houseList.length; };
+
+  /** Dev benchmark: places N synthetic houses (all 11 sizes, both orientations), measures placement + LOD settle. */
+  function benchmark(counts = [1, 2, 10, 100, 500, 1000], camera = lastCamera, keep = false) {
     const sizes = ['2x3', '3x3', '3x4', '3x5', '3x6', '4x4', '4x5', '4x6', '5x5', '5x6', '6x6'].flatMap((k) => { const [a, b] = k.split('x').map(Number); return a === b ? [[a, b]] : [[a, b], [b, a]]; });
     const rows = [];
     for (const n of counts) {
-      const ids = []; const t0 = performance.now();
+      const ids = []; const t0 = _now(); const w0 = { ...getStats() };
       for (let i = 0; i < n; i++) {
         const [w, d] = sizes[i % sizes.length], gx = i % 72, gz = Math.floor(i / 72);
         const id = `bench_${n}_${i}`; ids.push(id);
         addHouse({ id, archetype: { w, d, variantIndex: i % 10 }, position: { x: -180 + gx * 5, y: 0, z: -180 + gz * 8 }, rotationY: (i % 8) * 0.4, level: 1, seed: i, skirt: i % 9 === 0 ? { height: 0.6, retaining: false, width: w * 0.97, depth: d * 0.97, yaw: (i % 8) * 0.4 } : null }, { immediate: true });
       }
-      const placeMs = performance.now() - t0;
-      const u0 = performance.now(); if (camera) { viewSig = ''; update(camera, { focus: { x: 0, z: 0 } }); } const updMs = performance.now() - u0;
-      rows.push({ houses: n, placeMs: +placeMs.toFixed(2), msPerHouse: +(placeMs / n).toFixed(4), firstUpdateMs: +updMs.toFixed(2), ...getStats() });
+      const placeMs = _now() - t0;
+      let updMs = 0; if (camera) { viewSig = ''; for (let f = 0; f < 200 && (f === 0 || lodRemaining > 0); f++) { const u0 = _now(); update(camera, { focus: { x: 0, z: 0 } }); updMs += _now() - u0; } }
+      const s = getStats();
+      rows.push({ houses: n, placementMs: +placeMs.toFixed(2), msPerHouse: +(placeMs / n).toFixed(4), lodSettleUpdateMs: +updMs.toFixed(2), newGeometries: s.geometryCount - w0.geometryCount, ...s });
       if (!keep) { ids.forEach(removeHouse); _prune(); }
     }
     return rows;
   }
 
-  const api = { addHouse, removeHouse, updateHouse, setLevel, hasHouse, flushPending, update, getStats, verify, dispose, benchmark };
-  if (IS_DEV && typeof window !== 'undefined') { window.__HOUSE_RENDERER__ = api; window.__HOUSE_BENCH__ = (counts, keep) => { const r = benchmark(counts, lastCamera, keep); console.table(r); return r; }; }
+  const api = { addHouse, addHouses, removeHouse, updateHouse, setLevel, hasHouse, flushPending, update, getStats, verify, dispose, benchmark, setForcedLod };
+  if (typeof window !== 'undefined') {
+    window.__HOUSE_RENDERER__ = api;
+    window.__HOUSE_BENCH__ = (counts, keep) => { const r = benchmark(counts, lastCamera, keep); console.table(r); return r; };
+  }
   return api;
 }
