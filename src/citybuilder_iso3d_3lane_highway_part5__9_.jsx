@@ -38,6 +38,10 @@ const BUILDING_UPKEEP = 0.6;
 const START_TREASURY = 5000;
 
 const NUM_CARS = 18;
+// Prompt 29 — first-person (driver / pedestrian) view: nothing beyond this many world units is drawn; fog
+// swallows the last stretch so the cut is never visible (100 m ~ 20 houses).
+const DRIVER_VIEW_DIST = 100;
+const DRIVER_FOG_NEAR = 30;
 const NUM_PEDS = 45;
 const CAR_SPEED = 9;
 // The "standard" road speed (km/h) that CAR_SPEED (world units/sec) represents — every road
@@ -12004,10 +12008,10 @@ export default function CityGridIso() {
     let camGroundY = 0; // smoothed terrain height under the camera's look-at point (Prompt 25)
 
     const renderer = new THREE.WebGLRenderer({ antialias: true });
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5)); // Prompt 29: was 2 — on hi-dpi screens that is up to 1.8x more pixels to shade for almost no visible gain
     renderer.setSize(mount.clientWidth, mount.clientHeight);
     renderer.shadowMap.enabled = true;
-    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    renderer.shadowMap.type = THREE.PCFShadowMap; // Prompt 29: was PCFSoft (more taps per pixel)
     mount.appendChild(renderer.domElement);
 
     scene.add(new THREE.HemisphereLight(0x8fb8c8, 0x1a2018, 0.8));
@@ -14734,6 +14738,7 @@ export default function CityGridIso() {
             const parcel = createParcelAlongFrontage(network, segment.id, side, band);
             if (!parcel) continue;
             landParcelsRef.current.set(parcel.id, parcel);
+            if (!showRoadsideLandRef.current) continue; // Prompt 29: parcel DATA is always kept; the debug meshes only exist while the overlay is switched on
             let hy = -1e9; // Prompt 25: this debug overlay is a flat polygon — lay it just above the highest ground under it
             for (const q of parcel.polygon) hy = Math.max(hy, terrainHeight(q.x, q.z));
             const y = hy + 0.05 + band * 0.001; // tiny per-band lift so band edges don't z-fight
@@ -16916,19 +16921,35 @@ export default function CityGridIso() {
       camera.lookAt(target.x, camGroundY, target.z);
       camera.zoom = zoomRef.current;
       camera.updateProjectionMatrix();
+      // Prompt 29 — first-person views (driver car / pedestrian): the shadow frustum follows the rider, not the
+      // (possibly far away) iso camera target, and shrinks to the 100 m draw distance.
+      const _fpCar = selectedCarRef.current, _fpPed = selectedPedRef.current;
+      const _fpDriver = cameraModeRef.current === 'driver' && _fpCar && _fpCar.active;
+      const _fpWalker = cameraModeRef.current === 'ped' && _fpPed && _fpPed.active;
+      const fpMode = !!(_fpDriver || _fpWalker);
+      const focusX = _fpDriver ? _fpCar.worldX : _fpWalker ? _fpPed.worldX : target.x;
+      const focusZ = _fpDriver ? _fpCar.worldZ : _fpWalker ? _fpPed.worldZ : target.z;
+      const focusY = _fpDriver ? _fpCar.worldY : _fpWalker ? terrainHeight(_fpPed.worldX, _fpPed.worldZ) : camGroundY;
       // the sun (and its shadow frustum) travels with the view so shadows stay sharp anywhere on the big map
-      sun.position.set(target.x + SUN_OFFSET.x, camGroundY + SUN_OFFSET.y, target.z + SUN_OFFSET.z);
-      sun.target.position.set(target.x, camGroundY, target.z);
+      sun.position.set(focusX + SUN_OFFSET.x, focusY + SUN_OFFSET.y, focusZ + SUN_OFFSET.z);
+      sun.target.position.set(focusX, focusY, focusZ);
+      const wantSe = fpMode ? DRIVER_VIEW_DIST * 1.15 : se;
+      if (sun.shadow.camera.right !== wantSe) {
+        Object.assign(sun.shadow.camera, { left: -wantSe, right: wantSe, top: wantSe, bottom: -wantSe });
+        sun.shadow.camera.updateProjectionMatrix();
+      }
+      const wantFar = fpMode ? DRIVER_VIEW_DIST + 12 : 2000;
+      if (driverCamera.far !== wantFar) { driverCamera.far = wantFar; driverCamera.updateProjectionMatrix(); }
       // Prompt 26 Part B — zoomed out far enough (overview/俯瞰 view) individual shadows are a few
       // screen pixels and add nothing visually, but the shadow pass still costs the same either
       // way, so this is pure waste exactly in the situation reported as heaviest. Below zoom 0.9
       // (out past roughly "see several districts at once") the shadow pass is skipped outright;
       // fog is also pulled in so distant geometry fades rather than needing to be drawn crisply
       // all the way to the horizon. Both relax back to normal the moment the player zooms back in.
-      const zoomedOut = zoomRef.current < 0.9;
+      const zoomedOut = !fpMode && zoomRef.current < 0.9;
       if (renderer.shadowMap.enabled !== !zoomedOut) renderer.shadowMap.enabled = !zoomedOut;
-      scene.fog.near = zoomedOut ? 180 : 300;
-      scene.fog.far = zoomedOut ? 700 : 1400;
+      scene.fog.near = fpMode ? DRIVER_FOG_NEAR : zoomedOut ? 180 : 300;
+      scene.fog.far = fpMode ? DRIVER_VIEW_DIST : zoomedOut ? 700 : 1400;
 
       // ---- traffic signal phase cycle: ns green -> ns yellow -> ew green -> ew yellow -> ns ...
       // Each lens mesh's material always exists (red/yellow/green all rendered every frame); only
@@ -16999,6 +17020,11 @@ export default function CityGridIso() {
       } else {
         houseRenderer.update(camera, { focus: target });
         renderer.render(scene, camera);
+      }
+      // Prompt 29 — opt-in profiling: run `window.__cityPerf = true` in the console to log renderer.info every ~2 s.
+      if (typeof window !== 'undefined' && window.__cityPerf && (_shadowFrameCounter % 120 === 0)) {
+        const inf = renderer.info;
+        console.log('[perf] calls', inf.render.calls, 'tris', inf.render.triangles, 'geometries', inf.memory.geometries, 'textures', inf.memory.textures, 'fp', fpMode);
       }
       raf = requestAnimationFrame(animate);
     };
@@ -19883,7 +19909,10 @@ Grade: ${((freeRoadDraftStatus?.grade ?? 0) * 100).toFixed(1)}%${freeRoadDraftSt
                   const t = threeRef.current;
                   if (t?.roadsideLandGroup) {
                     if (next) { t.rebuildRoadsideLandOverlay(); t.roadsideLandGroup.visible = true; }
-                    else { t.roadsideLandGroup.visible = false; }
+                    else {
+                      t.roadsideLandGroup.visible = false;
+                      while (t.roadsideLandGroup.children.length) { const c = t.roadsideLandGroup.children.pop(); if (c.geometry) c.geometry.dispose(); } // Prompt 29: free the debug meshes while hidden
+                    }
                   }
                   return next;
                 });
