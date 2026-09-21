@@ -12,7 +12,7 @@
 //   geometry creation or dispose. Geometry is created once per module key in HousingPBR.jsx.
 // ============================================================================
 import * as THREE from 'three';
-import { getHouseArchetype, getHouseLodParts, getHouseLotParts, getHouseGeometryStats, getHouseMaterialStats, getSolidMaterial, disposeHouseSharedResources, HOUSE_STATS } from './HousingPBR.jsx';
+import { getHouseArchetype, getHouseLodParts, getHouseLotParts, getHouseGeometryStats, getHouseMaterialStats, getSolidMaterial, disposeHouseSharedResources, HOUSE_STATS, HOUSE_SCALE } from './HousingPBR.jsx';
 
 // World-space sector size per LOD. Near LODs use small sectors (tight frustum culling); far LODs use big
 // ones (everything is on screen when zoomed out anyway) so far houses collapse into a handful of buckets.
@@ -139,10 +139,10 @@ export function createHouseInstanceRenderer(scene) {
 
   // ---------- per-house attach / detach ----------
   function _composeMatrices(h) {
-    _q.setFromAxisAngle(_Y, h.rotationY); _p.set(h.position.x, h.position.y, h.position.z);
+    _p.set(h.position.x, h.position.y, h.position.z);
     _s.set(h.scale, h.scale * h.sy, h.scale);
-    h.matrix.compose(_p, _q, _s);
-    if (h.yardSign < 0) { _q.setFromAxisAngle(_Y, h.rotationY + Math.PI); h.lotMatrix.compose(_p, _q, _s); } else h.lotMatrix.copy(h.matrix); // yard/fence frame: +Z = road side
+    _q.setFromAxisAngle(_Y, h.rotationY + (h.yardSign < 0 ? Math.PI : 0)); h.lotMatrix.compose(_p, _q, _s); // yard/fence frame (NOT shrunk): +Z = road side
+    _q.setFromAxisAngle(_Y, h.rotationY); _s.multiplyScalar(HOUSE_SCALE); h.matrix.compose(_p, _q, _s); // house only: HOUSE_SCALE
     if (h.skirt) {
       _q.setFromAxisAngle(_Y, h.skirt.yaw || 0);
       _p.set(h.position.x, h.position.y - h.skirt.height / 2 + 0.02, h.position.z);

@@ -7009,8 +7009,8 @@ const KIND_SPECS = [
   },
 ];
 
-// shrink all vehicle kinds uniformly (body, cabin, cargo, wheels, driver seat) to ~half size
-const CAR_SCALE = 0.5;
+// shrink all vehicle kinds uniformly (body, cabin, cargo, wheels, driver seat); 0.5 -> 0.3 (= x0.6, matches HOUSE_SCALE)
+const CAR_SCALE = 0.3;
 KIND_SPECS.forEach((spec) => {
   spec.bodyLen *= CAR_SCALE; spec.bodyWid *= CAR_SCALE; spec.bodyH *= CAR_SCALE;
   if (spec.cabin) { spec.cabin.len *= CAR_SCALE; spec.cabin.wid *= CAR_SCALE; spec.cabin.h *= CAR_SCALE; spec.cabin.offZ *= CAR_SCALE; }

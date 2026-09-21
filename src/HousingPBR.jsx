@@ -209,6 +209,8 @@ function _lowDensityFeaturesForSize(w, d, i) {
   };
 }
 
+// 4x4以上のロットだけ形を変える（10種 = 10形）。2x3〜3x6は従来の箱型(gable)のまま。
+const HOUSE_SHAPES = ['L', 'sideGable', 'garage', 'hip', 'gable', 'cross', 'modern', 'Lm', 'garageHip', 'sideGable'];
 export const LOW_DENSITY_HOUSES = LOW_DENSITY_SIZE_CLASSES.flatMap((sizeKey, sizeIdx) => {
   const [a, b] = sizeKey.split('x').map(Number);
   return Array.from({ length: 10 }, (_, i) => {
@@ -218,6 +220,7 @@ export const LOW_DENSITY_HOUSES = LOW_DENSITY_SIZE_CLASSES.flatMap((sizeKey, siz
     return {
       id: `low_${sizeKey}_${String(i + 1).padStart(2, '0')}`,
       sizeKey,
+      shape: Math.min(a, b) >= 4 ? HOUSE_SHAPES[i] : 'gable',
       // widthCells/depthCells はこの変体データの「基準サイズ」。実際に建てる際は
       // buildLowDensityHouseForCell がロットの実寸 w/d でこれを上書きするので、
       // 3x2 選択でも 2x3 選択でも同じ10種プールからそのままの向きで建つ。
@@ -957,6 +960,85 @@ const _railMod = (len) => _geo(`rail|${_q(len)}`, () => {
   return _mergeGeos(list);
 });
 
+// ---- 9.3b house SHAPES (main block + wings, roof kinds) -----------------------------------------
+// roofKind: 'gableZ' (front-facing gable, ridge along Z = original) | 'gableX' (side gable) | 'hip'.
+// Everything is laid out in the MAIN block frame; L.shiftX/Z then re-centres the whole assembly in the lot.
+const SHAPE_WIDTH_FACTOR = { L: 0.62, Lm: 0.62, garage: 0.52, garageHip: 0.52, cross: 0.68, modern: 0.7 };
+const _faceN = (a, b, c) => {
+  const e1 = [b[0] - a[0], b[1] - a[1], b[2] - a[2]], e2 = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+  let n = [e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]];
+  const l = Math.hypot(n[0], n[1], n[2]) || 1; n = n.map((v) => v / l);
+  return n[1] < 0 ? n.map((v) => -v) : n;
+};
+function _hipGeometry(hw, hd, ridge, r) { // eave rectangle +-hw x +-hd at y=0, equal pitch, ridge along the long axis
+  const k = Math.abs(hw - hd), alongX = hw >= hd;
+  const A = [-hw, 0, -hd], B = [hw, 0, -hd], C = [hw, 0, hd], D = [-hw, 0, hd];
+  const R1 = alongX ? [-k, ridge, 0] : [0, ridge, -k], R2 = alongX ? [k, ridge, 0] : [0, ridge, k];
+  const pos = [], nor = [], uv = [];
+  const tri = (a, b, c) => _pushTri(pos, nor, uv, a, b, c, _faceN(a, b, c), [a[0] * r, a[2] * r], [b[0] * r, b[2] * r], [c[0] * r, c[2] * r]);
+  const quad = (a, b, c, d) => { tri(a, b, c); tri(a, c, d); };
+  if (alongX) { quad(A, B, R2, R1); quad(C, D, R1, R2); tri(D, A, R1); tri(B, C, R2); }
+  else { quad(A, D, R2, R1); quad(C, B, R1, R2); tri(A, B, R1); tri(C, D, R2); }
+  _pushTri(pos, nor, uv, A, B, C, [0, -1, 0], [0, 0], [1, 0], [1, 1]); _pushTri(pos, nor, uv, A, C, D, [0, -1, 0], [0, 0], [1, 1], [0, 1]); // soffit
+  return _mkGeo(pos, nor, uv);
+}
+const _hipRoofMod = (w, d, rh, ov) => _geo(`hip|${_q(w)}x${_q(d)}|${_q(rh)}|${_q(ov)}`, () => _hipGeometry(w / 2 + ov, d / 2 + ov, rh, 1 / ROOF_TILE_M));
+const _unitHipGeo = (uv) => _geo(`unit|hip|${uv}`, () => { const g = _hipGeometry(0.5, 0.25, 1, uv); g.scale(1, 1, 2); g.computeVertexNormals(); return g; });
+function _unitRoofSpec(kind, w, d, ov) { // unit roof geometry + scale/yaw for LOD1..3
+  const a = w + 2 * ov, b = d + 2 * ov;
+  if (kind === 'gableX') return { geo: _unitGableGeo(1.5, 1.5), sx: b, sz: a, yaw: Math.PI / 2 };
+  if (kind === 'hip') return a >= b ? { geo: _unitHipGeo(1.5), sx: a, sz: b, yaw: 0 } : { geo: _unitHipGeo(1.5), sx: b, sz: a, yaw: Math.PI / 2 };
+  return { geo: _unitGableGeo(1.5, 1.5), sx: a, sz: b, yaw: 0 };
+}
+function _blockShell(kind, w, d, wh, rh, ov) { // wall module + roof module (+ yaw for both roof and, via yaw, ridge axis) of one block
+  const fac = (ww, dd) => ({ width: ww, depth: dd, wallHeight: wh, ridgeHeight: rh, overhang: ov, uvFacade: [Math.max(ww, 1) / 2, wh / 2] });
+  if (kind === 'gableX') return { wall: _bodyMod(fac(d, w)), roof: _gableSlopesMod(d, w, rh, ov), yaw: Math.PI / 2 };
+  if (kind === 'hip') return { wall: _geo(`hipbody|${_q(w)}x${_q(wh)}x${_q(d)}`, () => _boxAt(w, wh, d, 0, wh / 2, 0, Math.max(w, 1) / 2, wh / 2)), roof: _hipRoofMod(w, d, rh, ov), yaw: 0 };
+  return { wall: _bodyMod(fac(w, d)), roof: _gableSlopesMod(w, d, rh, ov), yaw: 0 };
+}
+function _applyShape(L, shape, width0) {
+  const ov = L.overhang, wh = L.wallHeight, w = L.width, d = L.depth, pitch = 0.62;
+  const rhFor = (span, k = 1) => Math.max(0.45, pitch * k * (span / 2 + ov));
+  const m = shape === 'Lm' ? -1 : 1, mx = m * (width0 - w) / 2, wings = [], back = (dw) => -d / 2 + 0.03 + dw / 2;
+  let garage = null;
+  L.wings = wings; L.roofKind = 'gableZ'; L.garage = null; L.ridgeHeight = rhFor(w);
+  if (shape === 'sideGable') { L.roofKind = 'gableX'; L.ridgeHeight = rhFor(d); L.dormer = false; }
+  else if (shape === 'hip') { L.roofKind = 'hip'; L.ridgeHeight = rhFor(Math.min(w, d)); L.dormer = false; }
+  else if (shape === 'L' || shape === 'Lm') { // front-facing gable (porch/door) on one side + full-width side-gable wing behind
+    const dw = Math.max(2.4, d * 0.55);
+    wings.push({ cx: -mx, cz: back(dw), w: width0, d: dw, wh, kind: 'gableX', rh: Math.min(rhFor(dw), L.ridgeHeight * 0.92), win: true });
+  } else if (shape === 'cross') {
+    const dw = Math.max(2.4, d * 0.42);
+    wings.push({ cx: 0, cz: -d * 0.06, w: width0, d: dw, wh, kind: 'gableX', rh: Math.min(rhFor(dw), L.ridgeHeight * 0.92), win: true });
+  } else if (shape === 'garage' || shape === 'garageHip') {
+    const hipG = shape === 'garageHip', wg = width0 - w, wgE = wg + 0.1, dg = Math.min(d - 0.4, Math.max(3.0, d * 0.8)), zg = d / 2 - 0.4;
+    const gcx = -m * (w / 2 + wg / 2 - 0.05);
+    if (hipG) { L.roofKind = 'hip'; L.ridgeHeight = rhFor(Math.min(w, d)); L.dormer = false; }
+    wings.push({ cx: gcx, cz: zg - dg / 2, w: wgE, d: dg, wh: wh * 0.86, kind: hipG ? 'hip' : 'gableZ', rh: hipG ? rhFor(Math.min(wgE, dg)) : rhFor(wgE), garageDoor: true });
+    garage = { cx: gcx, zf: zg, w: wgE };
+  } else if (shape === 'modern') { // low-pitch side gable + taller offset mass at the back
+    L.roofKind = 'gableX'; L.ridgeHeight = rhFor(d, 0.4); L.dormer = false;
+    const w2 = width0 * 0.52, dw = Math.max(2.4, d * 0.55);
+    wings.push({ cx: -mx - m * (width0 / 2 - w2 / 2), cz: back(dw), w: w2, d: dw, wh: wh * 1.12, kind: 'gableZ', rh: rhFor(w2, 0.4), win: true });
+  }
+  let x0 = -w / 2, x1 = w / 2, z0 = -d / 2, z1 = d / 2 + L.frontExt;
+  wings.forEach((g) => { x0 = Math.min(x0, g.cx - g.w / 2); x1 = Math.max(x1, g.cx + g.w / 2); z0 = Math.min(z0, g.cz - g.d / 2); z1 = Math.max(z1, g.cz + g.d / 2); });
+  L.shiftX = -(x0 + x1) / 2; L.shiftZ = -(z0 + z1) / 2 + L.frontExt / 2; // parts already carry zs = -frontExt/2
+  if (garage) L.garage = { cx: garage.cx + L.shiftX, zf: garage.zf - L.frontExt / 2 + L.shiftZ, w: garage.w };
+}
+function _wingWindowXs(L, g) { // window centres on the part of a wing's front face that sticks out beside the main block
+  const need = L.winW + 0.5, out = [], a0 = g.cx - g.w / 2, a1 = g.cx + g.w / 2, m0 = -L.width / 2, m1 = L.width / 2;
+  if (m0 - a0 >= need) out.push((a0 + m0) / 2);
+  if (a1 - m1 >= need) out.push((m1 + a1) / 2);
+  return out;
+}
+function _shiftParts(list, L) {
+  if (!L.shiftX && !L.shiftZ) return list;
+  const T = new THREE.Matrix4().makeTranslation(L.shiftX || 0, 0, L.shiftZ || 0);
+  list.forEach((p) => { p.local = new THREE.Matrix4().multiplyMatrices(T, p.local); });
+  return list;
+}
+
 // ---- 9.4 layout (numbers only — exact mirror of the maths in buildLowDensityHouse) --------------
 function _lowDensityLayout(config) {
   // Prompt 24A-R3: the roof now OVERHANGS the walls by a visible eave (0.2 - 0.42 m, grows with lot size) and the
@@ -964,7 +1046,9 @@ function _lowDensityLayout(config) {
   // eave was clamped to ~4 % of the lot (a few cm), which made every house read as a "tofu" block.
   const minCells = Math.min(config.widthCells, config.depthCells);
   const overhang = Math.max(0.2, Math.min(0.42, minCells * 0.09));
-  const width = Math.max(1.4, config.widthCells - 2 * overhang - 0.06);
+  const width0 = Math.max(1.4, config.widthCells - 2 * overhang - 0.06);
+  const shape = config.shape || 'gable';
+  const width = width0 * (SHAPE_WIDTH_FACTOR[shape] || 1); // main block; wings fill the rest of width0
   const depthFull = Math.max(1.6, config.depthCells - 2 * overhang - 0.06);
   const hasPorch = !!(config.porch && config.porch.present && config.depthCells >= 4); // (= old depthFull >= 3.2 test, expressed in cells)
   const porchDepthC = Math.min(1.8, Math.max(0.9, depthFull * 0.3));
@@ -989,6 +1073,7 @@ function _lowDensityLayout(config) {
     const porchWidth = wrap ? Math.min(width + 1.0, config.widthCells - 0.25) : Math.max(1.2, width * 0.55);
     L.porch = { wrap, style: wrap ? 'wraparound' : 'partial', key: wrap ? 'w' : 'p', depth: porchDepthC, width: porchWidth, colCount: wrap ? 6 : 4, uvDeck: [porchWidth / 1.5, porchDepthC / 1.5] };
   }
+  if (shape !== 'gable') _applyShape(L, shape, width0);
   return L;
 }
 // Chimney: top always clears the roof surface at its x by 0.85 m (the legacy formula ended exactly ON the roof
@@ -1000,6 +1085,9 @@ function _chimneySpec(L) {
 }
 
 // ---- 9.5 House Archetypes ----------------------------------------------------------------------
+// 家の実寸倍率: レイアウトは従来どおりロット(w×d)基準で作り、家グループ全体をこの倍率で縮小して描画する。
+// ロット(芝生・フェンス)は縮小しない → 敷地はそのまま、家だけ小さく見えて庭が広くなる。
+export const HOUSE_SCALE = 0.6;
 export const HOUSE_ARCHETYPE_BASES = new Map(LOW_DENSITY_HOUSES.map((h) => [h.id, h]));
 export const HOUSE_ARCHETYPES = new Map();
 const DOOR_PRESETS = ['darkWood', 'rawWoodCedar', 'paintedBlueWood', 'paintedWhiteWood'];
@@ -1052,14 +1140,16 @@ function _lod0Parts(arch) {
   const topY = baseY + wallHeight, fz = depth / 2;
 
   // --- facade / siding, foundation, roof (+ facade-coloured gable ends)
-  add('wall', _bodyMod(L), 'facade', _local(0, baseY, zs), true); // wall box + gable ends
+  const kind = L.roofKind || 'gableZ', shM = _blockShell(kind, width, depth, wallHeight, ridgeHeight, overhang);
+  add('wall', shM.wall, 'facade', _local(0, baseY, zs), true); // wall box + gable ends
   add('foundation', _boxMod(width + 0.2, baseY, depth + 0.2, L.uvFound[0], L.uvFound[1]), 'foundation', _local(0, baseY / 2, zs), true);
-  add('roof', _gableSlopesMod(width, depth, ridgeHeight, overhang), 'roof', _local(0, topY, zs), true);
+  add('roof', shM.roof, 'roof', _local(0, topY, zs, 1, 1, 1, shM.yaw), true);
 
   // --- metal: gutters, downspouts, chimney cap, door handle
   const hw = width / 2 + overhang;
   [-1, 1].forEach((s) => {
-    unit('gutter', 'metal', s * hw, topY + 0.02, 0, 0.07, 0.09, depth + overhang * 2);
+    if (kind === 'gableZ') unit('gutter', 'metal', s * hw, topY + 0.02, 0, 0.07, 0.09, depth + overhang * 2);
+    else unit('gutter', 'metal', 0, topY + 0.02, s * (depth / 2 + overhang), width + overhang * 2, 0.09, 0.07);
     unit('downspout', 'metal', s * (width / 2 + 0.045), baseY + wallHeight / 2, -depth / 2 + 0.06, 0.06, wallHeight, 0.06);
   });
   // --- trim: corner boards
@@ -1109,7 +1199,24 @@ function _lod0Parts(arch) {
     }
     if (p.wrap) [-1, 1].forEach((s) => add('railing', _railMod(_q(p.depth - 0.25)), 'trim', _local(s * (p.width / 2 - 0.05), deckTop, fz + p.depth / 2 - 0.05 + zs, 1, 1, 1, Math.PI / 2), false));
   }
-  return list;
+  // --- wings (shape variants): wall + foundation + roof, garage door / side windows
+  const winAt = (x, z) => {
+    const y = L.winY;
+    unit('winframe', 'trim', x, y, z, L.winW, L.winH, 0.05);
+    unit('glass', 'glass', x, y, z + 0.02, L.glassW, L.glassH, 0.08);
+    unit('mullion', 'trim', x, y, z + 0.06, 0.035, L.glassH, 0.03);
+    unit('mullion', 'trim', x, y, z + 0.06, L.glassW, 0.035, 0.03);
+    unit('sill', 'trim', x, y - L.winH / 2 - 0.03, z + 0.06, L.winW + 0.16, 0.06, 0.16);
+  };
+  (L.wings || []).forEach((g) => {
+    const sh = _blockShell(g.kind, g.w, g.d, g.wh, g.rh, overhang), zF = g.cz + g.d / 2;
+    add('wall', sh.wall, 'facade', _local(g.cx, baseY, g.cz + zs), true);
+    add('foundation', _boxMod(g.w + 0.2, baseY, g.d + 0.2, g.w / 2, 0.5), 'foundation', _local(g.cx, baseY / 2, g.cz + zs), true);
+    add('roof', sh.roof, 'roof', _local(g.cx, baseY + g.wh, g.cz + zs, 1, 1, 1, sh.yaw), true);
+    if (g.garageDoor) unit('door', 'door', g.cx, baseY + 1.05, zF + 0.03, g.w * 0.8, 2.1, 0.08);
+    else if (g.win) _wingWindowXs(L, g).forEach((x) => winAt(x, zF));
+  });
+  return _shiftParts(list, L);
 }
 
 // ---- 9.7 LOD1..3: UNIT geometry + per-part local matrix ---------------------------------------
@@ -1135,10 +1242,11 @@ function _unitParts(arch, lod) {
   const facadeMat = lod === 1 ? pbr(refs.facade) : lod === 2 ? { matKey: `lite:${refs.facade}`, material: getSharedLiteMaterial(refs.facade) } : { matKey: 'flat:white', material: _solid(0xffffff, { roughness: 0.9 }) };
   const roofMat = lod === 1 ? pbr(refs.roof) : lod === 2 ? { matKey: `lite:${refs.roof}`, material: getSharedLiteMaterial(refs.roof) } : { matKey: 'flat:white', material: _solid(0xffffff, { roughness: 0.9 }) };
   const wallColor = lod === 3 ? { color: _flatRGB(refs.facade) } : null, roofColor = lod === 3 ? { color: _flatRGB(refs.roof) } : null;
-  const roofLocal = _local(0, baseY + wallHeight, zs, width + L.overhang * 2, ridgeHeight, depth + L.overhang * 2);
+  const ru = _unitRoofSpec(L.roofKind || 'gableZ', width, depth, L.overhang);
+  const roofLocal = _local(0, baseY + wallHeight, zs, ru.sx, ridgeHeight, ru.sz, ru.yaw);
   if (lod === 1) {
     add('wall', _unitBoxGeo(2, 1.45), facadeMat, _local(0, baseY + wallHeight / 2, zs, width, wallHeight, depth), true);
-    add('roof', _unitGableGeo(1.5, 1.5), roofMat, roofLocal, true);
+    add('roof', ru.geo, roofMat, roofLocal, true);
     add('foundation', _unitBoxGeo(2, 0.5), pbr(refs.foundation), _local(0, baseY / 2, zs, width + 0.2, baseY, depth + 0.2), true);
     if (L.hasPorch) {
       const p = L.porch;
@@ -1153,13 +1261,25 @@ function _unitParts(arch, lod) {
   } else { // LOD2 / LOD3: body reaches the ground (no foundation part), roof, (LOD2) porch roof
     const h = baseY + wallHeight;
     add('wall', _unitBoxGeo(2, 1.6), facadeMat, _local(0, h / 2, zs, width, h, depth), true, wallColor);
-    add('roof', _unitGableGeo(1.5, 1.5), roofMat, roofLocal, true, roofColor);
+    add('roof', ru.geo, roofMat, roofLocal, true, roofColor);
     if (lod === 2 && L.hasPorch) {
       const p = L.porch;
       add('porchroof', _unitBoxGeo(1.5, 1.5), roofMat, _local(0, baseY + 2.4, depth / 2 + p.depth / 2 + zs, Math.min(p.width + 0.3, L.widthCells), 0.12, p.depth + 0.3), true);
     }
   }
-  return list;
+  (L.wings || []).forEach((g) => { // shape-variant wings
+    const r2 = _unitRoofSpec(g.kind, g.w, g.d, L.overhang), gh = baseY + g.wh, rl = _local(g.cx, gh, g.cz + zs, r2.sx, g.rh, r2.sz, r2.yaw);
+    if (lod === 1) {
+      add('wall', _unitBoxGeo(2, 1.45), facadeMat, _local(g.cx, baseY + g.wh / 2, g.cz + zs, g.w, g.wh, g.d), true);
+      add('roof', r2.geo, roofMat, rl, true);
+      add('foundation', _unitBoxGeo(2, 0.5), pbr(refs.foundation), _local(g.cx, baseY / 2, g.cz + zs, g.w + 0.2, baseY, g.d + 0.2), true);
+      if (g.garageDoor) add('door', _unitBox(), { matKey: `flat:${refs.door}`, material: _flatMaterial(refs.door) }, _local(g.cx, baseY + 1.05, g.cz + g.d / 2 + 0.02 + zs, g.w * 0.8, 2.1, 0.08), false);
+    } else {
+      add('wall', _unitBoxGeo(2, 1.6), facadeMat, _local(g.cx, gh / 2, g.cz + zs, g.w, gh, g.d), true, wallColor);
+      add('roof', r2.geo, roofMat, rl, true, roofColor);
+    }
+  });
+  return _shiftParts(list, L);
 }
 
 // ---- 9.8 LOT DRESSING: front yard (lawn + path) and the fence / wall around the whole lot ----------------
@@ -1185,22 +1305,26 @@ function _lotParts(arch, Y, lod) {
   const solid = (hex, o) => ({ matKey: `solid:${hex}`, material: _solid(hex, o) });
   const add = (part, g, mat, local) => list.push({ part, geoKey: g.key, geometry: g.geometry, ...mat, local, tinted: false });
   const zF = D / 2, zB = -D / 2, zLot = zF + Y;            // lot edges in house-local Z (front edge = road side)
-  if (Y > 0) add('lawn', U, solid(0x5c8447, { roughness: 0.95 }), _local(0, -0.15, zF + Y / 2, W, 0.36, Y)); // top surface at y = +0.03
+  add('lawn', U, solid(0x5c8447, { roughness: 0.95 }), _local(0, -0.15, (zB + zLot) / 2, W, 0.36, D + Y)); // whole lot (house is scaled down inside it); top surface at y = +0.03
   if (lod >= 2) return list;
 
   const wall = String(refs.facade).startsWith('plaster');   // stucco houses get a low masonry wall, wood houses a picket fence
   const style = wall ? 'wall' : 'picket';
   const fenceMat = wall ? solid(FLAT_COLOR[refs.facade] ?? 0xd8d2c4, { roughness: 0.9 }) : solid(refs.trim, { roughness: 0.65 });
   const xL = -W / 2 + 0.06, xR = W / 2 - 0.06, zBk = zB + 0.06, zFr = zLot - 0.06;
-  const gateX = L.hasPorch ? 0 : L.doorX, gate = 0.65;
+  const gateX = ((L.hasPorch ? 0 : L.doorX) + (L.shiftX || 0)) * HOUSE_SCALE, gate = 0.65;
   const runs = [[xL, zBk, xL, zFr], [xR, zBk, xR, zFr], [xL, zBk, xR, zBk]];
-  if (gateX - gate > xL + 0.3) runs.push([xL, zFr, gateX - gate, zFr]);
-  if (gateX + gate < xR - 0.3) runs.push([gateX + gate, zFr, xR, zFr]);
+  const gaps = [[gateX - gate, gateX + gate]]; // front fence openings: pedestrian gate (+ driveway for garage houses)
+  if (L.garage) { const hgw = L.garage.w * 0.45 * HOUSE_SCALE + 0.1, gx = L.garage.cx * HOUSE_SCALE; gaps.push([gx - hgw, gx + hgw]); }
+  gaps.sort((a, b) => a[0] - b[0]);
+  let fcur = xL;
+  gaps.forEach(([g0, g1]) => { if (g0 - fcur > 0.3) runs.push([fcur, zFr, g0, zFr]); fcur = Math.max(fcur, g1); });
+  if (xR - fcur > 0.3) runs.push([fcur, zFr, xR, zFr]);
 
   if (lod === 1) { // distant view: one thin board per run
     runs.forEach(([x0, z0, x1, z1]) => {
       const len = Math.hypot(x1 - x0, z1 - z0); if (len < 0.3) return;
-      add('fence', U, fenceMat, _local((x0 + x1) / 2, 0.25, (z0 + z1) / 2, z0 === z1 ? len : 0.05, 0.5, z0 === z1 ? 0.05 : len));
+      add('fence', U, fenceMat, _local((x0 + x1) / 2, 0.25 * HOUSE_SCALE, (z0 + z1) / 2, z0 === z1 ? len : 0.05, 0.5 * HOUSE_SCALE, z0 === z1 ? 0.05 : len));
     });
     return list;
   }
@@ -1208,16 +1332,20 @@ function _lotParts(arch, Y, lod) {
   runs.forEach(([x0, z0, x1, z1]) => {
     const len = Math.hypot(x1 - x0, z1 - z0); if (len < 0.3) return;
     const n = Math.max(1, Math.ceil(len / FENCE_SEG)), seg = len / n, yaw = z0 === z1 ? 0 : Math.PI / 2;
-    for (let i = 0; i < n; i++) { const t = (i + 0.5) / n; add('fence', _fencePanelMod(seg, style), fenceMat, _local(x0 + (x1 - x0) * t, 0, z0 + (z1 - z0) * t, 1, 1, 1, yaw)); }
+    for (let i = 0; i < n; i++) { const t = (i + 0.5) / n; add('fence', _fencePanelMod(seg, style), fenceMat, _local(x0 + (x1 - x0) * t, 0, z0 + (z1 - z0) * t, 1, HOUSE_SCALE, 1, yaw)); }
     for (let i = 0; i <= n; i++) {
       const px = x0 + (x1 - x0) * i / n, pz = z0 + (z1 - z0) * i / n, k = `${px.toFixed(2)}|${pz.toFixed(2)}`;
       if (seen.has(k)) continue; seen.add(k);
-      add('fencepost', U, fenceMat, _local(px, 0.55, pz, 0.1, 1.1, 0.1));
+      add('fencepost', U, fenceMat, _local(px, 0.55 * HOUSE_SCALE, pz, 0.1, 1.1 * HOUSE_SCALE, 0.1));
     }
   });
   // stone path from the gate to the steps / door
-  const zStart = L.depth / 2 + L.frontExt / 2, plen = zFr - zStart;
+  const zStart = (L.depth / 2 + L.frontExt / 2 + (L.shiftZ || 0)) * HOUSE_SCALE, plen = zFr - zStart;
   if (Y > 0.3 && plen > 0.2) add('path', U, solid(0xb0a999, { roughness: 0.9 }), _local(gateX, -0.005, zStart + plen / 2, 1.0, 0.1, plen));
+  if (L.garage && Y > 0.3) { // driveway from the lot edge to the garage door
+    const g = L.garage, gz = g.zf * HOUSE_SCALE, dl = zFr - gz;
+    if (dl > 0.2) add('path', U, solid(0x8b857a, { roughness: 0.9 }), _local(g.cx * HOUSE_SCALE, -0.005, gz + dl / 2, g.w * 0.85 * HOUSE_SCALE, 0.1, dl));
+  }
   return list;
 }
 /** Lot dressing (yard + fence) for an archetype: cached per (yardDepth, LOD). Same part shape as getHouseLodParts. */
