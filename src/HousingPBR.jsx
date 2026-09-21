@@ -997,29 +997,33 @@ function _blockShell(kind, w, d, wh, rh, ov) { // wall module + roof module (+ y
   return { wall: _bodyMod(fac(w, d)), roof: _gableSlopesMod(w, d, rh, ov), yaw: 0 };
 }
 function _applyShape(L, shape, width0) {
-  const ov = L.overhang, wh = L.wallHeight, w = L.width, d = L.depth, pitch = 0.62;
+  // Main block keeps its porch/door/windows. Wings extend BACKWARD (and sideways) from it, so the porch side is never covered.
+  const ov = L.overhang, wh = L.wallHeight, w = L.width, pitch = 0.62, dm0 = L.depth;
   const rhFor = (span, k = 1) => Math.max(0.45, pitch * k * (span / 2 + ov));
-  const m = shape === 'Lm' ? -1 : 1, mx = m * (width0 - w) / 2, wings = [], back = (dw) => -d / 2 + 0.03 + dw / 2;
+  const m = shape === 'Lm' ? -1 : 1, mx = m * (width0 - w) / 2, wings = [];
+  const twoMass = shape === 'L' || shape === 'Lm' || shape === 'cross' || shape === 'modern';
+  if (twoMass || shape === 'garage' || shape === 'garageHip') { L.depth = Math.max(1.8, dm0 * 0.85); L.uvRoof = [Math.max(w, 1) / 3, Math.max(L.depth, 1) / 3]; }
+  const d = L.depth, ext = Math.max(0.9, dm0 * 0.4), inn = Math.max(0.8, d * 0.45);
   let garage = null;
   L.wings = wings; L.roofKind = 'gableZ'; L.garage = null; L.ridgeHeight = rhFor(w);
+  const mainRh = L.ridgeHeight;
   if (shape === 'sideGable') { L.roofKind = 'gableX'; L.ridgeHeight = rhFor(d); L.dormer = false; }
   else if (shape === 'hip') { L.roofKind = 'hip'; L.ridgeHeight = rhFor(Math.min(w, d)); L.dormer = false; }
   else if (shape === 'L' || shape === 'Lm') { // front-facing gable (porch/door) on one side + full-width side-gable wing behind
-    const dw = Math.max(2.4, d * 0.55);
-    wings.push({ cx: -mx, cz: back(dw), w: width0, d: dw, wh, kind: 'gableX', rh: Math.min(rhFor(dw), L.ridgeHeight * 0.92), win: true });
-  } else if (shape === 'cross') {
-    const dw = Math.max(2.4, d * 0.42);
-    wings.push({ cx: 0, cz: -d * 0.06, w: width0, d: dw, wh, kind: 'gableX', rh: Math.min(rhFor(dw), L.ridgeHeight * 0.92), win: true });
+    const dw = ext + inn;
+    wings.push({ cx: -mx, cz: -d / 2 - ext + dw / 2, w: width0, d: dw, wh, kind: 'gableX', rh: Math.min(rhFor(dw), mainRh * 0.9), win: true });
+  } else if (shape === 'cross') { // side-gable wing crossing behind the front gable
+    const dw = ext + d - 0.35;
+    wings.push({ cx: 0, cz: -d / 2 - ext + dw / 2, w: width0, d: dw, wh, kind: 'gableX', rh: Math.min(rhFor(dw), mainRh * 0.9), win: true });
   } else if (shape === 'garage' || shape === 'garageHip') {
-    const hipG = shape === 'garageHip', wg = width0 - w, wgE = wg + 0.1, dg = Math.min(d - 0.4, Math.max(3.0, d * 0.8)), zg = d / 2 - 0.4;
-    const gcx = -m * (w / 2 + wg / 2 - 0.05);
+    const hipG = shape === 'garageHip', wg = width0 - w, wgE = wg + 0.1, dg = d + 0.6, zg = d / 2, gcx = -m * (w / 2 + wg / 2 - 0.05);
     if (hipG) { L.roofKind = 'hip'; L.ridgeHeight = rhFor(Math.min(w, d)); L.dormer = false; }
-    wings.push({ cx: gcx, cz: zg - dg / 2, w: wgE, d: dg, wh: wh * 0.86, kind: hipG ? 'hip' : 'gableZ', rh: hipG ? rhFor(Math.min(wgE, dg)) : rhFor(wgE), garageDoor: true });
+    wings.push({ cx: gcx, cz: zg - dg / 2, w: wgE, d: dg, wh: wh * 0.86, kind: hipG ? 'hip' : 'gableZ', rh: hipG ? rhFor(Math.min(wgE, dg)) : Math.min(rhFor(wgE), mainRh * 0.9), garageDoor: true });
     garage = { cx: gcx, zf: zg, w: wgE };
   } else if (shape === 'modern') { // low-pitch side gable + taller offset mass at the back
-    L.roofKind = 'gableX'; L.ridgeHeight = rhFor(d, 0.4); L.dormer = false;
-    const w2 = width0 * 0.52, dw = Math.max(2.4, d * 0.55);
-    wings.push({ cx: -mx - m * (width0 / 2 - w2 / 2), cz: back(dw), w: w2, d: dw, wh: wh * 1.12, kind: 'gableZ', rh: rhFor(w2, 0.4), win: true });
+    L.roofKind = 'gableX'; L.ridgeHeight = rhFor(d, 0.4);
+    const w2 = width0 * 0.52, dw = ext + inn;
+    wings.push({ cx: -mx - m * (width0 / 2 - w2 / 2), cz: -d / 2 - ext + dw / 2, w: w2, d: dw, wh: wh * 1.12, kind: 'gableZ', rh: rhFor(w2, 0.4), win: true });
   }
   let x0 = -w / 2, x1 = w / 2, z0 = -d / 2, z1 = d / 2 + L.frontExt;
   wings.forEach((g) => { x0 = Math.min(x0, g.cx - g.w / 2); x1 = Math.max(x1, g.cx + g.w / 2); z0 = Math.min(z0, g.cz - g.d / 2); z1 = Math.max(z1, g.cz + g.d / 2); });
@@ -1141,7 +1145,7 @@ function _lod0Parts(arch) {
 
   // --- facade / siding, foundation, roof (+ facade-coloured gable ends)
   const kind = L.roofKind || 'gableZ', shM = _blockShell(kind, width, depth, wallHeight, ridgeHeight, overhang);
-  add('wall', shM.wall, 'facade', _local(0, baseY, zs), true); // wall box + gable ends
+  add('wall', shM.wall, 'facade', _local(0, baseY, zs, 1, 1, 1, shM.yaw), true); // wall box + gable ends
   add('foundation', _boxMod(width + 0.2, baseY, depth + 0.2, L.uvFound[0], L.uvFound[1]), 'foundation', _local(0, baseY / 2, zs), true);
   add('roof', shM.roof, 'roof', _local(0, topY, zs, 1, 1, 1, shM.yaw), true);
 
@@ -1210,7 +1214,7 @@ function _lod0Parts(arch) {
   };
   (L.wings || []).forEach((g) => {
     const sh = _blockShell(g.kind, g.w, g.d, g.wh, g.rh, overhang), zF = g.cz + g.d / 2;
-    add('wall', sh.wall, 'facade', _local(g.cx, baseY, g.cz + zs), true);
+    add('wall', sh.wall, 'facade', _local(g.cx, baseY, g.cz + zs, 1, 1, 1, sh.yaw), true);
     add('foundation', _boxMod(g.w + 0.2, baseY, g.d + 0.2, g.w / 2, 0.5), 'foundation', _local(g.cx, baseY / 2, g.cz + zs), true);
     add('roof', sh.roof, 'roof', _local(g.cx, baseY + g.wh, g.cz + zs, 1, 1, 1, sh.yaw), true);
     if (g.garageDoor) unit('door', 'door', g.cx, baseY + 1.05, zF + 0.03, g.w * 0.8, 2.1, 0.08);
