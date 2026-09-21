@@ -5,7 +5,8 @@ import { buildTerraceHouse, getTerraceHouseConfig, TERRACE_HOUSES, buildLowDensi
 import { createHouseInstanceRenderer } from './HouseInstanceRenderer.jsx';
 const HOUSE_RENDERER_IS_DEV = (() => { try { return !!(import.meta && import.meta.env && import.meta.env.DEV); } catch (e) { return false; } })();
 
-const GRID_SIZE = 64;
+const GRID_SIZE = 192; // Prompt 25: 3x per axis (was 64) -> 1152 m x 1152 m
+const VIEW_GRID_SIZE = 64; // the ORIGINAL 64-tile size — camera framing / sun shadow extent stay tuned to this so zoom feels unchanged
 const TILE = 6;
 const MAX_LEVEL = 3;
 const GROW_CHANCE = 0.16;
@@ -23,7 +24,7 @@ const TILE_IND = 4;
 // written to only via applyTool's existing zone_res/com/ind branch (see projectMicroZoneToTileCache
 // further down, Part M — one direction only, Micro Zone → Tile cache, never the reverse).
 const MICRO_TILE = TILE / 6; // 1m
-const MICRO_GRID_SIZE = GRID_SIZE * 6; // 384 micro cells per axis
+const MICRO_GRID_SIZE = GRID_SIZE * 6; // 1152 micro cells per axis (Prompt 25: map is 3x)
 const MAP_HALF = (GRID_SIZE * TILE) / 2; // 192 — world spans [-MAP_HALF, +MAP_HALF) on X and Z
 // Education facilities are NOT a zone type (isZoneType() below intentionally excludes this) — a
 // dedicated grid value keeps them out of zone painting/dezoning/growth entirely while still
@@ -115,101 +116,212 @@ const CAR_GROUND_Y = ROAD_TOP_Y; // vehicles rest on the actual road surface, no
 const PED_GROUND_Y = SIDEWALK_TOP_Y; // pedestrians rest on the actual sidewalk surface
 const PED_SCALE = 0.5;
 
-// -- terrain layer (Prompt 16 of the Tile->World Space migration: Real Terrain Heightfield) --
+// -- terrain layer (Prompt 25: 3x map / mountains / rivers / sea / road grading) --------------
 // terrainHeight/terrainNormal/terrainSlope remain the Single Source of Truth for elevation
-// everywhere in the game (roads, Ground mesh, buildings, Citizens, vehicles, pedestrians) — every
-// call site above/below already goes through them (see the flat-stub comment this replaces), so
-// nothing about THIS Prompt touches road routing, building placement, or Citizen simulation; it
-// only gives these three functions a real body.
+// everywhere in the game (roads, Ground mesh, buildings, Citizens, vehicles, pedestrians).
 //
-// Height comes from a small, dependency-free 2-octave deterministic value-noise heightfield —
-// no external noise library, no per-frame recomputation. A (GRID_SIZE+1)x(GRID_SIZE+1) lattice
-// (one sample per Tile corner — plenty fine relative to the noise's own wavelength) is
-// precomputed ONCE at module load (requirement #9/#10: never re-walked per render frame) and
-// every terrainHeight() call for a coordinate inside the map simply bilinearly interpolates that
-// cached lattice — cheap array reads, not a noise re-evaluation, and (because the Ground mesh
-// below samples this exact same lattice at its own vertices) the visible terrain and every
-// gameplay height query are always pixel-for-pixel the same surface (requirement: Ground geometry
-// matches terrainHeight). A coordinate that falls outside the cached map extent (free camera pan,
-// a Free Road dragged past the border, etc.) transparently falls back to evaluating the same
-// deterministic noise function directly — so sampling stays continuous and seamless everywhere,
-// not just within the Tile grid (requirement #8), it just isn't cache-accelerated out there.
-const TERRAIN_SEED = 133742; // fixed constant -> the exact same terrain shape every run/session (requirement #4)
+// Two layers now stand behind terrainHeight():
+//   1. BASE terrain  — a deterministic, dependency-free procedural heightfield (rolling hills +
+//      mountain ranges + a sea on the east coast + two rivers), baked ONCE at module load into a
+//      TERRAIN_STEP (2 m) lattice. It never changes at run time.
+//   2. GRADED terrain — a copy of the base lattice that road construction edits. Every road that
+//      lies flat on the ground (elevation 0) levels a corridor of ground for itself: where the
+//      hillside is higher than the road it is CUT into a steep cliff face, where it is lower the
+//      road sits on an embankment. The road's own height comes from roadGradeHeight() — a smoothed,
+//      clamped copy of the base terrain — so where the land is too rough to cut through, the road
+//      simply bends up and down along the ground instead. terrainHeight() reads the graded lattice,
+//      so roads, houses, cars and the ground mesh all see the same surface.
+// Grading is recomputed per 72 m chunk, only for chunks whose set of nearby roads changed (see
+// terrainRegrade below), never per frame.
+const WORLD_SIZE = GRID_SIZE * TILE; // 1152 m per axis
+const WATER_LEVEL = 0; // sea / river surface (world Y)
+const TERRAIN_MAX_PICK_Y = 110; // pointer picking starts marching from this height (highest peak ~76 m + margin)
+const ROAD_MIN_Y = WATER_LEVEL + 1.4; // a road never sinks below this: over water it becomes a bridge deck
+const TERRAIN_STEP = 2; // lattice spacing in metres
+const TERRAIN_CELLS = WORLD_SIZE / TERRAIN_STEP; // 576
+const TERRAIN_N = TERRAIN_CELLS + 1; // 577 lattice points per axis
+const TERRAIN_HALF = WORLD_SIZE / 2;
+const TERRAIN_CHUNK_CELLS = 36; // 72 m = 12 Tiles per chunk
+const TERRAIN_CHUNKS = TERRAIN_CELLS / TERRAIN_CHUNK_CELLS; // 16 per axis
+const TERRAIN_SEED = 133742; // fixed constant -> the exact same world every run
 
-// Deterministic integer hash -> a pseudo-random value in [-1, 1], purely a function of the
-// lattice cell (ix, iz) and TERRAIN_SEED — no Math.random anywhere in this pipeline, so re-running
-// the game (or re-sampling the same coordinate a thousand times) always agrees exactly.
-function _terrainHash2(ix, iz) {
-  let h = (ix * 374761393 + iz * 668265263 + TERRAIN_SEED * 2654435761) | 0;
+function _terrainHash2(ix, iz, salt) {
+  let h = (Math.imul(ix, 374761393) + Math.imul(iz, 668265263) + Math.imul(TERRAIN_SEED + salt * 7919, 2654435761)) | 0;
   h = Math.imul(h ^ (h >>> 13), 1274126177);
   h = h ^ (h >>> 16);
   return ((h >>> 0) / 4294967295) * 2 - 1; // -1..1
 }
-function _terrainSmooth(t) { return t * t * (3 - 2 * t); } // smoothstep easing between lattice cells
-// One octave of bilinear-interpolated value noise. `cell` is the world-unit size of one noise
-// lattice cell — a large cell gives broad, gentle undulation; a small one gives finer detail.
-function _terrainValueNoise(x, z, cell) {
+function _terrainFade(t) { return t * t * t * (t * (t * 6 - 15) + 10); } // quintic ease
+function _terrainSst(a, b, x) { const t = Math.max(0, Math.min(1, (x - a) / (b - a))); return t * t * (3 - 2 * t); }
+// One octave of bilinear value noise (-1..1); `cell` = world metres per lattice cell.
+function _terrainNoise(x, z, cell, salt) {
   const gx = x / cell, gz = z / cell;
   const ix = Math.floor(gx), iz = Math.floor(gz);
-  const fx = _terrainSmooth(gx - ix), fz = _terrainSmooth(gz - iz);
-  const v00 = _terrainHash2(ix, iz), v10 = _terrainHash2(ix + 1, iz);
-  const v01 = _terrainHash2(ix, iz + 1), v11 = _terrainHash2(ix + 1, iz + 1);
-  const a = v00 + (v10 - v00) * fx;
-  const b = v01 + (v11 - v01) * fx;
+  const fx = _terrainFade(gx - ix), fz = _terrainFade(gz - iz);
+  const v00 = _terrainHash2(ix, iz, salt), v10 = _terrainHash2(ix + 1, iz, salt);
+  const v01 = _terrainHash2(ix, iz + 1, salt), v11 = _terrainHash2(ix + 1, iz + 1, salt);
+  const a = v00 + (v10 - v00) * fx, b = v01 + (v11 - v01) * fx;
   return a + (b - a) * fz;
 }
-// Two gentle octaves summed (requirement #5: rolling hills, never extreme relief) — a broad,
-// sweeping undulation plus a smaller, subtler layer of detail on top of it. The detail octave is
-// sampled at an offset coordinate purely so its lattice doesn't line up with the broad octave's.
-const TERRAIN_BASE_AMPLITUDE = 3.2; // world-unit height range of the broad octave
-const TERRAIN_DETAIL_AMPLITUDE = 0.9; // world-unit height range of the finer octave
-const TERRAIN_BASE_CELL = 140; // world units per broad noise cell (large -> gentle, sweeping hills)
-const TERRAIN_DETAIL_CELL = 46; // world units per fine noise cell (adds subtle rolling detail)
-function _terrainRawHeight(x, z) {
-  const broad = _terrainValueNoise(x, z, TERRAIN_BASE_CELL) * TERRAIN_BASE_AMPLITUDE;
-  const detail = _terrainValueNoise(x + 1000.7, z - 500.3, TERRAIN_DETAIL_CELL) * TERRAIN_DETAIL_AMPLITUDE;
-  return broad + detail;
+
+// ---- rivers -------------------------------------------------------------------------------
+// Two rivers, authored as waypoint polylines, Catmull-Rom smoothed, given a gentle meander, and
+// rasterised ONCE into a coarse distance field (RIVER_GRID_STEP) so the per-lattice-point carve is
+// a cheap lookup. hw0/hw1 = channel half-width at the source / at the river mouth.
+const TERRAIN_RIVERS = [
+  { hw0: 8, hw1: 16, pts: [[140, -590], [105, -450], [185, -350], [125, -250], [55, -150], [130, -60], [250, 0], [340, 40], [470, 35]] },
+  { hw0: 7, hw1: 15, pts: [[-130, 590], [-55, 470], [45, 400], [25, 300], [110, 235], [225, 205], [335, 265], [470, 285]] },
+];
+const RIVER_BANK = 26; // metres of valley slope on each side of the channel
+const RIVER_BED_Y = WATER_LEVEL - 2.6;
+const RIVER_GRID_STEP = 4;
+const RIVER_GRID_N = Math.round(WORLD_SIZE / RIVER_GRID_STEP) + 1;
+function _buildRiverField() {
+  const dist = new Float32Array(RIVER_GRID_N * RIVER_GRID_N).fill(1e9);
+  const hwField = new Float32Array(RIVER_GRID_N * RIVER_GRID_N);
+  TERRAIN_RIVERS.forEach((river, ri) => {
+    const P = river.pts;
+    // Catmull-Rom dense sampling (~4 m)
+    const dense = [];
+    for (let i = 0; i < P.length - 1; i++) {
+      const p0 = P[Math.max(0, i - 1)], p1 = P[i], p2 = P[i + 1], p3 = P[Math.min(P.length - 1, i + 2)];
+      const segLen = Math.hypot(p2[0] - p1[0], p2[1] - p1[1]);
+      const n = Math.max(2, Math.ceil(segLen / 4));
+      for (let k = 0; k < n; k++) {
+        const t = k / n, t2 = t * t, t3 = t2 * t;
+        const x = 0.5 * ((2 * p1[0]) + (-p0[0] + p2[0]) * t + (2 * p0[0] - 5 * p1[0] + 4 * p2[0] - p3[0]) * t2 + (-p0[0] + 3 * p1[0] - 3 * p2[0] + p3[0]) * t3);
+        const z = 0.5 * ((2 * p1[1]) + (-p0[1] + p2[1]) * t + (2 * p0[1] - 5 * p1[1] + 4 * p2[1] - p3[1]) * t2 + (-p0[1] + 3 * p1[1] - 3 * p2[1] + p3[1]) * t3);
+        dense.push([x, z]);
+      }
+    }
+    dense.push(P[P.length - 1].slice());
+    // meander perpendicular to the local direction; fades out at both ends so the mouth/source stay put
+    let arc = 0;
+    const pts = dense.map((p, i) => {
+      const q = dense[Math.min(dense.length - 1, i + 1)], r = dense[Math.max(0, i - 1)];
+      let tx = q[0] - r[0], tz = q[1] - r[1]; const tl = Math.hypot(tx, tz) || 1; tx /= tl; tz /= tl;
+      if (i > 0) arc += Math.hypot(p[0] - dense[i - 1][0], p[1] - dense[i - 1][1]);
+      const fade = Math.min(1, i / 25, (dense.length - 1 - i) / 25);
+      const off = Math.sin(arc / 62 + ri * 2.1) * 13 * fade;
+      return { x: p[0] - tz * off, z: p[1] + tx * off, u: i / (dense.length - 1) };
+    });
+    pts.forEach((p) => {
+      const hw = river.hw0 + (river.hw1 - river.hw0) * p.u;
+      const R = hw + RIVER_BANK + RIVER_GRID_STEP;
+      const gx0 = Math.max(0, Math.floor((p.x - R + TERRAIN_HALF) / RIVER_GRID_STEP)), gx1 = Math.min(RIVER_GRID_N - 1, Math.ceil((p.x + R + TERRAIN_HALF) / RIVER_GRID_STEP));
+      const gz0 = Math.max(0, Math.floor((p.z - R + TERRAIN_HALF) / RIVER_GRID_STEP)), gz1 = Math.min(RIVER_GRID_N - 1, Math.ceil((p.z + R + TERRAIN_HALF) / RIVER_GRID_STEP));
+      for (let gz = gz0; gz <= gz1; gz++) for (let gx = gx0; gx <= gx1; gx++) {
+        const wx = -TERRAIN_HALF + gx * RIVER_GRID_STEP, wz = -TERRAIN_HALF + gz * RIVER_GRID_STEP;
+        const d = Math.hypot(wx - p.x, wz - p.z);
+        const k = gz * RIVER_GRID_N + gx;
+        if (d < dist[k]) { dist[k] = d; hwField[k] = hw; }
+      }
+    });
+  });
+  return { dist, hwField };
+}
+const _riverField = _buildRiverField();
+function _riverSample(arr, x, z) {
+  const gx = (x + TERRAIN_HALF) / RIVER_GRID_STEP, gz = (z + TERRAIN_HALF) / RIVER_GRID_STEP;
+  const ix = Math.max(0, Math.min(RIVER_GRID_N - 2, Math.floor(gx))), iz = Math.max(0, Math.min(RIVER_GRID_N - 2, Math.floor(gz)));
+  const fx = Math.max(0, Math.min(1, gx - ix)), fz = Math.max(0, Math.min(1, gz - iz));
+  const a = arr[iz * RIVER_GRID_N + ix], b = arr[iz * RIVER_GRID_N + ix + 1];
+  const c = arr[(iz + 1) * RIVER_GRID_N + ix], d = arr[(iz + 1) * RIVER_GRID_N + ix + 1];
+  return (a + (b - a) * fx) * (1 - fz) + (c + (d - c) * fx) * fz;
 }
 
-// -- precomputed heightfield cache (requirement #9/#10) --
-// One sample per Tile corner across the whole map — built exactly once at module load, never
-// touched again by render/game logic. GRID_SIZE/TILE are load-time constants, so this can live at
-// module scope alongside the pure terrain functions themselves (no React lifecycle needed).
-const TERRAIN_CACHE_N = GRID_SIZE + 1;
-const TERRAIN_CACHE_HALF = (GRID_SIZE * TILE) / 2;
-function _buildTerrainHeightCache() {
-  const data = new Float32Array(TERRAIN_CACHE_N * TERRAIN_CACHE_N);
-  for (let gz = 0; gz < TERRAIN_CACHE_N; gz++) {
-    for (let gx = 0; gx < TERRAIN_CACHE_N; gx++) {
-      const x = -TERRAIN_CACHE_HALF + gx * TILE;
-      const z = -TERRAIN_CACHE_HALF + gz * TILE;
-      data[gz * TERRAIN_CACHE_N + gx] = _terrainRawHeight(x, z);
+// ---- procedural base height ----------------------------------------------------------------
+const TERRAIN_LAND_BASE = 5.5; // typical lowland height above the water surface
+// Rotated multi-octave value noise (each octave is turned ~37 deg) — keeps hills and mountains from
+// showing the axis-aligned "boxy" look plain value noise has.
+function _terrainFbm(x, z, cell, salt, oct) {
+  let amp = 1, sum = 0, norm = 0, c = cell, rx = x, rz = z;
+  for (let o = 0; o < oct; o++) {
+    sum += amp * _terrainNoise(rx, rz, c, salt + o * 13);
+    norm += amp; amp *= 0.5; c *= 0.5;
+    const nx = rx * 0.8 - rz * 0.6 + 173.3, nz = rx * 0.6 + rz * 0.8 - 91.7;
+    rx = nx; rz = nz;
+  }
+  return sum / norm;
+}
+// The starting area (highway gate + interchange + first city blocks) is deliberately gentle so the
+// player's first roads are buildable; relief ramps up to full strength away from it.
+const TERRAIN_START_BOX = { cx: -300, cz: 3, hx: 340, hz: 185 };
+function _terrainProcedural(x, z) {
+  const b = TERRAIN_START_BOX;
+  const qx = Math.max(0, Math.abs(x - b.cx) - b.hx), qz = Math.max(0, Math.abs(z - b.cz) - b.hz);
+  const sd = _terrainSst(0, 230, Math.hypot(qx, qz)); // 0 inside the start zone -> 1 far away from it
+  const Fh = 0.3 + 0.7 * sd; // hills: gentle (30 %) inside the start zone
+  const Fm = sd * sd; // mountains: none inside the start zone, full strength far away
+  // rolling hills: broad swells + mid bumps + fine roughness
+  const hills = _terrainFbm(x, z, 210, 1, 3) * 8.5 + _terrainFbm(x + 311, z - 97, 60, 5, 2) * 1.6;
+  // mountain ranges: a broad mask picks WHERE, a domain-warped ridged noise shapes the peaks; the
+  // far north and south of the map are always mountainous.
+  const wx = x + 110 * _terrainNoise(x, z, 260, 40), wz = z + 110 * _terrainNoise(x, z, 260, 41);
+  const mMask = Math.max(
+    _terrainSst(0.56, 0.86, _terrainFbm(wx, wz, 400, 21, 2) * 0.5 + 0.5),
+    _terrainSst(-230, -500, z + 130 * _terrainFbm(x, z, 230, 42, 3)) * 0.95,
+    _terrainSst(290, 520, z + 130 * _terrainFbm(x, z, 230, 43, 3)) * 0.75,
+  );
+  const ridge = 1 - Math.abs(_terrainFbm(wx + 90, wz - 40, 170, 22, 3));
+  const mountain = mMask * (14 + 58 * (0.2 + 0.8 * ridge * ridge * ridge));
+  let h = TERRAIN_LAND_BASE + hills * Fh + mountain * Fm;
+  // sea on the east coast
+  const coastX = 405 + _terrainNoise(0, z, 180, 31) * 45 + _terrainNoise(0, z, 70, 32) * 22;
+  const seaT = _terrainSst(coastX - 30, coastX + 70, x);
+  h = h * (1 - seaT) + (-14) * seaT;
+  // rivers: carve a smooth valley down to the river bed
+  if (x > -TERRAIN_HALF - 60 && x < TERRAIN_HALF + 60 && z > -TERRAIN_HALF - 60 && z < TERRAIN_HALF + 60) {
+    const d = _riverSample(_riverField.dist, x, z);
+    if (d < 400) {
+      const hw = _riverSample(_riverField.hwField, x, z);
+      if (d < hw + RIVER_BANK && h > RIVER_BED_Y) {
+        const t = 1 - _terrainSst(hw * 0.75, hw + RIVER_BANK, d);
+        h = h + (RIVER_BED_Y - h) * t;
+      }
+    }
+  }
+  return h;
+}
+function _buildTerrainBaseField() {
+  const data = new Float32Array(TERRAIN_N * TERRAIN_N);
+  for (let gz = 0; gz < TERRAIN_N; gz++) {
+    for (let gx = 0; gx < TERRAIN_N; gx++) {
+      data[gz * TERRAIN_N + gx] = _terrainProcedural(-TERRAIN_HALF + gx * TERRAIN_STEP, -TERRAIN_HALF + gz * TERRAIN_STEP);
     }
   }
   return data;
 }
-const _terrainHeightCache = _buildTerrainHeightCache();
+const _terrainBaseField = _buildTerrainBaseField(); // immutable
+const _terrainField = new Float32Array(_terrainBaseField); // graded copy (mutated by terrainRegrade)
 
-function terrainHeight(x, z) {
-  const gx = (x + TERRAIN_CACHE_HALF) / TILE;
-  const gz = (z + TERRAIN_CACHE_HALF) / TILE;
+function _terrainLookup(field, x, z) {
+  const gx = (x + TERRAIN_HALF) / TERRAIN_STEP, gz = (z + TERRAIN_HALF) / TERRAIN_STEP;
   const ix = Math.floor(gx), iz = Math.floor(gz);
-  if (ix < 0 || iz < 0 || ix >= TERRAIN_CACHE_N - 1 || iz >= TERRAIN_CACHE_N - 1) {
-    return _terrainRawHeight(x, z); // outside the cached map extent -> sample directly (still deterministic/continuous)
-  }
+  if (ix < 0 || iz < 0 || ix >= TERRAIN_CELLS || iz >= TERRAIN_CELLS) return NaN;
   const fx = gx - ix, fz = gz - iz;
-  const h00 = _terrainHeightCache[iz * TERRAIN_CACHE_N + ix];
-  const h10 = _terrainHeightCache[iz * TERRAIN_CACHE_N + ix + 1];
-  const h01 = _terrainHeightCache[(iz + 1) * TERRAIN_CACHE_N + ix];
-  const h11 = _terrainHeightCache[(iz + 1) * TERRAIN_CACHE_N + ix + 1];
-  const a = h00 + (h10 - h00) * fx;
-  const b = h01 + (h11 - h01) * fx;
+  const o = iz * TERRAIN_N + ix;
+  const h00 = field[o], h10 = field[o + 1], h01 = field[o + TERRAIN_N], h11 = field[o + TERRAIN_N + 1];
+  const a = h00 + (h10 - h00) * fx, b = h01 + (h11 - h01) * fx;
   return a + (b - a) * fz;
 }
-// terrainNormal: central-difference gradient of terrainHeight itself (requirement #2 — computed
-// FROM the heightfield, not a second independent noise evaluation), so the normal always matches
-// whatever surface terrainHeight/the Ground mesh actually describe, including at the cache/
-// raw-noise boundary.
+// Untouched natural ground (what roadGradeHeight smooths, and what a chunk resets to before regrading).
+function terrainBaseHeight(x, z) {
+  const v = _terrainLookup(_terrainBaseField, x, z);
+  return v === v ? v : _terrainProcedural(x, z); // NaN -> outside the map: sample the noise directly (continuous, deterministic)
+}
+// The graded ground: what everything in the game stands on.
+function terrainHeight(x, z) {
+  const v = _terrainLookup(_terrainField, x, z);
+  return v === v ? v : _terrainProcedural(x, z);
+}
+// Height a road's own surface is measured from: the graded ground, but never below ROAD_MIN_Y — a
+// road crossing water therefore turns into a bridge deck standing (elevation 0) 1.4 m above the
+// water, with pillars added by the support-structure pass because the river bed is far below it.
+function roadBaseY(x, z) { return Math.max(terrainHeight(x, z), ROAD_MIN_Y); }
+function terrainIsWater(x, z) { return terrainHeight(x, z) < WATER_LEVEL + 0.15; }
+
+// terrainNormal: central-difference gradient of terrainHeight itself.
 const TERRAIN_NORMAL_EPS = 0.5; // world units — finite-difference step
 function terrainNormal(x, z) {
   const hL = terrainHeight(x - TERRAIN_NORMAL_EPS, z);
@@ -218,17 +330,151 @@ function terrainNormal(x, z) {
   const hU = terrainHeight(x, z + TERRAIN_NORMAL_EPS);
   const dHdx = (hR - hL) / (2 * TERRAIN_NORMAL_EPS);
   const dHdz = (hU - hD) / (2 * TERRAIN_NORMAL_EPS);
-  // surface normal of the height field y = h(x,z): (-dh/dx, 1, -dh/dz), normalized.
   const nx = -dHdx, ny = 1, nz = -dHdz;
   const len = Math.hypot(nx, ny, nz) || 1;
   return { x: nx / len, y: ny / len, z: nz / len };
 }
-// terrainSlope: derived FROM terrainNormal (requirement #3), as the angle (radians) between the
-// surface normal and world-up — 0 on flat ground, increasing with steepness.
+// terrainSlope: angle (radians) between the surface normal and world-up.
 function terrainSlope(x, z) {
   const n = terrainNormal(x, z);
   return Math.acos(Math.min(1, Math.max(-1, n.y)));
 }
+
+// ---- road grading ---------------------------------------------------------------------------
+const ROAD_GRADE_R1 = 11; // smoothing rings (m) used by roadGradeHeight
+const ROAD_GRADE_R2 = 22;
+const ROAD_CUT_LIMIT = 4.5; // a road never runs deeper than this below the natural ground under it ...
+const ROAD_FILL_LIMIT = 3.5; // ... nor higher than this above it — past that it just follows the ground
+const ROAD_CUT_SLOPE = 2.2; // rise per metre of a cut face (~65 deg: a cliff)
+const ROAD_FILL_SLOPE = 1.0; // drop per metre of an embankment (45 deg)
+const ROAD_GRADE_REACH = 18; // m beyond the levelled corridor that grading may reach
+// Height a level road wants at (x,z): the natural ground smoothed over ~22 m (so crests are cut and
+// dips filled, giving gentler grades), clamped to stay within CUT/FILL_LIMIT of the ground (so on
+// really rough land the road follows the surface instead of tunnelling through it). Depends only
+// on the base terrain and the position, so every road passing through a point agrees on its height
+// and junction corners always match.
+function roadGradeHeight(x, z) {
+  const b = terrainBaseHeight(x, z);
+  let sum = b, n = 1;
+  for (let k = 0; k < 8; k++) {
+    const a = k * Math.PI / 4, c = Math.cos(a), s = Math.sin(a);
+    sum += terrainBaseHeight(x + c * ROAD_GRADE_R1, z + s * ROAD_GRADE_R1) + terrainBaseHeight(x + c * ROAD_GRADE_R2, z + s * ROAD_GRADE_R2);
+    n += 2;
+  }
+  const g = Math.max(b - ROAD_CUT_LIMIT, Math.min(b + ROAD_FILL_LIMIT, sum / n));
+  return Math.max(g, ROAD_MIN_Y);
+}
+
+function terrainChunkOfWorld(x, z) {
+  return {
+    ci: Math.max(0, Math.min(TERRAIN_CHUNKS - 1, Math.floor((x + TERRAIN_HALF) / (TERRAIN_CHUNK_CELLS * TERRAIN_STEP)))),
+    cj: Math.max(0, Math.min(TERRAIN_CHUNKS - 1, Math.floor((z + TERRAIN_HALF) / (TERRAIN_CHUNK_CELLS * TERRAIN_STEP)))),
+  };
+}
+const _terrainChunkSigs = new Float64Array(TERRAIN_CHUNKS * TERRAIN_CHUNKS).fill(0); // 0 == "no roads nearby" == pristine base terrain
+const _regradeScratchD = new Float32Array((TERRAIN_CHUNK_CELLS + 1) * (TERRAIN_CHUNK_CELLS + 1));
+const _regradeScratchH = new Float32Array((TERRAIN_CHUNK_CELLS + 1) * (TERRAIN_CHUNK_CELLS + 1));
+
+// Applies ONE grade feature onto the lattice region [i0..i1] x [j0..j1] (inclusive lattice indices).
+//   feature.kind 'poly': feature.pts = Float64Array [x,z,h, x,z,h, ...] centreline stations, feature.W = level half-width
+//   feature.kind 'rect': feature.cx/cz/half/h = a level square (a Tile road)
+// Each lattice point is levelled to the height of its nearest station when it lies inside the
+// corridor, and blended back toward the natural ground with a cut face / embankment beyond it.
+function _applyGradeFeature(f, i0, j0, i1, j1) {
+  const W = f.kind === 'poly' ? f.W : f.half;
+  const reach = W + ROAD_GRADE_REACH;
+  const wI = i1 - i0 + 1;
+  const scratchD = _regradeScratchD, scratchH = _regradeScratchH;
+  const x0 = -TERRAIN_HALF + i0 * TERRAIN_STEP, z0 = -TERRAIN_HALF + j0 * TERRAIN_STEP;
+  const touched = [];
+  if (f.kind === 'poly') {
+    const P = f.pts, n = P.length / 3;
+    const cnt = (i1 - i0 + 1) * (j1 - j0 + 1);
+    for (let k = 0; k < cnt; k++) scratchD[k] = 1e9;
+    for (let s = 0; s < n - 1; s++) {
+      const ax = P[s * 3], az = P[s * 3 + 1], ah = P[s * 3 + 2];
+      const bx = P[s * 3 + 3], bz = P[s * 3 + 4], bh = P[s * 3 + 5];
+      const mnx = Math.min(ax, bx) - reach, mxx = Math.max(ax, bx) + reach, mnz = Math.min(az, bz) - reach, mxz = Math.max(az, bz) + reach;
+      const li0 = Math.max(i0, Math.ceil((mnx + TERRAIN_HALF) / TERRAIN_STEP)), li1 = Math.min(i1, Math.floor((mxx + TERRAIN_HALF) / TERRAIN_STEP));
+      const lj0 = Math.max(j0, Math.ceil((mnz + TERRAIN_HALF) / TERRAIN_STEP)), lj1 = Math.min(j1, Math.floor((mxz + TERRAIN_HALF) / TERRAIN_STEP));
+      if (li0 > li1 || lj0 > lj1) continue;
+      const dx = bx - ax, dz = bz - az, len2 = dx * dx + dz * dz;
+      for (let j = lj0; j <= lj1; j++) {
+        const wz = -TERRAIN_HALF + j * TERRAIN_STEP;
+        for (let i = li0; i <= li1; i++) {
+          const wx = -TERRAIN_HALF + i * TERRAIN_STEP;
+          let u = len2 > 1e-9 ? ((wx - ax) * dx + (wz - az) * dz) / len2 : 0;
+          u = u < 0 ? 0 : u > 1 ? 1 : u;
+          const px = ax + dx * u - wx, pz = az + dz * u - wz;
+          const d = Math.hypot(px, pz);
+          const k = (j - j0) * wI + (i - i0);
+          if (d < scratchD[k]) { scratchD[k] = d; scratchH[k] = ah + (bh - ah) * u; }
+        }
+      }
+    }
+    for (let j = j0; j <= j1; j++) for (let i = i0; i <= i1; i++) {
+      const k = (j - j0) * wI + (i - i0);
+      if (scratchD[k] < reach) _gradeVertex(j * TERRAIN_N + i, scratchD[k] - W, scratchH[k]);
+    }
+  } else {
+    for (let j = j0; j <= j1; j++) {
+      const wz = -TERRAIN_HALF + j * TERRAIN_STEP;
+      if (Math.abs(wz - f.cz) > reach) continue;
+      for (let i = i0; i <= i1; i++) {
+        const wx = -TERRAIN_HALF + i * TERRAIN_STEP;
+        const d = Math.max(Math.abs(wx - f.cx), Math.abs(wz - f.cz));
+        if (d < reach) _gradeVertex(j * TERRAIN_N + i, d - W, f.h);
+      }
+    }
+  }
+  void x0; void z0; void touched;
+}
+// lat = distance beyond the level corridor's edge (<= 0 inside it); h = the road's height there.
+function _gradeVertex(o, lat, h) {
+  const b0 = _terrainField[o];
+  if (b0 < WATER_LEVEL - 0.05) return; // open water is never filled in — the road bridges it instead
+  if (lat <= 0) { _terrainField[o] = h; return; }
+  if (b0 > h) _terrainField[o] = Math.min(b0, h + lat * ROAD_CUT_SLOPE);
+  else _terrainField[o] = Math.max(b0, h - lat * ROAD_FILL_SLOPE);
+}
+
+// terrainRegrade(features): features = [{ sig:number, order:number, bbox:[minX,minZ,maxX,maxZ], build():{kind,...} }].
+// Returns the [ci,cj] chunk indices whose lattice heights changed (the caller rebuilds their meshes).
+function terrainRegrade(features) {
+  const chunkW = TERRAIN_CHUNK_CELLS * TERRAIN_STEP;
+  const perChunk = new Map();
+  for (const f of features) {
+    const reachPad = 0; // bbox already includes the feature's reach
+    const ci0 = Math.max(0, Math.floor((f.bbox[0] - reachPad + TERRAIN_HALF) / chunkW)), ci1 = Math.min(TERRAIN_CHUNKS - 1, Math.floor((f.bbox[2] + reachPad + TERRAIN_HALF) / chunkW));
+    const cj0 = Math.max(0, Math.floor((f.bbox[1] - reachPad + TERRAIN_HALF) / chunkW)), cj1 = Math.min(TERRAIN_CHUNKS - 1, Math.floor((f.bbox[3] + reachPad + TERRAIN_HALF) / chunkW));
+    for (let cj = cj0; cj <= cj1; cj++) for (let ci = ci0; ci <= ci1; ci++) {
+      const key = cj * TERRAIN_CHUNKS + ci;
+      let arr = perChunk.get(key);
+      if (!arr) { arr = []; perChunk.set(key, arr); }
+      arr.push(f);
+    }
+  }
+  const changed = [];
+  for (let cj = 0; cj < TERRAIN_CHUNKS; cj++) for (let ci = 0; ci < TERRAIN_CHUNKS; ci++) {
+    const key = cj * TERRAIN_CHUNKS + ci;
+    const list = perChunk.get(key) || [];
+    list.sort((a, b) => a.order - b.order);
+    let sig = 0;
+    for (const f of list) sig = (sig * 31 + f.sig) % 4294967291;
+    if (list.length === 0) sig = 0;
+    if (sig === _terrainChunkSigs[key]) continue;
+    _terrainChunkSigs[key] = sig;
+    const i0 = ci * TERRAIN_CHUNK_CELLS, j0 = cj * TERRAIN_CHUNK_CELLS, i1 = i0 + TERRAIN_CHUNK_CELLS, j1 = j0 + TERRAIN_CHUNK_CELLS;
+    for (let j = j0; j <= j1; j++) for (let i = i0; i <= i1; i++) _terrainField[j * TERRAIN_N + i] = _terrainBaseField[j * TERRAIN_N + i];
+    for (const f of list) {
+      if (!f._built) f._built = f.build();
+      _applyGradeFeature(f._built, i0, j0, i1, j1);
+    }
+    changed.push([ci, cj]);
+  }
+  return changed;
+}
+
 
 // -- Building-on-Terrain grading (Prompt 17 of the Tile->World Space migration) --------------
 // A Building's footprint is real World Space geometry (position.x/z + footprint.width/depth +
@@ -275,6 +521,9 @@ function computeBuildingGrading(cx, cz, w, h, rotation = 0) {
   const minH = Math.min(...heights), maxH = Math.max(...heights);
   const relief = maxH - minH;
   const slope = terrainSlope(cx, cz); // angle (radians) of the ground right under the building's anchor
+  if (minH < WATER_LEVEL + 0.2 || terrainHeight(cx, cz) < WATER_LEVEL + 0.2) { // Prompt 25: no building on water / the shoreline
+    return { buildable: false, strategy: 'water', slope, relief, minH, maxH, baseY: terrainHeight(cx, cz), foundationHeight: 0, embedHeight: 0 };
+  }
   let strategy;
   if (slope <= BUILDING_GRADE_SLOPE_FLAT) strategy = 'flat';
   else if (slope <= BUILDING_GRADE_SLOPE_FOUNDATION) strategy = 'foundation';
@@ -845,7 +1094,7 @@ function addRoadSegmentToNetwork(network, segment) {
 function _roadNodes(network, segment) {
   return { a: network.nodes.get(segment.startNodeId), b: network.nodes.get(segment.endNodeId) };
 }
-function _roadElevationY(nodePos, elevAtEnd) { return terrainHeight(nodePos.x, nodePos.z) + elevAtEnd; }
+function _roadElevationY(nodePos, elevAtEnd) { return roadBaseY(nodePos.x, nodePos.z) + elevAtEnd; }
 // Prompt 20K Part A — `segment.visualStartOverride`/`visualEndOverride` ({x,z}, optional): when
 // present, RENDERING/geometry sampling (this function, getRoadTangent below) treats that end as
 // sitting at the given point instead of the real node's `.position` — while the segment's actual
@@ -862,6 +1111,16 @@ function _roadEndPositions(network, segment) {
     aPos: segment.visualStartOverride || a.position,
     bPos: segment.visualEndOverride || b.position,
   };
+}
+// getRoadPointXZ: same centreline as getRoadPoint but WITHOUT the height lookup — the terrain
+// grading pass (which is what decides the height) samples roads through this to avoid a loop.
+function getRoadPointXZ(network, segment, t) {
+  const { aPos, bPos } = _roadEndPositions(network, segment);
+  if (segment.curve && segment.curve.controlPoint) {
+    const c = segment.curve.controlPoint, omt = 1 - t;
+    return { x: omt * omt * aPos.x + 2 * omt * t * c.x + t * t * bPos.x, z: omt * omt * aPos.z + 2 * omt * t * c.z + t * t * bPos.z };
+  }
+  return { x: aPos.x + (bPos.x - aPos.x) * t, z: aPos.z + (bPos.z - aPos.z) * t };
 }
 function getRoadPoint(network, segment, t) {
   const { aPos, bPos } = _roadEndPositions(network, segment);
@@ -882,7 +1141,7 @@ function getRoadPoint(network, segment, t) {
   // authored offset ABOVE/BELOW whatever terrain sits directly under this exact point, so bridges
   // and cuts still read correctly along their whole span, not just at their two ends.
   const elevAtT = segment.elevation.start + (segment.elevation.end - segment.elevation.start) * t;
-  const y = terrainHeight(x, z) + elevAtT;
+  const y = roadBaseY(x, z) + elevAtT; // roadBaseY = graded ground, floored at ROAD_MIN_Y (bridge deck over water)
   return { x, y, z };
 }
 function getRoadTangent(network, segment, t) {
@@ -1390,7 +1649,7 @@ function buildGorePolygonPoints(highwayRt, rampRt, takeoffPos, tangent, normal, 
   const { rhw } = roadHalfWidth(highwayRt.hubMul);
   const rampHalf = getRoadFootprintHalfWidth(rampRt);
   const outerOffset = highwayOuterLaneOffset(highwayRt);
-  const y = terrainHeight(takeoffPos.x, takeoffPos.z) + elevAtTakeoff + 0.02;
+  const y = roadBaseY(takeoffPos.x, takeoffPos.z) + elevAtTakeoff + 0.02;
   const apex = { x: takeoffPos.x, y, z: takeoffPos.z };
   const curbLateral = lateralSign * (rhw - outerOffset); // beyond the outer lane center out to the highway's own paved edge
   const mainFar = {
@@ -2135,6 +2394,208 @@ function createOnRamp(network, highwaySegmentId, t, opts) {
 function createOffRamp(network, highwaySegmentId, t, opts) {
   return createHighwayRampConnection(network, highwaySegmentId, t, { ...opts, direction: 'off' });
 }
+// ============================================================================
+// Prompt 25 — the game's starting highway + interchange
+// ============================================================================
+// A 15 m viaduct enters from the west map edge. After a straight run (3x the old 8-tile stub) it
+// carries a grade-separated interchange with a ground-level boulevard ("C") that passes UNDER the
+// viaduct — modelled on the reference photo: a loop ramp with an outer slip ramp, and the
+// mirror-image pair on the other carriageway (a partial cloverleaf). The viaduct then descends
+// (~10 % grade) to the ground and becomes an ordinary-road stub the player extends from.
+//
+//   local frame (u east, v south) centred on the crossing (xc, z0):
+//     EB carriageway = south half of the highway (v > 0), WB = north half.
+//     SW  EB diverge slip   : viaduct (u=-150) ── S-curve ──> boulevard terminal (0,+100)
+//     SE  EB entrance slip  : boulevard terminal (0,+100) ── S-curve ──> viaduct (u=+150)
+//     SE  EB loop off-ramp  : viaduct (u=+19)  ── 270° loop ──> boulevard (0,+outer+R)
+//     NE / NW / NW = the same three ramps point-reflected through the crossing (WB carriageway).
+// Every ramp is a chain of real RoadSegments (one-way highway_ramp_1) with a linear 15 m -> 0 m
+// elevation profile; the first piece is a short parallel run from the highway's outermost lane
+// exactly like createHighwayRampConnection builds them.
+const IC_CROSSING_X = -280; // world X of the interchange crossing (the ground boulevard runs N-S here)
+const IC_HIGHWAY_ELEV = 15;
+const IC_LOOP_RADIUS = 32;
+const IC_TERMINAL_V = 100; // boulevard terminal distance from the crossing (m)
+const IC_RAMP_HALF_SPAN = 150; // slip ramps attach to the viaduct this far either side of the crossing (m)
+const IC_DESCENT_LEN = 150; // viaduct descent length after the interchange (m) -> 15 m / 150 m = 10 %
+function _icCtrlPoint(p0, t0, p1, t1) {
+  const dx = p1.x - p0.x, dz = p1.z - p0.z, len = Math.hypot(dx, dz);
+  const cross = t0.x * t1.z - t0.z * t1.x;
+  const mid = { x: (p0.x + p1.x) / 2, z: (p0.z + p1.z) / 2 };
+  if (Math.abs(cross) < 1e-3) return mid;
+  const a = (dx * t1.z - dz * t1.x) / cross, b = (t0.x * dz - t0.z * dx) / cross;
+  if (a < len * 0.15 || b < len * 0.15 || a > len * 1.2 || b > len * 1.2) return mid;
+  return { x: p0.x + a * t0.x, z: p0.z + a * t0.z };
+}
+function _icCubic(P0, P1, P2, P3, n) {
+  const pts = [];
+  for (let i = 0; i <= n; i++) {
+    const u = i / n, m = 1 - u;
+    pts.push({
+      x: m * m * m * P0.x + 3 * m * m * u * P1.x + 3 * m * u * u * P2.x + u * u * u * P3.x,
+      z: m * m * m * P0.z + 3 * m * m * u * P1.z + 3 * m * u * u * P2.z + u * u * u * P3.z,
+    });
+  }
+  return pts;
+}
+// Chains quadratic-bezier RoadSegments through `pts` (pts[0]/pts[last] = the two existing nodes'
+// positions). Interior points become new nodes. Elevation falls/rises linearly with arc length.
+// `outward` order is pts[0] -> pts[last]; `reverse` builds the segments in the opposite direction
+// of travel (an entrance ramp: ground -> viaduct) while keeping the same geometry.
+function _icAddChain(network, nodeFirst, nodeLast, pts, elevFirst, elevLast, rampType, reverse) {
+  const n = pts.length;
+  const cum = [0];
+  for (let i = 1; i < n; i++) cum.push(cum[i - 1] + Math.hypot(pts[i].x - pts[i - 1].x, pts[i].z - pts[i - 1].z));
+  const total = cum[n - 1] || 1;
+  const tang = pts.map((p, i) => {
+    const a = pts[Math.max(0, i - 1)], b = pts[Math.min(n - 1, i + 1)];
+    const l = Math.hypot(b.x - a.x, b.z - a.z) || 1;
+    return { x: (b.x - a.x) / l, z: (b.z - a.z) / l };
+  });
+  const nodes = [nodeFirst];
+  for (let i = 1; i < n - 1; i++) nodes.push(addRoadNodeToNetwork(network, makeRoadNode(pts[i].x, 0, pts[i].z)));
+  nodes.push(nodeLast);
+  const elevAt = (i) => elevFirst + (elevLast - elevFirst) * (cum[i] / total);
+  const segs = [];
+  for (let i = 0; i < n - 1; i++) {
+    const c = _icCtrlPoint(pts[i], tang[i], pts[i + 1], tang[i + 1]);
+    const opts = { roadType: rampType, curve: { controlPoint: { x: c.x, y: 0, z: c.z } } };
+    let seg;
+    if (!reverse) seg = makeRoadSegment(nodes[i].id, nodes[i + 1].id, { ...opts, elevation: { start: elevAt(i), end: elevAt(i + 1) } });
+    else seg = makeRoadSegment(nodes[i + 1].id, nodes[i].id, { ...opts, elevation: { start: elevAt(i + 1), end: elevAt(i) } });
+    segs.push(addRoadSegmentToNetwork(network, seg));
+  }
+  return { nodes, segments: segs };
+}
+// Sets every node's stored y to the real road height there (graded ground + the elevation of a
+// segment that meets it). The car update reads node.position.y for its slope-speed factor.
+function syncRoadNodeHeights(network) {
+  network.nodes.forEach((node) => {
+    for (const sid of node.connectedSegmentIds) {
+      const seg = network.segments.get(sid);
+      if (!seg) continue;
+      node.position.y = getRoadPoint(network, seg, seg.startNodeId === node.id ? 0 : 1).y;
+      return;
+    }
+  });
+}
+function buildInitialHighwayNetwork(network, cfg) {
+  const { outerX, z0, xc } = cfg;
+  const gores = [];
+  const hwRt = ROAD_TYPES.highway, rampType = 'highway_ramp_1', rampRt = ROAD_TYPES[rampType];
+  const outer = highwayOuterLaneOffset(hwRt);
+  const mkNode = (x, z) => addRoadNodeToNetwork(network, makeRoadNode(x, 0, z));
+  const E = IC_HIGHWAY_ELEV;
+  // ---- viaduct mainline: gate -> descent start (elevation 15), then the descent to the ground, then the stub
+  const descStartX = xc + IC_RAMP_HALF_SPAN + 40;
+  const descEndX = descStartX + IC_DESCENT_LEN;
+  const stubEndX = descEndX + TILE * 3;
+  const gate = mkNode(outerX, z0);
+  const dStart = mkNode(descStartX, z0);
+  const dEnd = mkNode(descEndX, z0);
+  const stubEnd = mkNode(stubEndX, z0);
+  const mainline = addRoadSegmentToNetwork(network, makeRoadSegment(gate.id, dStart.id, { roadType: 'highway', elevation: { start: E, end: E } }));
+  addRoadSegmentToNetwork(network, makeRoadSegment(dStart.id, dEnd.id, { roadType: 'highway', elevation: { start: E, end: 0 } }));
+  const stub = addRoadSegmentToNetwork(network, makeRoadSegment(dEnd.id, stubEnd.id, { roadType: 'two' }));
+  // ---- the ground-level boulevard under the viaduct
+  const loopV = outer + IC_LOOP_RADIUS; // loop end distance from the highway centreline
+  const cVs = [-260, -IC_TERMINAL_V, -loopV, loopV, IC_TERMINAL_V, 260];
+  const cNodes = cVs.map((v) => mkNode(xc, z0 + v));
+  const cSegs = [];
+  for (let i = 0; i < cNodes.length - 1; i++) cSegs.push(addRoadSegmentToNetwork(network, makeRoadSegment(cNodes[i].id, cNodes[i + 1].id, { roadType: 'four_median' })));
+  const nodeAtV = (v) => cNodes[cVs.indexOf(v)];
+  // ---- viaduct attachment nodes (split the mainline at each station once; both carriageways share it)
+  const stationNodes = new Map();
+  const hwNodeAtX = (x) => {
+    const key = Math.round(x);
+    if (stationNodes.has(key)) return stationNodes.get(key);
+    let seg = null;
+    for (const s of network.segments.values()) {
+      if (s.roadType !== 'highway' || s.elevation.start !== E || s.elevation.end !== E) continue;
+      const a = network.nodes.get(s.startNodeId).position, b = network.nodes.get(s.endNodeId).position;
+      if (x > Math.min(a.x, b.x) + 1 && x < Math.max(a.x, b.x) - 1) { seg = s; break; }
+    }
+    if (!seg) throw new Error('interchange: no viaduct segment at x=' + x);
+    const a = network.nodes.get(seg.startNodeId).position, b = network.nodes.get(seg.endNodeId).position;
+    const split = splitRoadSegmentAt(network, seg.id, (x - a.x) / (b.x - a.x), {});
+    stationNodes.set(key, split.node);
+    return split.node;
+  };
+  // ---- ramps (local frame -> world; r = +1 EB group, -1 = point-reflected WB group)
+  const W = (r, u, v) => ({ x: xc + r * u, z: z0 + r * v });
+  const offRecords = []; // { hwNode, ramp segment id, eastbound }
+  function addRamp(r, kind, hwU, pathLocal, endNode) {
+    // kind: 'off' (viaduct -> ground) | 'on' (ground -> viaduct)
+    const hwNode = hwNodeAtX(xc + r * hwU);
+    const lateral = r; // +1 = south (EB outer lane), -1 = north (WB outer lane)
+    const takeoff = W(r, hwU, outer);
+    const alongSignLocal = kind === 'off' ? 1 : -1; // local u direction the ramp lies in relative to hwNode
+    const sepLocalU = hwU + alongSignLocal * RAMP_PARALLEL_LENGTH;
+    const sepNode = mkNode(xc + r * sepLocalU, z0 + r * outer);
+    const segA = kind === 'off'
+      ? addRoadSegmentToNetwork(network, makeRoadSegment(hwNode.id, sepNode.id, { roadType: rampType, elevation: { start: E, end: E }, visualStartOverride: { x: takeoff.x, z: takeoff.z } }))
+      : addRoadSegmentToNetwork(network, makeRoadSegment(sepNode.id, hwNode.id, { roadType: rampType, elevation: { start: E, end: E }, visualEndOverride: { x: takeoff.x, z: takeoff.z } }));
+    // pathLocal runs sep -> ground endpoint (off) / ground endpoint -> sep (on), in LOCAL coords
+    const pts = pathLocal.map((q) => W(r, q.u, q.v));
+    let chain;
+    if (kind === 'off') chain = _icAddChain(network, sepNode, endNode, [sepNode.position, ...pts.slice(1, -1), endNode.position], E, 0, rampType, false);
+    else chain = _icAddChain(network, endNode, sepNode, [endNode.position, ...pts.slice(1, -1), sepNode.position], 0, E, rampType, false);
+    // ^ for an 'on' ramp the pts run ground -> sep already, so no reversal needed: segments travel ground -> viaduct
+    // painted gore wedge between viaduct and ramp
+    const tangent = { x: 1, z: 0 }, normal = { x: 0, z: 1 };
+    const alongSignWorld = alongSignLocal * r; // world-x direction of the ramp relative to hwNode (tangent = +x)
+    gores.push({ key: segA.id, points: buildGorePolygonPoints(hwRt, rampRt, takeoff, tangent, normal, lateral, alongSignWorld, E) });
+    if (kind === 'off') offRecords.push({ hwNodeId: hwNode.id, rampSegId: segA.id, eastbound: r > 0 });
+    return { segA, chain };
+  }
+  for (const r of [1, -1]) {
+    const T = IC_TERMINAL_V;
+    const termNode = r > 0 ? nodeAtV(T) : nodeAtV(-T);
+    const loopEndNode = r > 0 ? nodeAtV(loopV) : nodeAtV(-loopV);
+    // 1) diverge slip ramp: viaduct u=-150 -> S-curve -> terminal (0,T) arriving heading toward the boulevard
+    {
+      const sepU = -IC_RAMP_HALF_SPAN + RAMP_PARALLEL_LENGTH;
+      const cub = _icCubic({ x: sepU, z: outer }, { x: sepU + 60, z: outer }, { x: -60, z: T }, { x: 0, z: T }, 8).map((p) => ({ u: p.x, v: p.z }));
+      addRamp(r, 'off', -IC_RAMP_HALF_SPAN, cub, termNode);
+    }
+    // 2) entrance slip ramp: terminal (0,T) -> S-curve -> viaduct u=+150 (merging tangentially from behind)
+    {
+      const sepU = IC_RAMP_HALF_SPAN - RAMP_PARALLEL_LENGTH;
+      const cub = _icCubic({ x: 0, z: T }, { x: 70, z: T }, { x: sepU - 40, z: outer }, { x: sepU, z: outer }, 8).map((p) => ({ u: p.x, v: p.z }));
+      addRamp(r, 'on', IC_RAMP_HALF_SPAN, cub, termNode);
+    }
+    // 3) loop off-ramp: viaduct u=+19 -> 270° clockwise loop -> boulevard (0,outer+R)
+    {
+      const R = IC_LOOP_RADIUS;
+      const hwU = R - RAMP_PARALLEL_LENGTH;
+      const cx = R, cz = outer + R; // loop centre (local)
+      const arc = [];
+      for (let k = 0; k <= 6; k++) { const phi = -Math.PI / 2 + (k / 6) * (Math.PI * 1.5); arc.push({ u: cx + R * Math.cos(phi), v: cz + R * Math.sin(phi) }); }
+      addRamp(r, 'off', hwU, arc, loopEndNode);
+    }
+  }
+  // Diverge metadata: a car may only take an exit while it is on the carriageway that owns it, in the
+  // outermost lane (see pickNextSegmentAtNode) — recorded on the mainline segment a car arrives on.
+  const laneGroups = laneOffsetGroups(hwRt);
+  const highwayLaneIndex = laneGroups ? laneGroups.offsets.length - 1 : 0;
+  for (const rec of offRecords) {
+    const node = network.nodes.get(rec.hwNodeId);
+    let arrival = null;
+    for (const sid of node.connectedSegmentIds) {
+      const s = network.segments.get(sid);
+      if (!s || s.roadType !== 'highway') continue;
+      if (rec.eastbound ? s.endNodeId === node.id : s.startNodeId === node.id) arrival = s;
+    }
+    if (!arrival) continue;
+    if (!arrival.rampConnections) arrival.rampConnections = [];
+    arrival.rampConnections.push({
+      highwaySegmentId: arrival.id, highwayT: rec.eastbound ? 1 : 0, highwayLaneIndex, side: rec.eastbound ? 'right' : 'left',
+      rampSegmentId: rec.rampSegId, movement: 'diverge', atNodeId: node.id,
+    });
+  }
+  return { gores, mainline, stub, gate, stubEnd, boulevardSegments: cSegs };
+}
+
 // Merge / Diverge: a ramp merging into / diverging from the mainline is exactly an on-ramp/off-ramp
 // whose ground "endpoint" happens to be highway-class too — same primitive, no separate geometry.
 const createHighwayMerge = createOnRamp;
@@ -3012,8 +3473,8 @@ function computeRoadGuideMetrics(startPos, startElevation, endPos, endElevation)
   const dx = endPos.x - startPos.x, dz = endPos.z - startPos.z;
   const length = Math.hypot(dx, dz);
   const angleDeg = length > 1e-6 ? ((Math.atan2(dz, dx) * 180 / Math.PI) + 360) % 360 : 0;
-  const startY = terrainHeight(startPos.x, startPos.z) + startElevation;
-  const endY = terrainHeight(endPos.x, endPos.z) + endElevation;
+  const startY = roadBaseY(startPos.x, startPos.z) + startElevation;
+  const endY = roadBaseY(endPos.x, endPos.z) + endElevation;
   const heightDiff = endY - startY;
   const grade = length > 1e-6 ? heightDiff / length : 0;
   return { length, angleDeg, heightDiff, grade, startY, endY };
@@ -3335,10 +3796,11 @@ function closestPointOnRoadSegment(network, segment, x, z, coarseSamples = 24) {
 // OPPOSITE: frontage/band/Parcel queries pass includeHighway:false so a highway segment can never
 // be the "nearest road" that grants buildable frontage, even when it's physically the closest one.
 function getNearestRoadPoint(network, x, z, opts = {}) {
-  const { includeHighway = true } = opts;
+  const { includeHighway = true, atGradeOnly = false } = opts;
   let best = null;
   for (const segment of network.segments.values()) {
     if (!includeHighway && ROAD_TYPES[segment.roadType]?.highway) continue;
+    if (atGradeOnly && !isRoadSegmentAtGrade(segment)) continue; // Prompt 25: a raised / ramping road never fronts buildable land
     const hit = closestPointOnRoadSegment(network, segment, x, z);
     if (!best || hit.distance < best.distance) {
       const n = getRoadNormal(network, segment, hit.t);
@@ -3376,7 +3838,7 @@ function isInsideRoadFootprint(network, x, z) {
 // against getNearestRoadPoint(..., { includeHighway: false }), NOT getNearestRoadDistance, so a
 // nearby highway is simply invisible to this query rather than ever being "the nearest road".
 function getRoadsideBand(network, x, z) {
-  const nearest = getNearestRoadPoint(network, x, z, { includeHighway: false });
+  const nearest = getNearestRoadPoint(network, x, z, { includeHighway: false, atGradeOnly: true });
   if (!nearest) return null;
   const edgeDist = nearest.distance - getRoadWidth(nearest.segment) / 2;
   if (edgeDist < 0) return null; // inside this (non-highway) road's own footprint
@@ -3392,7 +3854,7 @@ function getRoadsideBand(network, x, z) {
 function getRoadFrontage(network, x, z) {
   const band = getRoadsideBand(network, x, z);
   if (band == null) return null;
-  const nearest = getNearestRoadPoint(network, x, z, { includeHighway: false });
+  const nearest = getNearestRoadPoint(network, x, z, { includeHighway: false, atGradeOnly: true });
   return { segmentId: nearest.segmentId, side: nearest.side, t: nearest.t, roadPoint: nearest.point, band, distanceFromRoadEdge: nearest.distance - getRoadWidth(nearest.segment) / 2 };
 }
 
@@ -3459,14 +3921,77 @@ function isMicroCellInRoadFrontageStrip(network, mx, mz) {
 // vanishing and gaps between them. This returns the max of the two possible diagonal triangulations
 // of the surrounding Tile quad, i.e. always on or just above whichever triangle is really drawn.
 function groundMeshHeight(x, z) {
-  const gx = (x + MAP_HALF) / TILE, gz = (z + MAP_HALF) / TILE;
-  const ix = Math.max(0, Math.min(GRID_SIZE - 1, Math.floor(gx))), iz = Math.max(0, Math.min(GRID_SIZE - 1, Math.floor(gz)));
+  const gx = (x + TERRAIN_HALF) / TERRAIN_STEP, gz = (z + TERRAIN_HALF) / TERRAIN_STEP;
+  const ix = Math.max(0, Math.min(TERRAIN_CELLS - 1, Math.floor(gx))), iz = Math.max(0, Math.min(TERRAIN_CELLS - 1, Math.floor(gz)));
   const fx = Math.max(0, Math.min(1, gx - ix)), fz = Math.max(0, Math.min(1, gz - iz));
-  const H = (a, b) => terrainHeight((ix + a) * TILE - MAP_HALF, (iz + b) * TILE - MAP_HALF);
-  const h00 = H(0, 0), h10 = H(1, 0), h01 = H(0, 1), h11 = H(1, 1);
+  const o = iz * TERRAIN_N + ix;
+  const h00 = _terrainField[o], h10 = _terrainField[o + 1], h01 = _terrainField[o + TERRAIN_N], h11 = _terrainField[o + TERRAIN_N + 1];
   const hA = fx + fz <= 1 ? h00 + (h10 - h00) * fx + (h01 - h00) * fz : h11 + (h01 - h11) * (1 - fx) + (h10 - h11) * (1 - fz);
   const hB = fx <= fz ? h00 + (h01 - h00) * fz + (h11 - h01) * fx : h00 + (h10 - h00) * fx + (h11 - h10) * fz;
   return Math.max(hA, hB);
+}
+// ---- road grading inputs (Prompt 25) ---------------------------------------------------------
+// A road is "at grade" (lies flat on the ground, buildable frontage, carves its own corridor) only
+// when BOTH ends have elevation 0. Anything raised, lowered or ramping is NOT at grade.
+const ROAD_AT_GRADE_TOL = 0.05;
+function isRoadSegmentAtGrade(segment) {
+  return Math.abs(segment.elevation.start) < ROAD_AT_GRADE_TOL && Math.abs(segment.elevation.end) < ROAD_AT_GRADE_TOL;
+}
+function _gradeFnv(nums) {
+  let h = 2166136261;
+  for (let i = 0; i < nums.length; i++) { h = Math.imul(h ^ (Math.round(nums[i] * 50) | 0), 16777619) >>> 0; }
+  return h;
+}
+function _gradeIdOrder(id) {
+  const m = /(\d+)/.exec(String(id));
+  return m ? Number(m[1]) : _gradeFnv([String(id).length]);
+}
+// Builds the per-call grade-feature list for terrainRegrade(): one 'poly' feature per at-grade
+// free-road segment and one 'rect' feature per Tile road. `roadTiles` = [{ tx, ty }] (tile coords).
+// Only cheap params are hashed here; centre-line sampling (the expensive part) happens lazily in
+// build(), and only for features that touch a chunk that actually changed.
+function collectRoadGradeFeatures(network, roadTiles) {
+  const feats = [];
+  if (network) {
+    network.segments.forEach((seg) => {
+      if (!isRoadSegmentAtGrade(seg)) return;
+      const { aPos, bPos } = _roadEndPositions(network, seg);
+      const c = seg.curve && seg.curve.controlPoint;
+      const wMax = Math.max(getRoadWidth(seg, 0), getRoadWidth(seg, 0.5), getRoadWidth(seg, 1));
+      const W = wMax / 2 + 2.6; // paved half-width + sidewalk gap + verge (>= one lattice diagonal so bilinear cells never dip into the cut face under the pavement)
+      const xs = [aPos.x, bPos.x], zs = [aPos.z, bPos.z];
+      if (c) { xs.push(c.x); zs.push(c.z); }
+      const reach = W + ROAD_GRADE_REACH;
+      const bbox = [Math.min(...xs) - reach, Math.min(...zs) - reach, Math.max(...xs) + reach, Math.max(...zs) + reach];
+      const sig = _gradeFnv([_gradeIdOrder(seg.id), aPos.x, aPos.z, bPos.x, bPos.z, c ? c.x : 0, c ? c.z : 0, c ? 1 : 0, W]);
+      feats.push({
+        sig, order: _gradeIdOrder(seg.id), bbox,
+        build() {
+          let approx = Math.hypot(bPos.x - aPos.x, bPos.z - aPos.z);
+          if (c) approx = Math.hypot(c.x - aPos.x, c.z - aPos.z) + Math.hypot(bPos.x - c.x, bPos.z - c.z);
+          const n = Math.max(2, Math.min(600, Math.ceil(approx / 1.5)));
+          const pts = new Float64Array((n + 1) * 3);
+          for (let i = 0; i <= n; i++) {
+            const q = getRoadPointXZ(network, seg, i / n);
+            pts[i * 3] = q.x; pts[i * 3 + 1] = q.z; pts[i * 3 + 2] = roadGradeHeight(q.x, q.z);
+          }
+          return { kind: 'poly', pts, W };
+        },
+      });
+    });
+  }
+  const half = TILE / 2 + 0.05;
+  const orderBase = 1e6;
+  for (const t of roadTiles || []) {
+    const cx = (t.tx - GRID_SIZE / 2) * TILE + TILE / 2, cz = (t.ty - GRID_SIZE / 2) * TILE + TILE / 2;
+    const reach = half + ROAD_GRADE_REACH;
+    feats.push({
+      sig: _gradeFnv([t.tx, t.ty, 7]), order: orderBase + t.ty * GRID_SIZE + t.tx,
+      bbox: [cx - reach, cz - reach, cx + reach, cz + reach],
+      build() { return { kind: 'rect', cx, cz, half, h: roadGradeHeight(cx, cz) }; },
+    });
+  }
+  return feats;
 }
 // ============================================================================
 // Prompt 21H — Road-aligned Plot Cells (道路に平行な区画セル)
@@ -3620,7 +4145,7 @@ function _plotBuildStripCandidates(network, segment, sideName, sideSign, order, 
     const t = prof.sToT(startS + c * PLOT_CELL_SIZE);
     const p = getRoadPoint(network, segment, t), n = getRoadNormal(network, segment, t);
     bt[c] = t;
-    elevated[c] = p.y - terrainHeight(p.x, p.z) > 1.5; // on a bridge / viaduct: nothing to build beside it
+    elevated[c] = p.y - terrainHeight(p.x, p.z) > ROAD_AT_GRADE_TOL; // Prompt 25: ANY lift off the ground (was > 1.5 m) -> nothing to build beside it
     const col = new Array(PLOT_ROWS + 1);
     for (let r = 0; r <= PLOT_ROWS; r++) {
       const dist = d0 + r * PLOT_CELL_SIZE;
@@ -3637,6 +4162,10 @@ function _plotBuildStripCandidates(network, segment, sideName, sideSign, order, 
       let inMap = true;
       for (const q of poly) if (Math.abs(q.x) > MAP_HALF - 0.01 || Math.abs(q.z) > MAP_HALF - 0.01) { inMap = false; break; }
       if (!inMap) continue;
+      { // Prompt 25: no plots in water / on a cliff or cut face
+        const qx = (poly[0].x + poly[2].x) / 2, qz = (poly[0].z + poly[2].z) / 2;
+        if (terrainHeight(qx, qz) < WATER_LEVEL + 0.3 || terrainSlope(qx, qz) > 0.75) continue;
+      }
       out.push({ gid, segId: segment.id, side: sideName, sideSign, col: c, row: r, poly, tan: { x: tan.x, z: tan.z }, order });
     }
   }
@@ -3653,6 +4182,7 @@ function computeRoadPlotLayout(network) {
   for (const segment of network.segments.values()) {
     order++;
     if (isHighwayDeckRoadType(ROAD_TYPES[segment.roadType])) continue; // no Building Plots beside a highway / ramp
+    if (!isRoadSegmentAtGrade(segment)) continue; // Prompt 25: plots only beside roads lying on the ground (elevation 0 m)
     for (const sideName of ['left', 'right']) {
       const g = _plotBuildStripCandidates(network, segment, sideName, sideName === 'left' ? 1 : -1, order, candidates);
       if (g) groups.set(g.gid, g);
@@ -4200,7 +4730,7 @@ function createParcelAlongFrontage(network, segmentId, side, band, subdivisions 
     // Prompt 18 §10: a highway-type RoadSegment still gets a Parcel record (so the roadside-land
     // overlay keeps showing distance bands next to highways too), but it is marked unbuildable —
     // nothing may claim direct frontage/Building Placement off of it.
-    buildable: !ROAD_TYPES[segment.roadType]?.highway,
+    buildable: !ROAD_TYPES[segment.roadType]?.highway && isRoadSegmentAtGrade(segment), // Prompt 25: only roads lying on the ground (0 m) grant frontage
     band,
   };
 }
@@ -4238,7 +4768,7 @@ function createBuildingParcelAlongFrontage(network, segmentId, side, minSubdivis
     id: `bparcel_${segmentId}_${side}`,
     segmentId, side,
     polygon: [...innerEdge, ...outerEdge.reverse()],
-    buildable: !ROAD_TYPES[segment.roadType]?.highway, // requirement #10
+    buildable: !ROAD_TYPES[segment.roadType]?.highway && isRoadSegmentAtGrade(segment), // requirement #10 + Prompt 25 (raised roads grant no frontage)
   };
 }
 
@@ -4345,6 +4875,7 @@ const LOW_DENSITY_FAIL_TEXT = {
   road_collision: '道路(舗装面)と衝突します',
   legacy_tile_block: '旧Tileの占有(旧Tile道路・他ゾーン・施設)と重なります',
   terrain_too_steep: '地形が急すぎて建築できません',
+  terrain_water: '水面・水際には建築できません',
   finalize_failed: '建物の生成に失敗しました(内部エラー)',
   out_of_bounds: 'マップ外にはみ出します',
   no_module: '建築できる区画モジュールが見つかりません(Parcel・寸法)',
@@ -8187,8 +8718,8 @@ export default function CityGridIso() {
   const threeRef = useRef(null);
   const toolRef = useRef('select');
   const taxRef = useRef(0.09);
-  const camTargetRef = useRef({ x: 0, z: 0 });
-  const zoomRef = useRef(1);
+  const camTargetRef = useRef({ x: -300, z: 0 }); // Prompt 25: start over the highway interchange (the map is 3x larger now)
+  const zoomRef = useRef(0.6); // Prompt 25: start zoomed out enough to see the whole interchange
   const azimuthRef = useRef(Math.PI / 4);
   const keysRef = useRef(new Set());
   const cameraModeRef = useRef('iso');
@@ -8939,6 +9470,32 @@ export default function CityGridIso() {
       return !(s && s.rampHeadIncomplete);
     });
     let pool = ids.map(build).filter(Boolean).filter(oneWayOk);
+    // Prompt 25: the viaduct is ONE two-way segment (both carriageways), so ramp direction has to be
+    // enforced here. (a) A diverge ramp may only be taken by a car arriving on the mainline segment
+    // that OWNS that exit (its rampConnections entry) — never by opposite-direction traffic.
+    // (b) A car that has just come up an entrance ramp onto the mainline must continue in the ramp's
+    // direction of travel, never turn back the way it came.
+    if (fromSeg && pool.length) {
+      pool = pool.filter((c) => {
+        if (!c.forward || !ROAD_TYPES[c.segment.roadType]?.oneWay) return true;
+        let owned = false, mine = false;
+        for (const sid of node.connectedSegmentIds || []) {
+          const os = graph.segments.get(sid);
+          const cn = os && os.rampConnections && os.rampConnections.find((x) => x.atNodeId === nodeId && x.rampSegmentId === c.segment.id && x.movement === 'diverge');
+          if (cn) { owned = true; if (os.id === fromSeg.id) mine = true; }
+        }
+        return !owned || mine;
+      });
+      if (ROAD_TYPES[fromSeg.roadType]?.oneWay && fromSeg.endNodeId === nodeId && pool.length > 1) {
+        const tin = getRoadTangent(graph, fromSeg, 1);
+        const fwdPool = pool.filter((c) => {
+          const tc = getRoadTangent(graph, c.segment, c.forward ? 0 : 1);
+          const dx = c.forward ? tc.x : -tc.x, dz = c.forward ? tc.z : -tc.z;
+          return dx * tin.x + dz * tin.z > -0.3;
+        });
+        if (fwdPool.length) pool = fwdPool;
+      }
+    }
     // Part I/J/K — lane-aware ramp choice at a real Diverge node (createHighwayRampConnection).
     // This is NOT a lane-change AI redesign (Part K's own scope limit): it only decides, for this
     // ONE node, whether a ramp candidate already sitting in the normal `pool` is offered/kept at
@@ -9569,8 +10126,9 @@ export default function CityGridIso() {
     try { clearReason = lotFootprintCheck(fp.cx, fp.cz, fp.w, fp.d, fp.rotationY, { exact: true }); } finally { zoneBuildTypeRef.current = null; }
     diag.footprintClear = clearReason === null;
     if (clearReason) return { zoneOk: true, buildOk: false, reason: clearReason, placement: null, diag };
-    diag.gradingBuildable = computeBuildingGrading(fp.cx, fp.cz, fp.w, fp.d, fp.rotationY).buildable;
-    if (!diag.gradingBuildable) return { zoneOk: true, buildOk: false, reason: 'terrain_too_steep', placement: null, diag };
+    const _grade = computeBuildingGrading(fp.cx, fp.cz, fp.w, fp.d, fp.rotationY);
+    diag.gradingBuildable = _grade.buildable;
+    if (!diag.gradingBuildable) return { zoneOk: true, buildOk: false, reason: _grade.strategy === 'water' ? 'terrain_water' : 'terrain_too_steep', placement: null, diag };
     return { zoneOk: true, buildOk: true, reason: null, placement: { ...fp, parcelId: parcel.id, parcelSource: diag.parcelSource }, diag };
   };
   // Try to actually put the house up. Returns { ok, reason, error?, plan }. Never touches the zone.
@@ -10480,7 +11038,7 @@ export default function CityGridIso() {
     // BUILDING_GRADE_SLOPE_RETAINING is refused outright ("placement禁止") rather than let a house
     // float or bury itself past what a foundation/retaining wall can reasonably hide.
     const grading = computeBuildingGrading(centerX, centerZ, width, depth, rotationY);
-    if (!grading.buildable) return fail('terrain_too_steep');
+    if (!grading.buildable) return fail(grading.strategy === 'water' ? 'terrain_water' : 'terrain_too_steep');
     const mapHalf = (GRID_SIZE * TILE) / 2;
     // Prompt 21F: legacy Tile bookkeeping is rasterized from the ROTATED footprint's real bounds
     // (identical to before for rotation 0), so a house turned to face an east/west road no longer
@@ -11205,17 +11763,18 @@ export default function CityGridIso() {
     const mount = mountRef.current;
     const scene = new THREE.Scene();
     scene.background = new THREE.Color(0x0f1512);
-    scene.fog = new THREE.Fog(0x0f1512, 300, 900);
+    scene.fog = new THREE.Fog(0x0f1512, 300, 1400);
 
-    const viewSize = GRID_SIZE * TILE * 0.62;
+    const viewSize = VIEW_GRID_SIZE * TILE * 0.62;
     const aspect = mount.clientWidth / mount.clientHeight || 1;
     const camera = new THREE.OrthographicCamera((-viewSize * aspect) / 2, (viewSize * aspect) / 2, viewSize / 2, -viewSize / 2, 0.1, 3000);
-    const CAM_DIST = GRID_SIZE * TILE * 0.9;
+    const CAM_DIST = VIEW_GRID_SIZE * TILE * 0.9;
     const CAM_ELEV = Math.atan2(1.1, Math.SQRT2);
     camera.position.set(CAM_DIST * 0.5586, CAM_DIST * 0.6141, CAM_DIST * 0.5586);
     camera.lookAt(0, 0, 0);
 
     const driverCamera = new THREE.PerspectiveCamera(70, aspect, 0.1, 2000);
+    let camGroundY = 0; // smoothed terrain height under the camera's look-at point (Prompt 25)
 
     const renderer = new THREE.WebGLRenderer({ antialias: true });
     renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
@@ -11227,44 +11786,113 @@ export default function CityGridIso() {
     scene.add(new THREE.HemisphereLight(0x8fb8c8, 0x1a2018, 0.8));
     scene.add(new THREE.AmbientLight(0x405048, 0.5));
     const sun = new THREE.DirectionalLight(0xfff4dd, 1.6);
-    sun.position.set(GRID_SIZE * TILE * 0.5, GRID_SIZE * TILE * 0.9, GRID_SIZE * TILE * 0.25);
+    const SUN_OFFSET = new THREE.Vector3(VIEW_GRID_SIZE * TILE * 0.5, VIEW_GRID_SIZE * TILE * 0.9, VIEW_GRID_SIZE * TILE * 0.25);
+    sun.position.copy(SUN_OFFSET);
     sun.castShadow = true;
     sun.shadow.mapSize.set(2048, 2048);
-    const se = GRID_SIZE * TILE * 0.65;
-    Object.assign(sun.shadow.camera, { left: -se, right: se, top: se, bottom: -se, far: GRID_SIZE * TILE * 3 });
+    const se = VIEW_GRID_SIZE * TILE * 0.65;
+    Object.assign(sun.shadow.camera, { left: -se, right: se, top: se, bottom: -se, far: VIEW_GRID_SIZE * TILE * 3 });
     sun.shadow.bias = -0.0015;
     scene.add(sun); scene.add(sun.target);
 
-    // Prompt 16: subdivided one segment per Tile (GRID_SIZE x GRID_SIZE quads -> a vertex sits
-    // exactly on every Tile corner) so the mesh can actually show the heightfield's rolling hills
-    // instead of one flat quad with height baked only into its 4 outer corners. Each vertex world
-    // position lands exactly on a terrainHeight() cache lattice point (see TERRAIN_CACHE_N above),
-    // so the visible Ground mesh and every gameplay terrainHeight() query are the same surface,
-    // sampled at matching points, with zero interpolation mismatch between the two.
-    const groundGeo = new THREE.PlaneGeometry(GRID_SIZE * TILE, GRID_SIZE * TILE, GRID_SIZE, GRID_SIZE);
-    groundGeo.rotateX(-Math.PI / 2);
-    // Built once here (requirement #9: never re-walked per render frame) — every vertex Y comes
-    // straight from the Single Source of Truth (terrainHeight), never a second/duplicated noise
-    // evaluation, so the rendered Ground can never drift from what roads/buildings/Citizens see.
-    {
-      const posAttr = groundGeo.attributes.position;
-      for (let i = 0; i < posAttr.count; i++) {
-        const vx = posAttr.getX(i);
-        const vz = posAttr.getZ(i);
-        posAttr.setY(i, terrainHeight(vx, vz));
+    // ---- Prompt 25: chunked terrain mesh -------------------------------------------------------
+    // The world is TERRAIN_CHUNKS x TERRAIN_CHUNKS chunks of 72 m (36 lattice cells of 2 m). Every
+    // vertex Y is read straight from the graded lattice (_terrainField) that terrainHeight() also
+    // reads, so the rendered ground can never drift from what roads / buildings / vehicles see. When
+    // road construction regrades a chunk (ensureTerrainGraded below) only that chunk's buffers are
+    // rewritten. Vertex attribute aBlend = (rock, sand, snow) weights, computed from slope + height,
+    // is mixed into the base grass colour in the fragment shader — steep cut faces and mountain
+    // flanks read as bare rock, low shores as sand, high peaks as snow.
+    const terrainGroup = new THREE.Group();
+    terrainGroup.name = 'terrainGroup';
+    scene.add(terrainGroup);
+    const TCH = TERRAIN_CHUNK_CELLS, TV = TCH + 1;
+    const terrainChunkIndex = new Uint16Array(TCH * TCH * 6);
+    { let k = 0; for (let j = 0; j < TCH; j++) for (let i = 0; i < TCH; i++) { const a = j * TV + i, b = a + 1, c = a + TV, d = c + 1; terrainChunkIndex[k++] = a; terrainChunkIndex[k++] = c; terrainChunkIndex[k++] = b; terrainChunkIndex[k++] = b; terrainChunkIndex[k++] = c; terrainChunkIndex[k++] = d; } }
+    const terrainMaterial = new THREE.MeshStandardMaterial({ map: makeCheckerTexture(), roughness: 1 });
+    terrainMaterial.onBeforeCompile = (shader) => {
+      shader.vertexShader = shader.vertexShader
+        .replace('#include <common>', '#include <common>\nattribute vec3 aBlend;\nvarying vec3 vBlend;')
+        .replace('#include <begin_vertex>', '#include <begin_vertex>\nvBlend = aBlend;');
+      shader.fragmentShader = shader.fragmentShader
+        .replace('#include <common>', '#include <common>\nvarying vec3 vBlend;')
+        .replace('#include <map_fragment>', `#include <map_fragment>
+          vec3 rockCol = vec3(0.30, 0.285, 0.26);
+          vec3 sandCol = vec3(0.50, 0.45, 0.31);
+          vec3 snowCol = vec3(0.86, 0.89, 0.92);
+          diffuseColor.rgb = mix(diffuseColor.rgb, sandCol, vBlend.y);
+          diffuseColor.rgb = mix(diffuseColor.rgb, rockCol, vBlend.x);
+          diffuseColor.rgb = mix(diffuseColor.rgb, snowCol, vBlend.z);`);
+    };
+    const terrainChunks = [];
+    const _tSst = (a, b, x) => { const t = Math.max(0, Math.min(1, (x - a) / (b - a))); return t * t * (3 - 2 * t); };
+    function updateTerrainChunk(ch) {
+      const pos = ch.pos, nor = ch.nor, blend = ch.blend;
+      const gi0 = ch.ci * TCH, gj0 = ch.cj * TCH;
+      const H = (i, j) => _terrainField[(j < 0 ? 0 : j >= TERRAIN_N ? TERRAIN_N - 1 : j) * TERRAIN_N + (i < 0 ? 0 : i >= TERRAIN_N ? TERRAIN_N - 1 : i)];
+      for (let j = 0; j < TV; j++) {
+        for (let i = 0; i < TV; i++) {
+          const gi = gi0 + i, gj = gj0 + j, v = j * TV + i;
+          const h = H(gi, gj);
+          pos[v * 3] = -TERRAIN_HALF + gi * TERRAIN_STEP; pos[v * 3 + 1] = h; pos[v * 3 + 2] = -TERRAIN_HALF + gj * TERRAIN_STEP;
+          const dx = (H(gi + 1, gj) - H(gi - 1, gj)) / (2 * TERRAIN_STEP), dz = (H(gi, gj + 1) - H(gi, gj - 1)) / (2 * TERRAIN_STEP);
+          const il = 1 / Math.sqrt(dx * dx + 1 + dz * dz);
+          nor[v * 3] = -dx * il; nor[v * 3 + 1] = il; nor[v * 3 + 2] = -dz * il;
+          const steep = 1 - il;
+          const rock = Math.max(_tSst(0.12, 0.34, steep), _tSst(30, 46, h) * 0.8);
+          const snow = _tSst(52, 62, h) * (steep < 0.3 ? 1 : 0.4);
+          const sand = h < 1.8 ? 1 - _tSst(0.6, 1.8, h) : 0;
+          blend[v * 3] = rock; blend[v * 3 + 1] = sand * (1 - rock * 0.7); blend[v * 3 + 2] = snow;
+        }
       }
-      posAttr.needsUpdate = true;
-      groundGeo.computeVertexNormals();
+      ch.geo.attributes.position.needsUpdate = true;
+      ch.geo.attributes.normal.needsUpdate = true;
+      ch.geo.attributes.aBlend.needsUpdate = true;
+      ch.geo.computeBoundingSphere();
     }
-    const ground = new THREE.Mesh(groundGeo, new THREE.MeshStandardMaterial({ map: makeCheckerTexture(), roughness: 1 }));
-    ground.receiveShadow = true;
-    scene.add(ground);
-
-    // Ground plane used for pointer raycasts — offset by terrainHeight(0,0) (a real, non-zero
-    // heightfield sample now) instead of a bare literal 0, so raycasts land at the correct height
-    // near the map origin. This is an approximation away from the origin (a single flat plane
-    // can't follow the full heightfield), matching how it already behaved before this Prompt.
-    const groundPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), -terrainHeight(0, 0));
+    for (let cj = 0; cj < TERRAIN_CHUNKS; cj++) {
+      for (let ci = 0; ci < TERRAIN_CHUNKS; ci++) {
+        const geo = new THREE.BufferGeometry();
+        const pos = new Float32Array(TV * TV * 3), nor = new Float32Array(TV * TV * 3), blend = new Float32Array(TV * TV * 3), uv = new Float32Array(TV * TV * 2);
+        for (let j = 0; j < TV; j++) for (let i = 0; i < TV; i++) {
+          const v = j * TV + i;
+          uv[v * 2] = (ci * TCH + i) / TERRAIN_CELLS; uv[v * 2 + 1] = 1 - (cj * TCH + j) / TERRAIN_CELLS;
+        }
+        geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+        geo.setAttribute('normal', new THREE.BufferAttribute(nor, 3));
+        geo.setAttribute('uv', new THREE.BufferAttribute(uv, 2));
+        geo.setAttribute('aBlend', new THREE.BufferAttribute(blend, 3));
+        geo.setIndex(new THREE.BufferAttribute(terrainChunkIndex, 1));
+        const mesh = new THREE.Mesh(geo, terrainMaterial);
+        mesh.receiveShadow = true;
+        mesh.name = `terrain_${ci}_${cj}`;
+        const ch = { ci, cj, geo, mesh, pos, nor, blend };
+        updateTerrainChunk(ch);
+        terrainChunks[cj * TERRAIN_CHUNKS + ci] = ch;
+        terrainGroup.add(mesh);
+      }
+    }
+    const ground = terrainGroup; // (kept under the old name — threeRef.ground)
+    // Water: one translucent plane at WATER_LEVEL over the whole map; it only shows where the terrain dips below it.
+    const waterMesh = new THREE.Mesh(
+      new THREE.PlaneGeometry(WORLD_SIZE, WORLD_SIZE).rotateX(-Math.PI / 2),
+      new THREE.MeshStandardMaterial({ color: 0x1f5f80, roughness: 0.22, metalness: 0.2, transparent: true, opacity: 0.8, depthWrite: false }),
+    );
+    waterMesh.position.y = WATER_LEVEL;
+    waterMesh.name = 'waterMesh';
+    waterMesh.renderOrder = 1;
+    scene.add(waterMesh);
+    // Regrade (module-level terrainRegrade) then refresh the meshes of the chunks that changed.
+    // Called before any road mesh / Tile-road instance is (re)built, so they always sample the final ground.
+    function ensureTerrainGraded() {
+      const g = gridRef.current, tiles = [];
+      for (let ty = 0; ty < GRID_SIZE; ty++) for (let tx = 0; tx < GRID_SIZE; tx++) if (g[ty * GRID_SIZE + tx] === TILE_ROAD) tiles.push({ tx, ty });
+      const changed = terrainRegrade(collectRoadGradeFeatures(roadNetworkRef.current, tiles));
+      for (const [ci, cj] of changed) updateTerrainChunk(terrainChunks[cj * TERRAIN_CHUNKS + ci]);
+      return changed.length;
+    }
+    // Pointer picking follows the real terrain (a flat plane was fine at +-3 m hills, not at 70 m mountains).
+    const groundPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), -WATER_LEVEL);
     const dummy = new THREE.Object3D();
     const wheelDummy = new THREE.Object3D();
 
@@ -11310,6 +11938,7 @@ export default function CityGridIso() {
       return freeRoadDeckSideMaterial;
     }
     function rebuildFreeRoadSegmentMesh(segment) {
+      ensureTerrainGraded(); // Prompt 25: level the ground for this road (and any others) BEFORE sampling its height
       const existing = freeRoadGroup.getObjectByName(segment.id);
       if (existing) { freeRoadGroup.remove(existing); existing.geometry.dispose(); }
       const deckSideName = segment.id + '__deckside';
@@ -11970,6 +12599,16 @@ export default function CityGridIso() {
     // separate support-only shape) and, per interval, picks embankment vs. pillars vs. cut-trench
     // vs. tunnel vs. nothing, purely from how far the road surface sits above (or below) the
     // terrain sample directly under it.
+    // Prompt 25: a viaduct / ramp passing over a road that lies on the ground must not plant a pillar
+    // in that road's pavement (the initial interchange crosses a ground-level boulevard).
+    function groundRoadBlocksPillar(network, pt, segment) {
+      for (const other of network.segments.values()) {
+        if (other === segment || !isRoadSegmentAtGrade(other)) continue;
+        const hit = closestPointOnRoadSegment(network, other, pt.p.x, pt.p.z);
+        if (hit.distance < getRoadWidth(other) / 2 + 2.5) return true;
+      }
+      return false;
+    }
     function buildFreeRoadSupportForSegment(network, segment) {
       const SAMPLE_N = 16;
       const halfW = getRoadWidth(segment) / 2;
@@ -12002,7 +12641,7 @@ export default function CityGridIso() {
       let lastPillarS = -Infinity;
       pts.forEach((pt) => {
         const clearance = pt.p.y - pt.terrainY;
-        if (clearance > ROAD_EMBANKMENT_MAX_HEIGHT && pt.s - lastPillarS >= pillarSpacing) {
+        if (clearance > ROAD_EMBANKMENT_MAX_HEIGHT && pt.s - lastPillarS >= pillarSpacing && !groundRoadBlocksPillar(network, pt, segment)) {
           addPillarCluster(pt, halfW, segment);
           lastPillarS = pt.s;
         }
@@ -12300,6 +12939,7 @@ export default function CityGridIso() {
     }
 
     function rebuildFreeRoadSupportStructures() {
+      ensureTerrainGraded(); // Prompt 25: also runs after a road is DELETED, restoring the natural ground it had levelled
       while (freeRoadSupportGroup.children.length) {
         const c = freeRoadSupportGroup.children.pop();
         c.geometry.dispose();
@@ -12404,7 +13044,7 @@ export default function CityGridIso() {
       let e = Math.max(FREE_ROAD_ELEV_MAX_BELOW, Math.min(maxAbove, candidateElev));
       const len = Math.hypot(d.endPreviewPos.x - d.startPos.x, d.endPreviewPos.z - d.startPos.z);
       if (len > 0.01) {
-        const startY = terrainHeight(d.startPos.x, d.startPos.z) + d.startElevation;
+        const startY = roadBaseY(d.startPos.x, d.startPos.z) + d.startElevation;
         const endTerrainY = terrainHeight(d.endPreviewPos.x, d.endPreviewPos.z);
         const maxRise = len * MAX_ROAD_GRADE;
         const rise = (endTerrainY + e) - startY;
@@ -12890,7 +13530,7 @@ export default function CityGridIso() {
       if (len > 0.01) {
         const otherNode = whichEnd === 'start' ? b : a;
         const thisNode = whichEnd === 'start' ? a : b;
-        const otherY = terrainHeight(otherNode.position.x, otherNode.position.z) + seg.elevation[otherEnd];
+        const otherY = roadBaseY(otherNode.position.x, otherNode.position.z) + seg.elevation[otherEnd];
         const thisTerrainY = terrainHeight(thisNode.position.x, thisNode.position.z);
         const maxRise = len * MAX_ROAD_GRADE;
         const rise = (thisTerrainY + candidate) - otherY;
@@ -13810,6 +14450,7 @@ export default function CityGridIso() {
       return geo;
     }
     function rebuildRoadsideLandOverlay() {
+      ensureTerrainGraded();
       while (roadsideLandGroup.children.length) {
         const c = roadsideLandGroup.children.pop();
         c.geometry.dispose();
@@ -13822,7 +14463,9 @@ export default function CityGridIso() {
             const parcel = createParcelAlongFrontage(network, segment.id, side, band);
             if (!parcel) continue;
             landParcelsRef.current.set(parcel.id, parcel);
-            const y = terrainHeight(0, 0) + 0.01 + band * 0.001; // tiny per-band lift so band edges don't z-fight
+            let hy = -1e9; // Prompt 25: this debug overlay is a flat polygon — lay it just above the highest ground under it
+            for (const q of parcel.polygon) hy = Math.max(hy, terrainHeight(q.x, q.z));
+            const y = hy + 0.05 + band * 0.001; // tiny per-band lift so band edges don't z-fight
             const geo = polygonToFlatGeometry(parcel.polygon, y);
             const mesh = new THREE.Mesh(geo, roadsideLandMaterialForBand(band));
             mesh.name = parcel.id;
@@ -14506,6 +15149,7 @@ export default function CityGridIso() {
     };
 
     const syncInstances = () => {
+      ensureTerrainGraded(); // Prompt 25: Tile roads level their own 6 m squares of ground too
       const grid = gridRef.current, level = levelRef.current, connected = connectedRef.current;
       // Prompt 20O: needed so the generic instanced building pass below can skip any tile a World
       // Space Building (RES Lot / COM / IND) already owns — see the isZoneType(v) branch's
@@ -14818,38 +15462,18 @@ export default function CityGridIso() {
     // Tile-grid highway generation as the primary implementation is prohibited). Only done once,
     // on first mount, before the very first recomputeConnectivity()/syncInstances() below.
     {
+      // Prompt 25: the starting highway is now a 15 m viaduct, 3x longer than before, carrying a
+      // grade-separated interchange (partial cloverleaf: loop ramps + slip ramps over a ground-level
+      // boulevard) and descending to a ground-level IC stub. The geometry is authored in
+      // buildInitialHighwayNetwork (module level, headless-testable); here we only level the ground
+      // for its at-grade parts and build the meshes exactly like a player-drawn Free Road.
       const network = roadNetworkRef.current;
-      const mapHalf = (GRID_SIZE * TILE) / 2;
-      const midY = Math.floor(GRID_SIZE / 2);
-      const midZ = tileWorldZ(midY);
-      const HIGHWAY_LEN = 8; // world-space span (in tile units) of highway, from the map edge inward — matches the old tile span
-      const IC_STUB_LEN = 3; // world-space span (in tile units) of ordinary road right after the highway ends, for the player to build from
-
-      // Part B — highway start node (ON the map boundary — this doubles as the Part E external
-      // gate location) / end node (city-side), plus the highway RoadSegment itself, using
-      // roadType 'highway' (existing ROAD_TYPES.highway — Part C: no separate geometry rule, this
-      // is the exact shared getRoadPoint/getRoadTangent/getRoadNormal/getRoadWidth/getRoadLayout/
-      // buildRoadSegmentGeometry pipeline every Free Road segment uses).
-      const outerX = -mapHalf;
-      const innerX = tileWorldX(HIGHWAY_LEN);
-      const icEndX = tileWorldX(HIGHWAY_LEN + IC_STUB_LEN);
-      const outerNode = addRoadNodeToNetwork(network, makeRoadNode(outerX, terrainHeight(outerX, midZ), midZ));
-      const innerNode = addRoadNodeToNetwork(network, makeRoadNode(innerX, terrainHeight(innerX, midZ), midZ));
-      const icEndNode = addRoadNodeToNetwork(network, makeRoadNode(icEndX, terrainHeight(icEndX, midZ), midZ));
-      const highwaySegment = addRoadSegmentToNetwork(network, makeRoadSegment(outerNode.id, innerNode.id, { roadType: 'highway' }));
-      // Part H — the IC stub (ordinary road) connecting the highway to the (future) city network,
-      // also a native World Space RoadSegment, chained onto the highway's own inner RoadNode so
-      // "Highway -> ordinary road -> city network" is real RoadNode topology, never a Tile-
-      // adjacency coincidence. The player can extend it further with the Free Road tool (it snaps
-      // onto icEndNode via the normal findGraphNodeNear node-snap, same as any other junction).
-      const icSegment = addRoadSegmentToNetwork(network, makeRoadSegment(innerNode.id, icEndNode.id, { roadType: 'two' }));
-
-      // Part C/D — render this exactly like any player-drawn Free Road segment: real asphalt +
-      // lane-marking + median + shoulder mesh (Part D visual), junction caps, roadside-land /
-      // building-parcel registries, and support structures (a no-op today since elevation is
-      // {0,0}, kept only for consistency with every other call site that mutates roadNetworkRef).
-      rebuildFreeRoadSegmentMesh(highwaySegment);
-      rebuildFreeRoadSegmentMesh(icSegment);
+      const midZ = tileWorldZ(Math.floor(GRID_SIZE / 2));
+      const built = buildInitialHighwayNetwork(network, { outerX: -MAP_HALF, z0: midZ, xc: IC_CROSSING_X });
+      ensureTerrainGraded();
+      syncRoadNodeHeights(network);
+      network.segments.forEach((seg) => rebuildFreeRoadSegmentMesh(seg));
+      built.gores.forEach((g) => rebuildGoreMesh(g.key, g.points));
       rebuildFreeRoadJunctionCaps();
       rebuildFreeRoadSupportStructures();
       rebuildRoadsideLandOverlay();
@@ -15993,15 +16617,24 @@ export default function CityGridIso() {
       if (mx || mz) {
         camTargetRef.current = { x: camTarget.x + mx * panSpeed * dt, z: camTarget.z + mz * panSpeed * dt };
       }
+      // Prompt 25: keep the camera inside the (3x larger) map and let it ride over the terrain — the
+      // look-at point follows the ground height (smoothed) so mountains never slide the view around.
+      if (Math.abs(camTargetRef.current.x) > MAP_HALF || Math.abs(camTargetRef.current.z) > MAP_HALF) {
+        camTargetRef.current = { x: Math.max(-MAP_HALF, Math.min(MAP_HALF, camTargetRef.current.x)), z: Math.max(-MAP_HALF, Math.min(MAP_HALF, camTargetRef.current.z)) };
+      }
       const target = camTargetRef.current;
+      const groundAtTarget = Math.max(WATER_LEVEL, terrainHeight(target.x, target.z));
+      camGroundY += (groundAtTarget - camGroundY) * Math.min(1, dt * 4);
       const horiz = Math.cos(CAM_ELEV);
       const offset = new THREE.Vector3(Math.sin(az) * horiz, Math.sin(CAM_ELEV), Math.cos(az) * horiz).multiplyScalar(CAM_DIST);
-      camera.position.set(target.x + offset.x, offset.y, target.z + offset.z);
+      camera.position.set(target.x + offset.x, camGroundY + offset.y, target.z + offset.z);
       camera.up.set(0, 1, 0);
-      camera.lookAt(target.x, 0, target.z);
+      camera.lookAt(target.x, camGroundY, target.z);
       camera.zoom = zoomRef.current;
       camera.updateProjectionMatrix();
-      sun.target.position.set(target.x, 0, target.z);
+      // the sun (and its shadow frustum) travels with the view so shadows stay sharp anywhere on the big map
+      sun.position.set(target.x + SUN_OFFSET.x, camGroundY + SUN_OFFSET.y, target.z + SUN_OFFSET.z);
+      sun.target.position.set(target.x, camGroundY, target.z);
 
       // ---- traffic signal phase cycle: ns green -> ns yellow -> ew green -> ew yellow -> ns ...
       // Each lens mesh's material always exists (red/yellow/green all rendered every frame); only
@@ -17457,8 +18090,25 @@ export default function CityGridIso() {
     const rect = t.renderer.domElement.getBoundingClientRect();
     const ndc = new THREE.Vector2(((clientX - rect.left) / rect.width) * 2 - 1, -((clientY - rect.top) / rect.height) * 2 + 1);
     t.raycaster.setFromCamera(ndc, t.camera);
+    // Prompt 25: march the ray down onto the real terrain (water counts as a surface at WATER_LEVEL),
+    // so clicks land on the ground under the cursor even on a 70 m mountain.
+    const ray = t.raycaster.ray, o = ray.origin, d = ray.direction;
+    if (d.y < -1e-6) {
+      const sTop = Math.max(0, (TERRAIN_MAX_PICK_Y - o.y) / d.y), sBot = (WATER_LEVEL - 20 - o.y) / d.y;
+      const surf = (s) => { const x = o.x + d.x * s, z = o.z + d.z * s; return Math.max(WATER_LEVEL, terrainHeight(x, z)); };
+      let prev = sTop;
+      for (let s = sTop; s <= sBot; s += 1.5) {
+        if (o.y + d.y * s <= surf(s)) {
+          let lo = prev, hi = s;
+          for (let k = 0; k < 14; k++) { const mid = (lo + hi) / 2; if (o.y + d.y * mid <= surf(mid)) hi = mid; else lo = mid; }
+          const x = o.x + d.x * hi, z = o.z + d.z * hi;
+          return new THREE.Vector3(x, surf(hi), z);
+        }
+        prev = s;
+      }
+    }
     const point = new THREE.Vector3();
-    return t.raycaster.ray.intersectPlane(t.groundPlane, point) ? point : null;
+    return ray.intersectPlane(t.groundPlane, point) ? point : null;
   }, []);
 
   const raycastCar = useCallback((clientX, clientY) => {
@@ -17558,6 +18208,8 @@ export default function CityGridIso() {
     // silently eat a placed facility).
     const eduGrid = eduFacilityIdGridRef.current;
     if (eduGrid[i] !== -1) { if (t === 'edu_remove') removeEducationFacility(eduGrid[i]); return; }
+    // Prompt 25: no Tile roads / zones on open water or the shoreline (free roads bridge water instead).
+    if ((t.startsWith('road_') || t === 'zone_res' || t === 'zone_com' || t === 'zone_ind') && terrainIsWater(tileWorldX(tx), tileWorldZ(ty))) return;
     let changed = false, roadChanged = false, roadCost = 0;
     if (t.startsWith('road_')) {
       const typeKey = t.slice(5);
