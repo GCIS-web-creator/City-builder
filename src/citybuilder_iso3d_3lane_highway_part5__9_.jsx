@@ -1198,7 +1198,11 @@ function getRoadEdgeHalfWidths(segment, t) {
     const half = total / 2;
     return { posHalf: half, negHalf: half };
   }
-  const nearHalf = Math.max(0.05, total - et.farHalf);
+  // Prompt 28: the reduction removes ONE lane from the near (ramp) carriageway only — the near edge recedes to the
+  // reduced type's own half-width (total/2), NOT `total - farHalf`, which subtracted the symmetric shrink of BOTH
+  // carriageways from the near side alone and ate the whole near carriageway (bare gap between mainline and ramp,
+  // near lane off the pavement — the "分岐がおかしい" report). The far curb stays pinned at farHalf as before.
+  const nearHalf = Math.max(0.05, total / 2);
   return et.lateralSign > 0 ? { posHalf: nearHalf, negHalf: et.farHalf } : { posHalf: et.farHalf, negHalf: nearHalf };
 }
 // Part 20I-C/D — structural deck thickness for highway-class RoadSegments. The asphalt ribbon
@@ -1287,6 +1291,9 @@ function buildRoadSegmentGeometry(network, segment, subdivisions = 20) {
   // cover (the old normalized-t mapping is exactly what made curved-road paint smear/warp).
   let prevPoint = null;
   let cumulativeDist = 0;
+  // Prompt 28: ramp-class ribbons overlap the mainline's outer lane along their parallel run — lift them a hair
+  // higher so the ramp reads as one clean surface instead of z-fighting with the mainline asphalt.
+  const _ribbonLift = isRampRoadType(ROAD_TYPES[segment.roadType]) ? 0.03 : 0.015;
   for (let i = 0; i <= subdivisions; i++) {
     const t = i / subdivisions;
     // Prompt 20K-fix Part B: sampled per cross-section — for an ordinary (non-tapered) segment
@@ -1306,8 +1313,8 @@ function buildRoadSegmentGeometry(network, segment, subdivisions = 20) {
     // posHalf/negHalf replace the old single symmetric halfW so a segment carrying `edgeTaper`
     // (see getRoadEdgeHalfWidths) draws its two edges independently instead of both moving in
     // lockstep around a fixed centerline.
-    positions.push(p.x + n.x * posHalf, p.y + 0.015, p.z + n.z * posHalf);
-    positions.push(p.x - n.x * negHalf, p.y + 0.015, p.z - n.z * negHalf);
+    positions.push(p.x + n.x * posHalf, p.y + _ribbonLift, p.z + n.z * posHalf);
+    positions.push(p.x - n.x * negHalf, p.y + _ribbonLift, p.z - n.z * negHalf);
     uvs.push(1, v, 0, v);
   }
   const indices = [];
@@ -1645,7 +1652,109 @@ function addRampBezierChain(network, startNode, endNode, ctrl, roadType, elevSta
 // outer curb on one edge and the ramp's own far/separating edge on the other. Deliberately NOT a
 // RoadSegment — the render layer (rebuildGoreMesh) turns these bare points into a purely
 // decorative Mesh: no collision, no vehicle route, no RoadSegment topology (Part F absolute list).
-function buildGorePolygonPoints(highwayRt, rampRt, takeoffPos, tangent, normal, lateralSign, alongSign, elevAtTakeoff) {
+// Prompt 28 — the old triangle below hung its outer corner 2x the ramp's half-width out from the takeoff
+// point, i.e. on top of / outboard of the ramp's OWN parallel run (the "分岐がおかしい" report: a striped wedge
+// floating beside the ramp instead of sitting in the V between the ramp and the mainline). The wedge is now
+// derived from the ramp's real centreline + the mainline's real near-edge (see buildGorePolygonPoints).
+function _rampSegSamples(seg, posOf, steps, reverse) {
+  const aP = seg.visualStartOverride || posOf(seg.startNodeId);
+  const bP = seg.visualEndOverride || posOf(seg.endNodeId);
+  const out = [];
+  if (!aP || !bP) return out;
+  for (let i = 0; i <= steps; i++) {
+    const t = reverse ? 1 - i / steps : i / steps;
+    let x, z;
+    if (seg.curve && seg.curve.controlPoint) {
+      const c = seg.curve.controlPoint, omt = 1 - t;
+      x = omt * omt * aP.x + 2 * omt * t * c.x + t * t * bP.x;
+      z = omt * omt * aP.z + 2 * omt * t * c.z + t * t * bP.z;
+    } else { x = aP.x + (bP.x - aP.x) * t; z = aP.z + (bP.z - aP.z) * t; }
+    out.push({ x, z, elev: seg.elevation.start + (seg.elevation.end - seg.elevation.start) * t });
+  }
+  return out;
+}
+// segsAway: the ramp's segments ordered from the highway outward. reverse=true when they run toward the
+// highway (an on-ramp: every segment's own start->end is ground->highway), so each is sampled backwards.
+function sampleRampPathAway(segsAway, posOf, reverse) {
+  const pts = [];
+  segsAway.forEach((seg, idx) => {
+    const smp = _rampSegSamples(seg, posOf, 20, !!reverse);
+    pts.push(...(idx === 0 ? smp : smp.slice(1)));
+  });
+  return pts;
+}
+// Distance from the highway centreline to the mainline's ramp-side paved edge, as a function of the distance
+// `a` travelled from the takeoff point along the ramp's own direction (reads the real lane-reduction zone).
+function _mainlineNearEdgeFn(split, direction, lateralSign) {
+  const near = (seg, t) => { const h = getRoadEdgeHalfWidths(seg, t); return lateralSign > 0 ? h.posHalf : h.negHalf; };
+  if (!split) return null;
+  if (direction === 'off') {
+    if (split.zone && split.zone.segments && split.zone.segments.length) {
+      const seg0 = split.zone.segments[0];
+      return (a) => near(seg0, Math.max(0, Math.min(1, a / LANE_TAPER_LENGTH)));
+    }
+    const sb = split.segB;
+    return sb ? () => near(sb, 0.5) : null;
+  }
+  const segs = split.beforeZone && split.beforeZone.segments && split.beforeZone.segments.length ? split.beforeZone.segments : (split.segA ? [split.segA] : []);
+  const steady = segs[segs.length - 1];
+  return steady ? () => near(steady, 0.5) : null;
+}
+function buildGorePolygonPoints(highwayRt, rampRt, takeoffPos, tangent, normal, lateralSign, alongSign, elevAtTakeoff, rampPath, nearEdgeAt) {
+  if (rampPath && rampPath.length >= 3) {
+    const poly = _buildGoreFromRampPath(highwayRt, rampRt, takeoffPos, tangent, normal, lateralSign, alongSign, elevAtTakeoff, rampPath, nearEdgeAt);
+    if (poly) return poly;
+  }
+  return _buildLegacyGoreTriangle(highwayRt, rampRt, takeoffPos, tangent, normal, lateralSign, alongSign, elevAtTakeoff);
+}
+function _buildGoreFromRampPath(highwayRt, rampRt, takeoffPos, tangent, normal, lateralSign, alongSign, elevAtTakeoff, rampPath, nearEdgeAt) {
+  const rampHalf = getRoadFootprintHalfWidth(rampRt);
+  const outerOffset = highwayOuterLaneOffset(highwayRt);
+  const fullHalf = roadHalfWidth(highwayRt.hubMul).rhw;
+  const nh = (a) => (nearEdgeAt ? nearEdgeAt(Math.max(0, a)) : fullHalf);
+  const latDir = { x: normal.x * lateralSign, z: normal.z * lateralSign };
+  const n = rampPath.length;
+  const inner = [];
+  for (let i = 0; i < n; i++) {
+    const P = rampPath[i], Q = rampPath[Math.min(i + 1, n - 1)], R = rampPath[Math.max(i - 1, 0)];
+    let dx = Q.x - R.x, dz = Q.z - R.z;
+    const len = Math.hypot(dx, dz) || 1; dx /= len; dz /= len;
+    let mx = -dz, mz = dx; // ramp's outward (away-from-highway side) normal
+    if (mx * latDir.x + mz * latDir.z < 0) { mx = -mx; mz = -mz; }
+    const ix = P.x - mx * rampHalf, iz = P.z - mz * rampHalf; // the ramp's inner (highway-facing) edge
+    const rx = ix - takeoffPos.x, rz = iz - takeoffPos.z;
+    const a = (rx * tangent.x + rz * tangent.z) * alongSign;
+    const latC = outerOffset + (rx * latDir.x + rz * latDir.z);
+    inner.push({ x: ix, z: iz, elev: P.elev, a, g: latC - nh(a) });
+  }
+  let k = -1;
+  for (let i = 0; i < n; i++) { if (inner[i].g >= 0.02) { k = i; break; } }
+  if (k < 0) return null; // the ramp never clears the mainline edge inside the sampled span
+  const mainPt = (a, elev) => {
+    const lat = nh(a) - outerOffset;
+    const x = takeoffPos.x + tangent.x * alongSign * a + latDir.x * lat;
+    const z = takeoffPos.z + tangent.z * alongSign * a + latDir.z * lat;
+    return { x, z, elev };
+  };
+  let aApex, apexElev;
+  if (k === 0) { aApex = Math.max(0, inner[0].a); apexElev = inner[0].elev; }
+  else {
+    const g0 = inner[k - 1].g, g1 = inner[k].g;
+    const f = (g1 - g0) > 1e-6 ? Math.max(0, Math.min(1, -g0 / (g1 - g0))) : 1;
+    aApex = Math.max(0, inner[k - 1].a + (inner[k].a - inner[k - 1].a) * f);
+    apexElev = inner[k - 1].elev + (inner[k].elev - inner[k - 1].elev) * f;
+  }
+  let j = k;
+  while (j < n - 1 && (inner[j].a - aApex) < GORE_LENGTH && inner[j].g < rampHalf * 2) j++;
+  if (j === k && k < n - 1) j = k + 1;
+  const yAt = (pt) => roadBaseY(pt.x, pt.z) + (pt.elev !== undefined ? pt.elev : elevAtTakeoff) + 0.025;
+  const pts = [mainPt(aApex, apexElev)];
+  for (let i = k; i <= j; i++) pts.push(mainPt(Math.max(aApex, inner[i].a), inner[i].elev));
+  for (let i = j; i >= k; i--) pts.push({ x: inner[i].x, z: inner[i].z, elev: inner[i].elev });
+  if (pts.length < 3) return null;
+  return pts.map((pt) => ({ x: pt.x, y: yAt(pt), z: pt.z }));
+}
+function _buildLegacyGoreTriangle(highwayRt, rampRt, takeoffPos, tangent, normal, lateralSign, alongSign, elevAtTakeoff) {
   const { rhw } = roadHalfWidth(highwayRt.hubMul);
   const rampHalf = getRoadFootprintHalfWidth(rampRt);
   const outerOffset = highwayOuterLaneOffset(highwayRt);
@@ -1662,6 +1771,65 @@ function buildGorePolygonPoints(highwayRt, rampRt, takeoffPos, tangent, normal, 
     y, z: takeoffPos.z + tangent.z * alongSign * GORE_LENGTH + normal.z * rampLateral,
   };
   return [apex, mainFar, rampFar];
+}
+// Prompt 28 — a ramp that lands on an ordinary road used to end exactly on that road's CENTRELINE node, so its
+// paved ribbon (and guardrails) ran across half of the carriageway and blocked the through lanes. The ramp's
+// topology still ends at the shared node (routing unchanged), but its DRAWN end is now pulled back to the road's
+// paved edge (visualStart/EndOverride, same mechanism as the takeoff end) so the ramp meets the road as a real
+// T-junction / crossing: the road's own junction fan (ramp-class segments are excluded from it) stays a clean
+// through-road. Arrivals close to parallel with the road (a loop ramp merging in) are set to end on the road's
+// edge lane instead, with the last bezier's control point shifted so the ramp still enters heading along the road.
+// Returns the ids of the ramp segments whose drawn end moved (caller rebuilds their meshes).
+function pullRampEndsToRoadEdge(network, nodeId) {
+  const node = network.nodes.get(nodeId);
+  if (!node) return [];
+  const ids = Array.from(new Set(node.connectedSegmentIds || [])).filter((id) => network.segments.has(id));
+  const rampIds = ids.filter((id) => isRampRoadType(ROAD_TYPES[network.segments.get(id).roadType]));
+  const roadIds = ids.filter((id) => !rampIds.includes(id));
+  if (roadIds.length < 2 || !rampIds.length) return [];
+  if (roadIds.some((id) => { const rt = ROAD_TYPES[network.segments.get(id).roadType]; return !rt || rt.highway || isRampRoadType(rt); })) return [];
+  const ref = network.segments.get(roadIds[0]);
+  const rt0 = getRoadTangent(network, ref, ref.endNodeId === nodeId ? 1 : 0);
+  const nR = { x: -rt0.z, z: rt0.x };
+  let halfW = 0;
+  roadIds.forEach((id) => {
+    const sg = network.segments.get(id);
+    const h = getRoadEdgeHalfWidths(sg, sg.endNodeId === nodeId ? 1 : 0);
+    halfW = Math.max(halfW, h.posHalf, h.negHalf);
+  });
+  if (!(halfW > 0)) return [];
+  const edge = Math.max(0.1, halfW - 0.05); // tuck 5cm under the road so no hairline gap shows
+  const moved = [];
+  rampIds.forEach((id) => {
+    const r = network.segments.get(id);
+    const atStart = r.startNodeId === nodeId;
+    if (atStart ? r.visualStartOverride : r.visualEndOverride) return; // already anchored (a mainline takeoff end)
+    const tan = getRoadTangent(network, r, atStart ? 0 : 1);
+    const d = atStart ? { x: tan.x, z: tan.z } : { x: -tan.x, z: -tan.z }; // unit vector from the node back along the ramp
+    const cosPhi = Math.abs(d.x * nR.x + d.z * nR.z);
+    const probe = getRoadPoint(network, r, atStart ? 0.4 : 0.6);
+    let side = Math.sign((probe.x - node.position.x) * nR.x + (probe.z - node.position.z) * nR.z);
+    if (!side) side = Math.sign(d.x * nR.x + d.z * nR.z) || 1;
+    const other = network.nodes.get(atStart ? r.endNodeId : r.startNodeId);
+    const chord = other ? Math.hypot(other.position.x - node.position.x, other.position.z - node.position.z) : 1e9;
+    let endPt;
+    if (cosPhi >= 0.5) {
+      // crossing / T arrival: slide back along the ramp's own line until it reaches the road's edge
+      let sLen = edge / cosPhi;
+      if (r.curve && r.curve.controlPoint) sLen = Math.min(sLen, 0.8 * Math.hypot(r.curve.controlPoint.x - node.position.x, r.curve.controlPoint.z - node.position.z));
+      sLen = Math.min(sLen, 0.45 * chord);
+      endPt = { x: node.position.x + d.x * sLen, z: node.position.z + d.z * sLen };
+    } else {
+      // near-parallel arrival (merge): land on the road's edge lane at the same station along the road
+      endPt = { x: node.position.x + nR.x * side * edge, z: node.position.z + nR.z * side * edge };
+      if (r.curve && r.curve.controlPoint) {
+        r.curve = { controlPoint: { x: r.curve.controlPoint.x + nR.x * side * edge, y: 0, z: r.curve.controlPoint.z + nR.z * side * edge } };
+      }
+    }
+    if (atStart) r.visualStartOverride = endPt; else r.visualEndOverride = endPt;
+    moved.push(r.id);
+  });
+  return moved;
 }
 // opts: { direction: 'on'|'off', side: 'left'|'right', rampType, endpointNodeId?, endpointPoint?:{x,z}, dryRun? }
 // Exactly one of endpointNodeId (snap onto an existing node — Part T) / endpointPoint (mint a
@@ -2138,7 +2306,10 @@ function createCounterpartRampHead(network, oppositeSeg, tOpposite, counterpartD
     highwaySegmentId: beforeSeg.id, highwayT: 1, highwayLaneIndex, side: lateralSign === -1 ? 'left' : 'right',
     rampSegmentId: headSeg.id, movement: counterpartDirection === 'off' ? 'diverge' : 'merge', atNodeId: hwNode.id,
   });
-  const gorePoints = buildGorePolygonPoints(highwayRt, rampRt, takeoffPos, tangent, normal, lateralSign, alongSign, hwElevAtSplit);
+  const _cNodePos = new Map([[hwNode.id, hwNode.position], [sepNode.id, sepNode.position], [endNode.id, endNode.position]]);
+  const _cPosOf = (id) => _cNodePos.get(id) || (network.nodes.get(id) && network.nodes.get(id).position);
+  const _cRamp = sampleRampPathAway([headSeg, stubSeg], _cPosOf, counterpartDirection === 'on');
+  const gorePoints = buildGorePolygonPoints(highwayRt, rampRt, takeoffPos, tangent, normal, lateralSign, alongSign, hwElevAtSplit, _cRamp, _mainlineNearEdgeFn(mainlineSplit, counterpartDirection, lateralSign));
   // Part AH — every segment this call actually created on the opposite carriageway, so a later
   // full-station delete can tear the whole thing out and reconnect origNearNodeId->origFarNodeId
   // as one plain full-width segment again (mirrors the equivalent list built for the primary ramp
@@ -2203,6 +2374,7 @@ function continueRampHead(network, headEndNodeId, endpointOpts, dryRun) {
     if (headSeg) headSeg.rampHeadIncomplete = false; // Part AE: route becomes active only once BOTH pieces are cleared
     endNode.isRampHeadEndpoint = false;
     pair.status = 'complete';
+    pullRampEndsToRoadEdge(network, farNode.id); // Prompt 28: T-junction at the road's edge, not its centreline
   }
   return { ok: true, farNode, continuationSegments: chain.segments, pairId: pair.id };
 }
@@ -2332,7 +2504,16 @@ function createHighwayRampConnection(network, highwaySegmentId, t, opts = {}) {
   // Part F/S: painted gore wedge — bare points only, no RoadSegment, no collision/route/topology.
   // Prompt 20K Part A: anchored at takeoffPos (the highway's outer-lane point) instead of hwNode's
   // centerline position — the apex now lines up with where the ramp visually actually starts.
-  const gorePoints = buildGorePolygonPoints(highwayRt, rampRt, takeoffPos, tangent, normal, lateralSign, alongSign, hwElevAtSplit);
+  // Prompt 28: real gore wedge from the ramp's actual centreline + the mainline's actual near edge (dryRun-safe:
+  // positions come from the just-built plain node objects, not from the network).
+  const _nodePos = new Map([[hwNode.id, hwNode.position], [sepNode.id, sepNode.position], [endNode.id, endNode.position]]);
+  if (chain.midNode) _nodePos.set(chain.midNode.id, chain.midNode.position);
+  const _posOf = (id) => _nodePos.get(id) || (network.nodes.get(id) && network.nodes.get(id).position);
+  const _awaySegs = [segA, ...(direction === 'off' ? chain.segments : chain.segments.slice().reverse())];
+  const _ramp = sampleRampPathAway(_awaySegs, _posOf, direction === 'on');
+  const gorePoints = buildGorePolygonPoints(highwayRt, rampRt, takeoffPos, tangent, normal, lateralSign, alongSign, hwElevAtSplit, _ramp, _mainlineNearEdgeFn(mainlineSplit, direction, lateralSign));
+  // Prompt 28: land on the ground road's EDGE (T-junction), not its centreline.
+  if (!dryRun) pullRampEndsToRoadEdge(network, endNode.id);
   const result = {
     ok: true,
     takeoffNode: hwNode, sepNode, segA, midNode: chain.midNode,
@@ -2544,7 +2725,10 @@ function buildInitialHighwayNetwork(network, cfg) {
     // painted gore wedge between viaduct and ramp
     const tangent = { x: 1, z: 0 }, normal = { x: 0, z: 1 };
     const alongSignWorld = alongSignLocal * r; // world-x direction of the ramp relative to hwNode (tangent = +x)
-    gores.push({ key: segA.id, points: buildGorePolygonPoints(hwRt, rampRt, takeoff, tangent, normal, lateral, alongSignWorld, E) });
+    const _icPosOf = (id) => network.nodes.get(id).position;
+    const _icAway = [segA, ...(kind === 'off' ? chain.segments : chain.segments.slice().reverse())];
+    const _icPath = sampleRampPathAway(_icAway, _icPosOf, kind === 'on');
+    gores.push({ key: segA.id, points: buildGorePolygonPoints(hwRt, rampRt, takeoff, tangent, normal, lateral, alongSignWorld, E, _icPath, null) });
     if (kind === 'off') offRecords.push({ hwNodeId: hwNode.id, rampSegId: segA.id, eastbound: r > 0 });
     return { segA, chain };
   }
@@ -2574,6 +2758,8 @@ function buildInitialHighwayNetwork(network, cfg) {
       addRamp(r, 'off', hwU, arc, loopEndNode);
     }
   }
+  // Prompt 28: every slip/loop ramp lands on the boulevard's EDGE (T-junction / merge), not its centreline.
+  cNodes.forEach((nd) => pullRampEndsToRoadEdge(network, nd.id));
   // Diverge metadata: a car may only take an exit while it is on the carriageway that owns it, in the
   // outermost lane (see pickNextSegmentAtNode) — recorded on the mainline segment a car arrives on.
   const laneGroups = laneOffsetGroups(hwRt);
@@ -12030,7 +12216,7 @@ export default function CityGridIso() {
         ctx.restore();
         const tex = new THREE.CanvasTexture(canvas);
         tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
-        freeRoadGoreMaterial = new THREE.MeshStandardMaterial({ map: tex, roughness: 0.9 });
+        freeRoadGoreMaterial = new THREE.MeshStandardMaterial({ map: tex, roughness: 0.9, side: THREE.DoubleSide });
       }
       return freeRoadGoreMaterial;
     }
@@ -12048,7 +12234,8 @@ export default function CityGridIso() {
       const geo = new THREE.BufferGeometry();
       geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
       geo.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2));
-      geo.setIndex([0, 1, 2]);
+      const _fan = []; for (let i = 1; i < points.length - 1; i++) _fan.push(0, i, i + 1);
+      geo.setIndex(_fan);
       geo.computeVertexNormals();
       const mesh = new THREE.Mesh(geo, freeRoadGoreMaterialSingleton());
       mesh.name = name;
@@ -12091,7 +12278,7 @@ export default function CityGridIso() {
     // Part R: same valid/invalid color convention as the existing Free Road preview.
     const rampPreviewValidMat = new THREE.MeshBasicMaterial({ color: 0x7dffa6, transparent: true, opacity: 0.45, depthWrite: false });
     const rampPreviewInvalidMat = new THREE.MeshBasicMaterial({ color: 0xff5252, transparent: true, opacity: 0.4, depthWrite: false });
-    const rampPreviewGoreMat = new THREE.MeshBasicMaterial({ color: 0xffe27d, transparent: true, opacity: 0.35, depthWrite: false }); // Part R "warning"-toned gore tint — the gore is never itself the invalid/valid signal, just a dimmer companion overlay
+    const rampPreviewGoreMat = new THREE.MeshBasicMaterial({ color: 0xffe27d, transparent: true, opacity: 0.35, depthWrite: false, side: THREE.DoubleSide }); // Part R "warning"-toned gore tint — the gore is never itself the invalid/valid signal, just a dimmer companion overlay
     const rampPreviewMarkerGeo = new THREE.SphereGeometry(TILE * 0.15, 10, 8);
     function clearRampPreview() {
       while (rampPreviewGroup.children.length) {
@@ -12198,7 +12385,8 @@ export default function CityGridIso() {
         const geo = new THREE.BufferGeometry();
         geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
         geo.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2));
-        geo.setIndex([0, 1, 2]);
+        const _fanP = []; for (let i = 1; i < result.gorePoints.length - 1; i++) _fanP.push(0, i, i + 1);
+        geo.setIndex(_fanP);
         geo.computeVertexNormals();
         rampPreviewGroup.add(new THREE.Mesh(geo, rampPreviewGoreMat));
       }
