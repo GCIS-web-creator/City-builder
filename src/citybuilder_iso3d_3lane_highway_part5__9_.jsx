@@ -4338,6 +4338,7 @@ const LOW_DENSITY_FAIL_TEXT = {
   missing_cells: '選択範囲に欠けたセルがあります(道路や他の区画で切り取られた部分)',
   unsupported_size: '低密度住宅は 3×3 〜 6×6 の決められたセルサイズ(3×4 / 4×6 / 5×6 / 6×6 など)のみ建築できます',
   cell_blocked: '選択範囲に使用できないセルがあります(建物・道路・建築禁止エリア)',
+  not_road_adjacent: '道路に面したセル(道路に一番近い列)からドラッグを始めてください',
   parcel_missing: 'Parcel未生成(選択セルから敷地を作れませんでした)',
   footprint_outside_cells: '建物が選択セルからはみ出します(道路のカーブが急すぎます)',
   footprint_collision: 'Footprint collision(既存の建物と衝突します)',
@@ -9281,7 +9282,7 @@ export default function CityGridIso() {
       const cell = g.cellMap.get(c * PLOT_KEY_STRIDE + r);
       if (cell) cells.push(cell); else missing++; // a cut cell (tight bend / other road) — leaves a hole
     }
-    return { gid: g.gid, group: g, c0, c1, r0, r1, cols: c1 - c0 + 1, rows: r1 - r0 + 1, cells, missing };
+    return { gid: g.gid, group: g, c0, c1, r0, r1, cols: c1 - c0 + 1, rows: r1 - r0 + 1, cells, missing, anchorRow: anchor.row };
   };
   // paintPlotCell: the visible zone (plotZoneRef) + the legacy micro-grid cache the Simulation still reads.
   const paintPlotCell = (cell, zoneType, touchedTiles) => {
@@ -9497,25 +9498,49 @@ export default function CityGridIso() {
 
   // ---- ZONE-level validity: is the SELECTION itself something that can become a Residential zone? ----
   // (Independent of whether a house can then be built on it — Zone and Building are separate now.)
+  // Prompt 24A-R3: LOT = front yard + house + fence. The player drags from a cell that TOUCHES THE ROAD (row 0);
+  // the dragged cols x rows is the HOUSE size. The yard (depth Y = min(rows, PLOT_ROWS - rows), i.e. the same depth as
+  // the house wherever the 6-row roadside strip allows it) lies between the road and the house, so the house is built
+  // in the rows BEHIND the yard: lot rows 0..Y-1 = yard, Y..Y+rows-1 = house. Every downstream step (zone paint,
+  // preview, parcel, containment, cell reservation) then works on the whole lot.
+  const makeLowDensityLotSelection = (sel) => {
+    if (!sel || !sel.group) return sel;
+    if (sel.anchorRow !== 0 || sel.r0 !== 0) return { ...sel, lot: { invalid: 'not_road_adjacent' } };
+    const D = sel.rows, Y = Math.max(0, Math.min(D, PLOT_ROWS - D)), r1 = Y + D - 1;
+    const cm = sel.group.cellMap, cells = []; let missing = 0;
+    for (let c = sel.c0; c <= sel.c1; c++) for (let r = 0; r <= r1; r++) { const cell = cm.get(c * PLOT_KEY_STRIDE + r); if (cell) cells.push(cell); else missing++; }
+    return { ...sel, r0: 0, r1, rows: D + Y, cells, missing, lot: { houseRows: D, yardRows: Y, houseR0: Y } };
+  };
+  const houseRowsOf = (sel) => (sel.lot && sel.lot.houseRows != null ? sel.lot.houseRows : sel.rows);
   const evaluateLowDensityZone = (sel) => {
     if (!sel || !sel.cells || !sel.cells.length) return { ok: false, reason: 'selection_invalid' };
+    if (sel.lot && sel.lot.invalid) return { ok: false, reason: sel.lot.invalid };
     if (sel.missing > 0) return { ok: false, reason: 'missing_cells' };
-    if (!isLowDensityCellSelection(sel.cols, sel.rows)) return { ok: false, reason: 'unsupported_size' };
+    if (!isLowDensityCellSelection(sel.cols, houseRowsOf(sel))) return { ok: false, reason: 'unsupported_size' };
     for (const cell of sel.cells) if (!isPlotCellOpen(cell)) return { ok: false, reason: 'cell_blocked' };
     return { ok: true, reason: null };
   };
-  // The house footprint IS the selected cells: cols x rows metres, centred on the block, turned to the
-  // road's own direction (chord from the first to the last column; any angle), entrance on the road side.
+  // The house footprint = the HOUSE rows of the lot (behind the yard), centred on those cells, turned to the road's own
+  // direction (chord from the first to the last column; any angle), entrance on the road side. roadDir = unit vector from
+  // the house towards the road (used to place the yard / reserve the whole lot).
   const computeLowDensityFootprint = (sel) => {
-    const g = sel.group;
+    const g = sel.group, hr = houseRowsOf(sel), hr0 = sel.lot ? sel.lot.houseR0 : sel.r0;
+    const houseCells = sel.cells.filter((cell) => cell.row >= hr0 && cell.row < hr0 + hr);
     let cx = 0, cz = 0;
-    for (const cell of sel.cells) { cx += cell.cx; cz += cell.cz; }
-    cx /= sel.cells.length; cz /= sel.cells.length;
-    const first = g.cellMap.get(sel.c0 * PLOT_KEY_STRIDE + sel.r0), last = g.cellMap.get(sel.c1 * PLOT_KEY_STRIDE + sel.r0);
+    for (const cell of houseCells) { cx += cell.cx; cz += cell.cz; }
+    cx /= houseCells.length; cz /= houseCells.length;
+    const first = g.cellMap.get(sel.c0 * PLOT_KEY_STRIDE + hr0), last = g.cellMap.get(sel.c1 * PLOT_KEY_STRIDE + hr0);
     let tx = last.cx - first.cx, tz = last.cz - first.cz;
     if (Math.hypot(tx, tz) < 0.5) { tx = first.tan.x; tz = first.tan.z; }
     const tl = Math.hypot(tx, tz) || 1; tx /= tl; tz /= tl;
-    return { cx, cz, w: sel.cols, d: sel.rows, rotationY: Math.atan2(-tz, tx), frontSign: -g.sideSign };
+    const yardRows = sel.lot ? sel.lot.yardRows : 0;
+    let dx = 0, dz = 0;
+    if (yardRows > 0) { // centroid of the yard cells minus the house centroid
+      let yx = 0, yz = 0, n = 0;
+      for (const cell of sel.cells) if (cell.row < hr0) { yx += cell.cx; yz += cell.cz; n++; }
+      if (n) { dx = yx / n - cx; dz = yz / n - cz; const dl = Math.hypot(dx, dz) || 1; dx /= dl; dz /= dl; }
+    }
+    return { cx, cz, w: sel.cols, d: hr, rotationY: Math.atan2(-tz, tx), frontSign: -g.sideSign, yardDepth: yardRows, roadDir: { x: dx, z: dz } };
   };
   // ---- PLOT-FIRST building plan --------------------------------------------------------------
   // Returns { zoneOk, buildOk, reason, placement, diag }. The Roadside Plot selection is the primary land
@@ -9558,7 +9583,7 @@ export default function CityGridIso() {
     zoneBuildTypeRef.current = TILE_RES;
     try {
       ok = finalizeLot(type, pl.cx, pl.cz, pl.w, pl.d, pl.frontSign, pl.rotationY,
-        { skipRoadAccess: true, initialLevel: 1, exact: true, plotSource: 'roadside_plot_selection', diag });
+        { skipRoadAccess: true, initialLevel: 1, exact: true, plotSource: 'roadside_plot_selection', yardDepth: pl.yardDepth || 0, roadDir: pl.roadDir, diag });
     } finally { zoneBuildTypeRef.current = null; }
     logLowDensityDiag(sel, plan, ok ? 'ok' : 'failed', ok ? null : (diag.reason || 'finalize_failed'));
     return ok ? { ok: true, reason: null, plan } : { ok: false, reason: diag.reason || 'finalize_failed', error: diag.error, plan };
@@ -10299,6 +10324,7 @@ export default function CityGridIso() {
       position: { x: lot.position.x, y: grading.baseY, z: lot.position.z },
       rotationY: (lot.rotation || 0) + ((lot.frontSign ?? -1) < 0 ? Math.PI : 0), // local 180° flip when the entrance faces the other local Z side
       scale: 1, level: lot.level, seed: lot.id,
+      yardDepth: lot.yardDepth != null ? lot.yardDepth : -1, yardSign: lot.yardSign ?? 1, // -1 = lot from before 24A-R3 (no yard / fence)
       skirt: needSkirt ? { height: grading.foundationHeight + (isRetaining ? 0.3 : 0.05), retaining: isRetaining, width: w * 0.97, depth: d * 0.97, yaw: lot.rotation || 0 } : null,
     };
     if (lot.renderHandle != null && hr.hasHouse(lot.renderHandle)) hr.updateHouse(record);
@@ -10488,13 +10514,21 @@ export default function CityGridIso() {
       gx, gy, w, h, // legacy Tile-grid rasterization — bookkeeping only, see migration header comment
       level: opts.initialLevel || 0, group: null, renderHandle: null, frontSign: frontSign ?? -1, // renderHandle: Prompt 24A instanced-house id (no THREE object)
       plotSource: opts.plotSource || null, // Prompt 23-R2: 'roadside_plot_selection' | null
+      yardDepth: opts.yardDepth || 0, yardSign: 1, // Prompt 24A-R3: front yard (m) between the road and the house; fence surrounds yard + house
     };
+    // yardSign: +1 when the house's own front (+Z after rotation) already points at the road; -1 mirrors the yard/fence frame
+    if (lot.yardDepth > 0 && opts.roadDir) {
+      const th = (rotationY || 0) + ((frontSign ?? -1) < 0 ? Math.PI : 0);
+      lot.yardSign = (Math.sin(th) * opts.roadDir.x + Math.cos(th) * opts.roadDir.z) >= 0 ? 1 : -1;
+    }
     lotsRef.current.set(id, lot);
     try {
       registerBuildingForLot(lot); // Prompt 8: one-way Building Registry registration, additive only
       // Prompt 20K Part O (fixed): keyed by the REAL Building Registry buildingId (lot.buildingId,
       // set by registerBuildingForLot just above), not the legacy numeric lot id.
-      reserveMicroCellsForBuilding(lot.buildingId, centerX, centerZ, width, depth, rotationY || 0);
+      // Prompt 24A-R3: reserve the WHOLE lot (yard + house) so no other building / zone can be placed on the yard
+      if (lot.yardDepth > 0 && opts.roadDir) reserveMicroCellsForBuilding(lot.buildingId, centerX + opts.roadDir.x * lot.yardDepth / 2, centerZ + opts.roadDir.z * lot.yardDepth / 2, width, depth + lot.yardDepth, rotationY || 0);
+      else reserveMicroCellsForBuilding(lot.buildingId, centerX, centerZ, width, depth, rotationY || 0);
       rebuildLotGroup(lot);
       if (threeRef.current && !lot.group && lot.renderHandle == null) throw new Error('lot mesh was not created');
       threeRef.current?.rebuildRoadTileList?.();
@@ -11088,7 +11122,8 @@ export default function CityGridIso() {
     let anchor = dragRef.current.plotAnchor;
     if (anchor === undefined) { anchor = pickPlotCellNear(ax, az, 2) || null; dragRef.current.plotAnchor = anchor; }
     if (!anchor) { hide(); return; }
-    const sel = getPlotSelection(anchor, cx, cz);
+    let sel = getPlotSelection(anchor, cx, cz);
+    if (sel && zoneType === TILE_RES && isLowDensityResidentialNow()) sel = makeLowDensityLotSelection(sel); // Prompt 24A-R3: preview the WHOLE lot (yard + house)
     if (!sel || !sel.cells.length) { hide(); return; }
     let openCount = 0;
     const openFlags = sel.cells.map((cell) => { const o = isPlotCellOpen(cell); if (o) openCount++; return o; });
@@ -11106,13 +11141,13 @@ export default function CityGridIso() {
     }
     dragRef.current.microRect = { sel, valid, plan };
     if (zoneType === TILE_RES) {
-      const sizeTxt = `${sel.cols} × ${sel.rows} cells`;
+      const sizeTxt = lowDensity && sel.lot && sel.lot.houseRows != null ? `${sel.cols} × ${sel.lot.houseRows} + 庭${sel.lot.yardRows}` : `${sel.cols} × ${sel.rows} cells`;
       if (lowDensity) {
         publishZoneStatus(!plan.zoneOk
           ? { phase: 'preview', zone: 'INVALID', size: sizeTxt, building: '—', reason: plan.reason }
           : plan.buildOk
-            ? { phase: 'preview', zone: 'READY', size: sizeTxt, building: `${sel.cols} × ${sel.rows} House`, buildState: 'READY' }
-            : { phase: 'preview', zone: 'READY', size: sizeTxt, building: `${sel.cols} × ${sel.rows} House`, buildState: 'BLOCKED', reason: plan.reason });
+            ? { phase: 'preview', zone: 'READY', size: sizeTxt, building: `${sel.cols} × ${houseRowsOf(sel)} House`, buildState: 'READY' }
+            : { phase: 'preview', zone: 'READY', size: sizeTxt, building: `${sel.cols} × ${houseRowsOf(sel)} House`, buildState: 'BLOCKED', reason: plan.reason });
       } else {
         publishZoneStatus({ phase: 'preview', zone: valid ? 'READY' : 'INVALID', size: sizeTxt, building: valid ? '区画モジュールに分割して建築' : '—', buildState: valid ? 'READY' : undefined, reason: valid ? undefined : 'selection_invalid' });
       }
@@ -17679,7 +17714,10 @@ export default function CityGridIso() {
     const zoneType = tool === 'zone_res' ? TILE_RES : tool === 'zone_com' ? TILE_COM : TILE_IND;
     const paintZone = () => {
       const touched = new Set();
-      for (const cell of sel.cells) { if (isPlotCellOpen(cell)) paintPlotCell(cell, zoneType, touched); }
+      for (const cell of sel.cells) {
+        if (sel.lot && sel.lot.houseR0 != null && cell.row < sel.lot.houseR0) continue; // Prompt 24A-R3: the YARD is reserved with the house, never zoned (the legacy Tile growth must not build on it)
+        if (isPlotCellOpen(cell)) paintPlotCell(cell, zoneType, touched);
+      }
       projectTouchedTiles(touched, zoneType);
     };
     if (zoneType === TILE_RES) {
@@ -17693,7 +17731,7 @@ export default function CityGridIso() {
       // level 0 while a Residential zone is being built — Prompt 21F — so it no longer blocks its own house.)
       paintZone();
       const lowDensity = isLowDensityResidentialNow();
-      const sizeTxt = `${sel.cols} × ${sel.rows} cells`;
+      const sizeTxt = lowDensity && sel.lot && sel.lot.houseRows != null ? `${sel.cols} × ${sel.lot.houseRows} + 庭${sel.lot.yardRows}` : `${sel.cols} × ${sel.rows} cells`;
       let result = null, builtCount = 0;
       try {
         if (lowDensity) {
@@ -17710,7 +17748,7 @@ export default function CityGridIso() {
       paintZone(); // idempotent; re-projects Tiles that a rolled-back attempt reset
       publishZoneStatus({
         phase: 'result', zone: 'COMMITTED', size: sizeTxt,
-        building: lowDensity ? `${sel.cols} × ${sel.rows} House` : `${builtCount} 棟`,
+        building: lowDensity ? `${sel.cols} × ${houseRowsOf(sel)} House` : `${builtCount} 棟`,
         buildState: result.ok ? 'BUILT' : 'FAILED',
         reason: result.ok ? undefined : result.reason, error: result.ok ? undefined : result.error,
       });

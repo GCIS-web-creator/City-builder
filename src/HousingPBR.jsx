@@ -849,7 +849,7 @@ export function disposeHouseSharedResources() { // renderer / app shutdown ONLY 
   HOUSE_GEOMETRY_CACHE.forEach((g) => g && g.dispose()); HOUSE_GEOMETRY_CACHE.clear();
   _materialCache.forEach((m) => m.dispose()); _materialCache.clear();
   _sharedTexEntries.forEach((e) => { if (e.tex) e.tex.dispose(); }); _sharedTexEntries.clear();
-  HOUSE_ARCHETYPES.forEach((a) => { a._lodParts = [null, null, null, null]; });
+  HOUSE_ARCHETYPES.forEach((a) => { a._lodParts = [null, null, null, null]; a._lotParts = null; });
 }
 
 function _scaleUV(geo, rx, ry) {
@@ -959,16 +959,20 @@ const _railMod = (len) => _geo(`rail|${_q(len)}`, () => {
 
 // ---- 9.4 layout (numbers only — exact mirror of the maths in buildLowDensityHouse) --------------
 function _lowDensityLayout(config) {
-  const width = Math.max(1.6, config.widthCells * 0.92);
-  const depthFull = Math.max(1.6, config.depthCells * 0.92);
-  const hasPorch = !!(config.porch && config.porch.present && depthFull >= 3.2);
+  // Prompt 24A-R3: the roof now OVERHANGS the walls by a visible eave (0.2 - 0.42 m, grows with lot size) and the
+  // whole assembly (walls + eaves) still stays inside the lot: the wall box is the lot minus two eaves. Before, the
+  // eave was clamped to ~4 % of the lot (a few cm), which made every house read as a "tofu" block.
+  const minCells = Math.min(config.widthCells, config.depthCells);
+  const overhang = Math.max(0.2, Math.min(0.42, minCells * 0.09));
+  const width = Math.max(1.4, config.widthCells - 2 * overhang - 0.06);
+  const depthFull = Math.max(1.6, config.depthCells - 2 * overhang - 0.06);
+  const hasPorch = !!(config.porch && config.porch.present && config.depthCells >= 4); // (= old depthFull >= 3.2 test, expressed in cells)
   const porchDepthC = Math.min(1.8, Math.max(0.9, depthFull * 0.3));
   const stepCountC = porchDepthC >= 1.4 ? 3 : 2;
   const frontExt = hasPorch ? porchDepthC + 0.34 + (stepCountC - 1) * 0.32 : 0;
   const depth = hasPorch ? Math.max(2.0, depthFull - frontExt) : depthFull;
   const floors = config.floors || 1;
-  const wallHeight = 2.9 * floors, ridgeHeight = wallHeight * 0.5, baseY = 0.35;
-  const overhang = Math.max(0.08, Math.min(0.5, Math.min(width, depth) * 0.14, Math.min(config.widthCells, config.depthCells) * 0.04));
+  const wallHeight = 2.9 * floors, ridgeHeight = wallHeight * 0.55, baseY = 0.35;
   const winW = Math.min(1.05, width * 0.3), winH = Math.min(1.25, wallHeight * 0.42);
   const windowXs = width >= 3.2 ? [-width * 0.28, width * 0.28] : [0];
   const L = {
@@ -1156,6 +1160,74 @@ function _unitParts(arch, lod) {
     }
   }
   return list;
+}
+
+// ---- 9.8 LOT DRESSING: front yard (lawn + path) and the fence / wall around the whole lot ----------------
+// The house record carries yardDepth (metres of lawn between the road and the house, 0 = none). Everything here is
+// expressed in the HOUSE's local frame (origin = house-footprint centre, +Z = entrance/road side) and shares the same
+// instancing path as the house itself, so it costs no THREE object per house:
+//   lawn ..... 1 unit box            path .... 1 unit box           (LOD0-2 / LOD0-1)
+//   fence .... merged picket panel or low masonry wall, keyed by length; posts = the shared unit box   (LOD0)
+//   LOD1 ..... the fence collapses to a few thin boxes; LOD2+ keeps only the lawn.
+const FENCE_SEG = 2.4; // m max panel length
+const _fencePanelMod = (len, style) => _geo(`fence|${style}|${_q(len)}`, () => {
+  const l = _q(len);
+  if (style === 'wall') return _mergeGeos([_boxAt(l, 0.85, 0.14, 0, 0.425, 0), _boxAt(l + 0.02, 0.06, 0.2, 0, 0.88, 0)]);
+  const list = [_boxAt(l, 0.05, 0.05, 0, 0.32, 0), _boxAt(l, 0.05, 0.05, 0, 0.78, 0)];
+  const n = Math.max(2, Math.round(l / 0.13));
+  for (let i = 0; i < n; i++) list.push(_boxAt(0.07, 0.95, 0.02, -l / 2 + (i + 0.5) * (l / n), 0.475, 0.035));
+  return _mergeGeos(list);
+});
+
+function _lotParts(arch, Y, lod) {
+  const L = arch.layout, refs = arch.materialRefs, W = L.widthCells, D = L.depthCells, list = [];
+  const U = _unitBox();
+  const solid = (hex, o) => ({ matKey: `solid:${hex}`, material: _solid(hex, o) });
+  const add = (part, g, mat, local) => list.push({ part, geoKey: g.key, geometry: g.geometry, ...mat, local, tinted: false });
+  const zF = D / 2, zB = -D / 2, zLot = zF + Y;            // lot edges in house-local Z (front edge = road side)
+  if (Y > 0) add('lawn', U, solid(0x5c8447, { roughness: 0.95 }), _local(0, -0.15, zF + Y / 2, W, 0.36, Y)); // top surface at y = +0.03
+  if (lod >= 2) return list;
+
+  const wall = String(refs.facade).startsWith('plaster');   // stucco houses get a low masonry wall, wood houses a picket fence
+  const style = wall ? 'wall' : 'picket';
+  const fenceMat = wall ? solid(FLAT_COLOR[refs.facade] ?? 0xd8d2c4, { roughness: 0.9 }) : solid(refs.trim, { roughness: 0.65 });
+  const xL = -W / 2 + 0.06, xR = W / 2 - 0.06, zBk = zB + 0.06, zFr = zLot - 0.06;
+  const gateX = L.hasPorch ? 0 : L.doorX, gate = 0.65;
+  const runs = [[xL, zBk, xL, zFr], [xR, zBk, xR, zFr], [xL, zBk, xR, zBk]];
+  if (gateX - gate > xL + 0.3) runs.push([xL, zFr, gateX - gate, zFr]);
+  if (gateX + gate < xR - 0.3) runs.push([gateX + gate, zFr, xR, zFr]);
+
+  if (lod === 1) { // distant view: one thin board per run
+    runs.forEach(([x0, z0, x1, z1]) => {
+      const len = Math.hypot(x1 - x0, z1 - z0); if (len < 0.3) return;
+      add('fence', U, fenceMat, _local((x0 + x1) / 2, 0.25, (z0 + z1) / 2, z0 === z1 ? len : 0.05, 0.5, z0 === z1 ? 0.05 : len));
+    });
+    return list;
+  }
+  const seen = new Set();
+  runs.forEach(([x0, z0, x1, z1]) => {
+    const len = Math.hypot(x1 - x0, z1 - z0); if (len < 0.3) return;
+    const n = Math.max(1, Math.ceil(len / FENCE_SEG)), seg = len / n, yaw = z0 === z1 ? 0 : Math.PI / 2;
+    for (let i = 0; i < n; i++) { const t = (i + 0.5) / n; add('fence', _fencePanelMod(seg, style), fenceMat, _local(x0 + (x1 - x0) * t, 0, z0 + (z1 - z0) * t, 1, 1, 1, yaw)); }
+    for (let i = 0; i <= n; i++) {
+      const px = x0 + (x1 - x0) * i / n, pz = z0 + (z1 - z0) * i / n, k = `${px.toFixed(2)}|${pz.toFixed(2)}`;
+      if (seen.has(k)) continue; seen.add(k);
+      add('fencepost', U, fenceMat, _local(px, 0.55, pz, 0.1, 1.1, 0.1));
+    }
+  });
+  // stone path from the gate to the steps / door
+  const zStart = L.depth / 2 + L.frontExt / 2, plen = zFr - zStart;
+  if (Y > 0.3 && plen > 0.2) add('path', U, solid(0xb0a999, { roughness: 0.9 }), _local(gateX, -0.005, zStart + plen / 2, 1.0, 0.1, plen));
+  return list;
+}
+/** Lot dressing (yard + fence) for an archetype: cached per (yardDepth, LOD). Same part shape as getHouseLodParts. */
+export function getHouseLotParts(arch, yardDepth, lod) {
+  if (!(yardDepth >= 0)) return [];
+  const key = `${lod}|${_q(yardDepth)}`;
+  if (!arch._lotParts) arch._lotParts = new Map();
+  let l = arch._lotParts.get(key);
+  if (!l) { l = _lotParts(arch, yardDepth, lod); arch._lotParts.set(key, l); }
+  return l;
 }
 
 /** Renderable module instances of an archetype at one LOD (cached on the archetype). */

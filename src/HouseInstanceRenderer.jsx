@@ -12,7 +12,7 @@
 //   geometry creation or dispose. Geometry is created once per module key in HousingPBR.jsx.
 // ============================================================================
 import * as THREE from 'three';
-import { getHouseArchetype, getHouseLodParts, getHouseGeometryStats, getHouseMaterialStats, getSolidMaterial, disposeHouseSharedResources, HOUSE_STATS } from './HousingPBR.jsx';
+import { getHouseArchetype, getHouseLodParts, getHouseLotParts, getHouseGeometryStats, getHouseMaterialStats, getSolidMaterial, disposeHouseSharedResources, HOUSE_STATS } from './HousingPBR.jsx';
 
 // World-space sector size per LOD. Near LODs use small sectors (tight frustum culling); far LODs use big
 // ones (everything is on screen when zoomed out anyway) so far houses collapse into a handful of buckets.
@@ -33,8 +33,8 @@ const CAST = [
   { wall: 1, roof: 1 }, { roof: 1 }, {},
 ];
 const RECV = [
-  { wall: 1, roof: 1, porchroof: 1, foundation: 1, deck: 1, steps: 1, chimney: 1, door: 1, dormerwall: 1, dormerroof: 1 },
-  { wall: 1, roof: 1, foundation: 1 }, { wall: 1, roof: 1, porchroof: 1 }, {},
+  { wall: 1, roof: 1, porchroof: 1, foundation: 1, deck: 1, steps: 1, chimney: 1, door: 1, dormerwall: 1, dormerroof: 1, lawn: 1, path: 1 },
+  { wall: 1, roof: 1, foundation: 1, lawn: 1 }, { wall: 1, roof: 1, porchroof: 1, lawn: 1 }, { lawn: 1 },
 ];
 
 const _now = () => (typeof performance !== 'undefined' ? performance.now() : Date.now());
@@ -142,6 +142,7 @@ export function createHouseInstanceRenderer(scene) {
     _q.setFromAxisAngle(_Y, h.rotationY); _p.set(h.position.x, h.position.y, h.position.z);
     _s.set(h.scale, h.scale * h.sy, h.scale);
     h.matrix.compose(_p, _q, _s);
+    if (h.yardSign < 0) { _q.setFromAxisAngle(_Y, h.rotationY + Math.PI); h.lotMatrix.compose(_p, _q, _s); } else h.lotMatrix.copy(h.matrix); // yard/fence frame: +Z = road side
     if (h.skirt) {
       _q.setFromAxisAngle(_Y, h.skirt.yaw || 0);
       _p.set(h.position.x, h.position.y - h.skirt.height / 2 + 0.02, h.position.z);
@@ -160,6 +161,12 @@ export function createHouseInstanceRenderer(scene) {
       let c = _WHITE;
       if (p.tinted) { c = _tc; const base = p.color || _WHITE; c[0] = base[0] * h.tint[0]; c[1] = base[1] * h.tint[1]; c[2] = base[2] * h.tint[2]; }
       h.insts.push(_bucketAdd(b, h, m, c));
+    }
+    if (h.yardDepth >= 0) { // lot dressing: front yard + fence/wall around the whole lot (same shared-geometry instancing)
+      for (const p of getHouseLotParts(h.arch, h.yardDepth, lod)) {
+        const b = _bucket(sector, lod, p.geoKey, p.geometry, p.matKey, p.material, p.part, false, RECV[lod][p.part], false);
+        h.insts.push(_bucketAdd(b, h, _tm.multiplyMatrices(h.lotMatrix, p.local), _WHITE));
+      }
     }
     h.lod = lod;
     stats.instanceWriteMs += _now() - t0;
@@ -203,7 +210,7 @@ export function createHouseInstanceRenderer(scene) {
     if (!arch) throw new Error(`no low-density house archetype for ${a.w}x${a.d}`);
     const rnd = _rng(rec.seed == null ? 1 : rec.seed);
     const v = 0.9 + rnd() * 0.13; // subtle per-house tint (seed-driven; NOT per-house geometry)
-    const h = existing || { id: rec.id, insts: [], skirtInst: null, matrix: new THREE.Matrix4(), skirtMatrix: new THREE.Matrix4(), placed: false, lod: 0, listIndex: -1 };
+    const h = existing || { id: rec.id, insts: [], skirtInst: null, matrix: new THREE.Matrix4(), lotMatrix: new THREE.Matrix4(), skirtMatrix: new THREE.Matrix4(), placed: false, lod: 0, listIndex: -1 };
     h.arch = arch; h.level = rec.level ?? 1; h.style = levelStyle(h.level); h.seed = rec.seed ?? 0;
     h.position = { x: rec.position.x, y: rec.position.y, z: rec.position.z };
     h.rotationY = rec.rotationY || 0; h.scale = rec.scale || 1;
@@ -212,6 +219,8 @@ export function createHouseInstanceRenderer(scene) {
     h.skirt = rec.skirt ? { ...rec.skirt } : null;
     // Part 19: lightweight feature flags come from the archetype (porch / chimney / dormer / wraparound)
     h.features = arch.features;
+    h.yardDepth = rec.yardDepth == null ? -1 : rec.yardDepth; // -1 = no lot dressing (legacy records); >= 0 = yard depth in metres (fence always drawn)
+    h.yardSign = rec.yardSign < 0 ? -1 : 1;
     _composeMatrices(h);
     return h;
   }
@@ -337,11 +346,11 @@ export function createHouseInstanceRenderer(scene) {
     let bad = 0; const m = new THREE.Matrix4();
     houses.forEach((h) => {
       if (!h.placed) return;
-      const parts = getHouseLodParts(h.arch, h.lod);
-      if (h.insts.length !== parts.length) bad++;
+      const body = getHouseLodParts(h.arch, h.lod), lot = h.yardDepth >= 0 ? getHouseLotParts(h.arch, h.yardDepth, h.lod) : [];
+      if (h.insts.length !== body.length + lot.length) bad++;
       h.insts.forEach((inst, i) => {
         if (inst.b.owners[inst.slot] !== inst || inst.slot >= inst.b.count || inst.house !== h) { bad++; return; }
-        const p = parts[i]; if (!p) return; const exp = p.local ? m.multiplyMatrices(h.matrix, p.local) : h.matrix;
+        const isLot = i >= body.length, p = isLot ? lot[i - body.length] : body[i]; if (!p) return; const base = isLot ? h.lotMatrix : h.matrix; const exp = p.local ? m.multiplyMatrices(base, p.local) : base;
         const arr = inst.b.mesh.instanceMatrix.array;
         for (let k = 0; k < 16; k++) if (Math.abs(arr[inst.slot * 16 + k] - exp.elements[k]) > 1e-4) { bad++; break; }
       });
@@ -368,7 +377,7 @@ export function createHouseInstanceRenderer(scene) {
       for (let i = 0; i < n; i++) {
         const [w, d] = sizes[i % sizes.length], gx = i % 72, gz = Math.floor(i / 72);
         const id = `bench_${n}_${i}`; ids.push(id);
-        addHouse({ id, archetype: { w, d, variantIndex: i % 10 }, position: { x: -180 + gx * 5, y: 0, z: -180 + gz * 8 }, rotationY: (i % 8) * 0.4, level: 1, seed: i, skirt: i % 9 === 0 ? { height: 0.6, retaining: false, width: w * 0.97, depth: d * 0.97, yaw: (i % 8) * 0.4 } : null }, { immediate: true });
+        addHouse({ id, archetype: { w, d, variantIndex: i % 10 }, position: { x: -180 + gx * 5, y: 0, z: -180 + gz * 8 }, rotationY: (i % 8) * 0.4, level: 1, seed: i, yardDepth: i % 4 === 3 ? 0 : Math.min(3, 6 - d), skirt: i % 9 === 0 ? { height: 0.6, retaining: false, width: w * 0.97, depth: d * 0.97, yaw: (i % 8) * 0.4 } : null }, { immediate: true });
       }
       const placeMs = _now() - t0;
       let updMs = 0; if (camera) { viewSig = ''; for (let f = 0; f < 200 && (f === 0 || lodRemaining > 0); f++) { const u0 = _now(); update(camera, { focus: { x: 0, z: 0 } }); updMs += _now() - u0; } }
