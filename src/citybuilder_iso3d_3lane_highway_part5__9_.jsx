@@ -42,6 +42,8 @@ const NUM_CARS = 18;
 // swallows the last stretch so the cut is never visible (100 m ~ 20 houses).
 const DRIVER_VIEW_DIST = 100;
 const DRIVER_FOG_NEAR = 30;
+// Prompt 30 — the god (iso) view starts 5x closer than before (was 0.6).
+const INITIAL_GOD_ZOOM = 3.0;
 const NUM_PEDS = 45;
 const CAR_SPEED = 9;
 // The "standard" road speed (km/h) that CAR_SPEED (world units/sec) represents — every road
@@ -322,7 +324,16 @@ function terrainHeight(x, z) {
 // Height a road's own surface is measured from: the graded ground, but never below ROAD_MIN_Y — a
 // road crossing water therefore turns into a bridge deck standing (elevation 0) 1.4 m above the
 // water, with pillars added by the support-structure pass because the river bed is far below it.
-function roadBaseY(x, z) { return Math.max(terrainHeight(x, z), ROAD_MIN_Y); }
+// Prompt 30: every road is now measured from roadGradeHeight — a
+// position-only height that never depends on the graded terrain. It used to read the graded ground, so every
+// elevated road changed height whenever a neighbouring at-grade road regraded the ground under it (a viaduct
+// dipped where the boulevard below it cut a trench) -> the "道が途中でガクンと下がる" steps, and ramp ends pulled
+// out to a road edge landed metres off the boulevard they meet. A road that lies ON the ground (|elevation| ~ 0)
+// is levelled to the very same value (see _gradeVertex: overlapping corridors take the LOWER level, so the ground
+// can never rise through a road), and a ramp touching down meets the boulevard at exactly the same height.
+function roadBaseY(x, z, elev = 0) { // `elev` kept for call-site clarity; the base no longer depends on it
+  return roadGradeHeight(x, z);
+}
 function terrainIsWater(x, z) { return terrainHeight(x, z) < WATER_LEVEL + 0.15; }
 
 // terrainNormal: central-difference gradient of terrainHeight itself.
@@ -376,6 +387,10 @@ function terrainChunkOfWorld(x, z) {
   };
 }
 const _terrainChunkSigs = new Float64Array(TERRAIN_CHUNKS * TERRAIN_CHUNKS).fill(0); // 0 == "no roads nearby" == pristine base terrain
+// Prompt 30: lattice points already levelled by a road corridor in the current regrade pass. Where two corridors
+// overlap (a ramp mouth on a boulevard, a T junction) the LOWER level wins, so the ground can never poke up through
+// either road (the green "patches" sitting on junctions). Cleared together with the chunk it belongs to.
+const _terrainCorr = new Uint8Array(TERRAIN_N * TERRAIN_N);
 const _regradeScratchD = new Float32Array((TERRAIN_CHUNK_CELLS + 1) * (TERRAIN_CHUNK_CELLS + 1));
 const _regradeScratchH = new Float32Array((TERRAIN_CHUNK_CELLS + 1) * (TERRAIN_CHUNK_CELLS + 1));
 
@@ -437,7 +452,7 @@ function _applyGradeFeature(f, i0, j0, i1, j1) {
 function _gradeVertex(o, lat, h) {
   const b0 = _terrainField[o];
   if (b0 < WATER_LEVEL - 0.05) return; // open water is never filled in — the road bridges it instead
-  if (lat <= 0) { _terrainField[o] = h; return; }
+  if (lat <= 0) { if (_terrainCorr[o]) { if (h < _terrainField[o]) _terrainField[o] = h; } else { _terrainField[o] = h; _terrainCorr[o] = 1; } return; }
   if (b0 > h) _terrainField[o] = Math.min(b0, h + lat * ROAD_CUT_SLOPE);
   else _terrainField[o] = Math.max(b0, h - lat * ROAD_FILL_SLOPE);
 }
@@ -469,7 +484,7 @@ function terrainRegrade(features) {
     if (sig === _terrainChunkSigs[key]) continue;
     _terrainChunkSigs[key] = sig;
     const i0 = ci * TERRAIN_CHUNK_CELLS, j0 = cj * TERRAIN_CHUNK_CELLS, i1 = i0 + TERRAIN_CHUNK_CELLS, j1 = j0 + TERRAIN_CHUNK_CELLS;
-    for (let j = j0; j <= j1; j++) for (let i = i0; i <= i1; i++) _terrainField[j * TERRAIN_N + i] = _terrainBaseField[j * TERRAIN_N + i];
+    for (let j = j0; j <= j1; j++) for (let i = i0; i <= i1; i++) { _terrainField[j * TERRAIN_N + i] = _terrainBaseField[j * TERRAIN_N + i]; _terrainCorr[j * TERRAIN_N + i] = 0; }
     for (const f of list) {
       if (!f._built) f._built = f.build();
       _applyGradeFeature(f._built, i0, j0, i1, j1);
@@ -1098,7 +1113,7 @@ function addRoadSegmentToNetwork(network, segment) {
 function _roadNodes(network, segment) {
   return { a: network.nodes.get(segment.startNodeId), b: network.nodes.get(segment.endNodeId) };
 }
-function _roadElevationY(nodePos, elevAtEnd) { return roadBaseY(nodePos.x, nodePos.z) + elevAtEnd; }
+function _roadElevationY(nodePos, elevAtEnd) { return roadBaseY(nodePos.x, nodePos.z, elevAtEnd) + elevAtEnd; }
 // Prompt 20K Part A — `segment.visualStartOverride`/`visualEndOverride` ({x,z}, optional): when
 // present, RENDERING/geometry sampling (this function, getRoadTangent below) treats that end as
 // sitting at the given point instead of the real node's `.position` — while the segment's actual
@@ -1145,7 +1160,7 @@ function getRoadPoint(network, segment, t) {
   // authored offset ABOVE/BELOW whatever terrain sits directly under this exact point, so bridges
   // and cuts still read correctly along their whole span, not just at their two ends.
   const elevAtT = segment.elevation.start + (segment.elevation.end - segment.elevation.start) * t;
-  const y = roadBaseY(x, z) + elevAtT; // roadBaseY = graded ground, floored at ROAD_MIN_Y (bridge deck over water)
+  const y = roadBaseY(x, z, elevAtT) + elevAtT; // roadBaseY = graded ground, floored at ROAD_MIN_Y (bridge deck over water)
   return { x, y, z };
 }
 function getRoadTangent(network, segment, t) {
@@ -1751,7 +1766,7 @@ function _buildGoreFromRampPath(highwayRt, rampRt, takeoffPos, tangent, normal, 
   let j = k;
   while (j < n - 1 && (inner[j].a - aApex) < GORE_LENGTH && inner[j].g < rampHalf * 2) j++;
   if (j === k && k < n - 1) j = k + 1;
-  const yAt = (pt) => roadBaseY(pt.x, pt.z) + (pt.elev !== undefined ? pt.elev : elevAtTakeoff) + 0.025;
+  const yAt = (pt) => { const _e = pt.elev !== undefined ? pt.elev : elevAtTakeoff; return roadBaseY(pt.x, pt.z, _e) + _e + 0.025; };
   const pts = [mainPt(aApex, apexElev)];
   for (let i = k; i <= j; i++) pts.push(mainPt(Math.max(aApex, inner[i].a), inner[i].elev));
   for (let i = j; i >= k; i--) pts.push({ x: inner[i].x, z: inner[i].z, elev: inner[i].elev });
@@ -1762,7 +1777,7 @@ function _buildLegacyGoreTriangle(highwayRt, rampRt, takeoffPos, tangent, normal
   const { rhw } = roadHalfWidth(highwayRt.hubMul);
   const rampHalf = getRoadFootprintHalfWidth(rampRt);
   const outerOffset = highwayOuterLaneOffset(highwayRt);
-  const y = roadBaseY(takeoffPos.x, takeoffPos.z) + elevAtTakeoff + 0.02;
+  const y = roadBaseY(takeoffPos.x, takeoffPos.z, elevAtTakeoff) + elevAtTakeoff + 0.02;
   const apex = { x: takeoffPos.x, y, z: takeoffPos.z };
   const curbLateral = lateralSign * (rhw - outerOffset); // beyond the outer lane center out to the highway's own paved edge
   const mainFar = {
@@ -1819,7 +1834,11 @@ function pullRampEndsToRoadEdge(network, nodeId) {
     let endPt;
     if (cosPhi >= 0.5) {
       // crossing / T arrival: slide back along the ramp's own line until it reaches the road's edge
-      let sLen = edge / cosPhi;
+      // Prompt 30: the ramp's ribbon ends in a cut PERPENDICULAR to itself, so on an oblique arrival one corner reached the
+      // road edge and the other stopped up to (rampHalfWidth * sin) short of it — a wedge of bare ground (and the deck
+      // fascia) showed at every ramp mouth. Slide the end a little further in so both corners are on the road.
+      const _rampHalf = getRoadEdgeHalfWidths(r, atStart ? 0 : 1).posHalf;
+      let sLen = Math.max(edge * 0.3, edge - Math.min(_rampHalf * Math.sqrt(Math.max(0, 1 - cosPhi * cosPhi)), 1.6)) / cosPhi;
       if (r.curve && r.curve.controlPoint) sLen = Math.min(sLen, 0.8 * Math.hypot(r.curve.controlPoint.x - node.position.x, r.curve.controlPoint.z - node.position.z));
       sLen = Math.min(sLen, 0.45 * chord);
       endPt = { x: node.position.x + d.x * sLen, z: node.position.z + d.z * sLen };
@@ -2598,11 +2617,11 @@ function createOffRamp(network, highwaySegmentId, t, opts) {
 // elevation profile; the first piece is a short parallel run from the highway's outermost lane
 // exactly like createHighwayRampConnection builds them.
 const IC_CROSSING_X = -280; // world X of the interchange crossing (the ground boulevard runs N-S here)
-const IC_HIGHWAY_ELEV = 15;
+const IC_HIGHWAY_ELEV = 11; // Prompt 30: was 15 — the loop ramps dropped 15 m in ~150 m (10 %+, up to 20 % locally); 11 m still clears the boulevard and keeps them near MAX_RAMP_GRADE
 const IC_LOOP_RADIUS = 32;
 const IC_TERMINAL_V = 100; // boulevard terminal distance from the crossing (m)
 const IC_RAMP_HALF_SPAN = 150; // slip ramps attach to the viaduct this far either side of the crossing (m)
-const IC_DESCENT_LEN = 150; // viaduct descent length after the interchange (m) -> 15 m / 150 m = 10 %
+const IC_DESCENT_LEN = 220; // viaduct descent length after the interchange (m) -> 11 m / 220 m = 5 % (Prompt 30: was 150 m / 10 %)
 function _icCtrlPoint(p0, t0, p1, t1) {
   const dx = p1.x - p0.x, dz = p1.z - p0.z, len = Math.hypot(dx, dz);
   const cross = t0.x * t1.z - t0.z * t1.x;
@@ -3663,8 +3682,8 @@ function computeRoadGuideMetrics(startPos, startElevation, endPos, endElevation)
   const dx = endPos.x - startPos.x, dz = endPos.z - startPos.z;
   const length = Math.hypot(dx, dz);
   const angleDeg = length > 1e-6 ? ((Math.atan2(dz, dx) * 180 / Math.PI) + 360) % 360 : 0;
-  const startY = roadBaseY(startPos.x, startPos.z) + startElevation;
-  const endY = roadBaseY(endPos.x, endPos.z) + endElevation;
+  const startY = roadBaseY(startPos.x, startPos.z, startElevation) + startElevation;
+  const endY = roadBaseY(endPos.x, endPos.z, endElevation) + endElevation;
   const heightDiff = endY - startY;
   const grade = length > 1e-6 ? heightDiff / length : 0;
   return { length, angleDeg, heightDiff, grade, startY, endY };
@@ -8937,7 +8956,7 @@ export default function CityGridIso() {
   const toolRef = useRef('select');
   const taxRef = useRef(0.09);
   const camTargetRef = useRef({ x: -300, z: 0 }); // Prompt 25: start over the highway interchange (the map is 3x larger now)
-  const zoomRef = useRef(0.6); // Prompt 25: start zoomed out enough to see the whole interchange
+  const zoomRef = useRef(INITIAL_GOD_ZOOM); // Prompt 30: was 0.6 (whole interchange in view) — now 5x closer
   const azimuthRef = useRef(Math.PI / 4);
   const keysRef = useRef(new Set());
   const cameraModeRef = useRef('iso');
@@ -9042,7 +9061,7 @@ export default function CityGridIso() {
   const [oneWayFlip, setOneWayFlipState] = useState(false); // mirrors oneWayFlipRef, for the UI toggle button
   const [rampSide, setRampSideState] = useState('auto'); // mirrors rampSideRef, for the UI toggle button
   const [selected, setSelected] = useState(null);
-  const [hud, setHud] = useState({ tileX: null, tileY: null, roadCount: 0, zoom: 1, signalCount: 0 });
+  const [hud, setHud] = useState({ tileX: null, tileY: null, roadCount: 0, zoom: INITIAL_GOD_ZOOM, signalCount: 0 });
   const [stats, setStats] = useState({ population: 0, jobs: 0, employedCitizens: 0, tick: 0 });
   const [budget, setBudget] = useState({ treasury: START_TREASURY, income: 0, expenses: 0, net: 0, educationUpkeep: 0 });
   const [taxRate, setTaxRate] = useState(0.09);
@@ -13266,6 +13285,22 @@ export default function CityGridIso() {
     // horizontal length — an instant near-vertical wall, not a road. 9% is a steep-but-real-world
     // grade (comparable to a demanding mountain highway), used as the ceiling in both directions.
     const MAX_ROAD_GRADE = 0.09;
+    // Prompt 30: the grade limit used to LOSE to the soft above/below-ground band, so on steep ground (and over
+    // water, where the old code compared against the sea BED instead of the deck height) a road could still be
+    // 30 %+ steep. Now the grade limit wins: the elevation may leave the soft band as far as this hard limit to
+    // keep the grade (a viaduct over a valley, a cutting / tunnel into a hill) — the band still limits what the
+    // player can ask for with O/M, it just no longer forces a steeper road than MAX_ROAD_GRADE.
+    const FREE_ROAD_ELEV_HARD_BELOW = -30;
+    function solveElevationForGrade(fromY, toX, toZ, e, maxRise, hardAbove) {
+      for (let pass = 0; pass < 4; pass++) {
+        const base = roadBaseY(toX, toZ, e);
+        const rise = base + e - fromY;
+        if (rise > maxRise) e = fromY + maxRise - base;
+        else if (rise < -maxRise) e = fromY - maxRise - base;
+        else break;
+      }
+      return Math.max(FREE_ROAD_ELEV_HARD_BELOW, Math.min(hardAbove, e));
+    }
     // Given the draft's OWN current start/end horizontal distance, clamps a candidate elevation
     // offset to: (1) the absolute above/below-ground band, AND (2) whatever offset keeps the
     // start->end grade under MAX_ROAD_GRADE. Rather than rejecting the whole edit outright, this
@@ -13277,13 +13312,8 @@ export default function CityGridIso() {
       let e = Math.max(FREE_ROAD_ELEV_MAX_BELOW, Math.min(maxAbove, candidateElev));
       const len = Math.hypot(d.endPreviewPos.x - d.startPos.x, d.endPreviewPos.z - d.startPos.z);
       if (len > 0.01) {
-        const startY = roadBaseY(d.startPos.x, d.startPos.z) + d.startElevation;
-        const endTerrainY = terrainHeight(d.endPreviewPos.x, d.endPreviewPos.z);
-        const maxRise = len * MAX_ROAD_GRADE;
-        const rise = (endTerrainY + e) - startY;
-        if (rise > maxRise) e = (startY + maxRise) - endTerrainY;
-        else if (rise < -maxRise) e = (startY - maxRise) - endTerrainY;
-        e = Math.max(FREE_ROAD_ELEV_MAX_BELOW, Math.min(maxAbove, e));
+        const startY = roadBaseY(d.startPos.x, d.startPos.z, d.startElevation) + d.startElevation;
+        e = solveElevationForGrade(startY, d.endPreviewPos.x, d.endPreviewPos.z, e, len * MAX_ROAD_GRADE, MAX_HIGHWAY_ELEVATION);
       }
       return e;
     }
@@ -13763,13 +13793,8 @@ export default function CityGridIso() {
       if (len > 0.01) {
         const otherNode = whichEnd === 'start' ? b : a;
         const thisNode = whichEnd === 'start' ? a : b;
-        const otherY = roadBaseY(otherNode.position.x, otherNode.position.z) + seg.elevation[otherEnd];
-        const thisTerrainY = terrainHeight(thisNode.position.x, thisNode.position.z);
-        const maxRise = len * MAX_ROAD_GRADE;
-        const rise = (thisTerrainY + candidate) - otherY;
-        if (rise > maxRise) candidate = (otherY + maxRise) - thisTerrainY;
-        else if (rise < -maxRise) candidate = (otherY - maxRise) - thisTerrainY;
-        candidate = Math.max(FREE_ROAD_ELEV_MAX_BELOW, Math.min(maxAbove, candidate));
+        const otherY = roadBaseY(otherNode.position.x, otherNode.position.z, seg.elevation[otherEnd]) + seg.elevation[otherEnd];
+        candidate = solveElevationForGrade(otherY, thisNode.position.x, thisNode.position.z, candidate, len * MAX_ROAD_GRADE, MAX_HIGHWAY_ELEVATION);
       }
       seg.elevation = { ...seg.elevation, [whichEnd]: candidate };
       _refreshAfterSegmentEdit(seg);
@@ -14849,6 +14874,10 @@ export default function CityGridIso() {
     // near the top of the file for why. Every road-surface mesh below is built and positioned
     // from that shared stack so the asphalt is always visibly above and narrower than the
     // sidewalk, with a curb rim visible in between.
+    // Prompt 30 — every static tile-city InstancedMesh created from here to the building variants below is culled to
+    // the view (see viewCull below). Snapshot what exists already so vehicles / peds / overlays stay out of it.
+    const _collectInstanced = () => { const a = new Set(); scene.traverse((o) => { if (o.isInstancedMesh) a.add(o); }); return a; };
+    const _instBefore = _collectInstanced();
     const roadSideMat = new THREE.MeshStandardMaterial({ color: 0x1e2124, roughness: 0.95 });
     const sidewalkTopMat = new THREE.MeshStandardMaterial({ map: makePavementTexture(), roughness: 1 });
     const sidewalkGeo = new THREE.BoxGeometry(TILE * 0.98, SIDEWALK_H, TILE * 0.98);
@@ -15132,6 +15161,84 @@ export default function CityGridIso() {
       buildingVariantDefs[z] = buildBuildingVariants(z);
       buildingMeshes[z] = instanceVariants(scene, buildingVariantDefs[z], VARIANT_CAP);
     });
+    // ---- Prompt 30: draw only what is on screen -------------------------------------------------------------
+    // frustumCulled has to stay false on these InstancedMeshes (their bounding sphere is that of ONE instance at the
+    // origin), so the whole map's road tiles / buildings / signals used to be transformed every frame (and again in
+    // the shadow pass) no matter where the camera was. syncInstances() hands over the full instance list (snapshot);
+    // apply() then packs only the instances inside the (padded) view into the front of each buffer and lowers
+    // `count`. It re-runs only when the camera matrix changes or the city was edited. First-person views draw
+    // everything (their far plane + fog already limit it and shadows from behind the camera must not vanish).
+    const cullMeshes = [..._collectInstanced()].filter((m) => !_instBefore.has(m));
+    const viewCull = (() => {
+      const entries = cullMeshes.map((mesh) => ({ mesh, full: new Float32Array(16), fullCount: 0 }));
+      const CULL_PAD = 30, CULL_PAD_TALL = 45; // m: footprint + shadow reach / tallest building (its top may be on screen while its base is not)
+      const lastVP = new Float64Array(16);
+      const vp = new THREE.Matrix4();
+      let lastCam = null, haveLast = false, culled = false;
+      const flag = (mesh, n) => {
+        const attr = mesh.instanceMatrix;
+        const len = Math.max(16, n * 16);
+        if (typeof attr.addUpdateRange === 'function') { attr.clearUpdateRanges(); attr.addUpdateRange(0, len); }
+        else if (attr.updateRange) { attr.updateRange.offset = 0; attr.updateRange.count = len; }
+        attr.needsUpdate = true;
+      };
+      const restore = () => {
+        for (const e of entries) {
+          if (e.mesh.count === e.fullCount) continue;
+          e.mesh.instanceMatrix.array.set(e.full.subarray(0, e.fullCount * 16), 0);
+          e.mesh.count = e.fullCount;
+          flag(e.mesh, e.fullCount);
+        }
+        culled = false; haveLast = false;
+      };
+      const apply = (cam) => {
+        if (!cam) { if (culled) restore(); lastCam = null; return; }
+        lastCam = cam;
+        cam.updateMatrixWorld();
+        vp.multiplyMatrices(cam.projectionMatrix, cam.matrixWorldInverse);
+        const el = vp.elements;
+        let same = haveLast;
+        if (same) for (let i = 0; i < 16; i++) if (el[i] !== lastVP[i]) { same = false; break; }
+        if (same) return;
+        for (let i = 0; i < 16; i++) lastVP[i] = el[i];
+        haveLast = true; culled = true;
+        const P = cam.projectionMatrix.elements;
+        const persp = P[11] === -1;
+        const px = Math.abs(P[0]) * CULL_PAD, py = Math.abs(P[5]) * CULL_PAD, pyLow = Math.abs(P[5]) * (CULL_PAD + CULL_PAD_TALL);
+        const farLim = cam.far + CULL_PAD;
+        const e0 = el[0], e1 = el[1], e3 = el[3], e4 = el[4], e5 = el[5], e7 = el[7], e8 = el[8], e9 = el[9], e11 = el[11], e12 = el[12], e13 = el[13], e15 = el[15];
+        for (const e of entries) {
+          const n = e.fullCount;
+          if (!n) continue;
+          const src = e.full, dst = e.mesh.instanceMatrix.array;
+          let out = 0;
+          for (let i = 0, s = 0; i < n; i++, s += 16) {
+            const x = src[s + 12], y = src[s + 13], z = src[s + 14];
+            const w = e3 * x + e7 * y + e11 * z + e15;
+            const cx = e0 * x + e4 * y + e8 * z + e12;
+            const cy = e1 * x + e5 * y + e9 * z + e13;
+            if (cx < -(w + px) || cx > w + px || cy < -(w + pyLow) || cy > w + py) continue;
+            if (persp && (w < -CULL_PAD || w > farLim)) continue;
+            const o = out * 16;
+            for (let k = 0; k < 16; k++) dst[o + k] = src[s + k];
+            out++;
+          }
+          if (out !== e.mesh.count || true) { e.mesh.count = out; flag(e.mesh, out); }
+        }
+      };
+      // called at the end of syncInstances(): copy the freshly written full lists, then re-cull for the current view
+      const snapshot = () => {
+        for (const e of entries) {
+          const n = e.mesh.count;
+          if (e.full.length < n * 16) e.full = new Float32Array(n * 16);
+          if (n) e.full.set(e.mesh.instanceMatrix.array.subarray(0, n * 16), 0);
+          e.fullCount = n;
+        }
+        culled = false; haveLast = false;
+        if (lastCam) apply(lastCam);
+      };
+      return { apply, snapshot };
+    })();
 
     const markerGeo = new THREE.PlaneGeometry(TILE * 0.98, TILE * 0.98);
     markerGeo.rotateX(-Math.PI / 2);
@@ -15712,6 +15819,7 @@ export default function CityGridIso() {
         }));
       });
       setHud((h) => ({ ...h, roadCount: sidewalkCount, signalCount: signalNSCount }));
+      viewCull.snapshot();
     };
     threeRef.current.syncInstances = syncInstances;
     // InstancedMesh frustum-culls using a bounding sphere computed from its own (un-instanced)
@@ -16896,7 +17004,8 @@ export default function CityGridIso() {
       const az = azimuthRef.current;
       const forwardX = -Math.sin(az), forwardZ = -Math.cos(az);
       const rightX = Math.cos(az), rightZ = -Math.sin(az);
-      const panSpeed = TILE * 7;
+      // Prompt 30: pan speed follows the zoom (sqrt) so a 5x closer view does not fly across the screen
+      const panSpeed = TILE * 7 * Math.min(2, Math.max(0.45, Math.sqrt(0.6 / zoomRef.current)));
       const camTarget = camTargetRef.current;
       let mx = 0, mz = 0;
       if (keys.has('w')) { mx += forwardX; mz += forwardZ; }
@@ -16933,7 +17042,15 @@ export default function CityGridIso() {
       // the sun (and its shadow frustum) travels with the view so shadows stay sharp anywhere on the big map
       sun.position.set(focusX + SUN_OFFSET.x, focusY + SUN_OFFSET.y, focusZ + SUN_OFFSET.z);
       sun.target.position.set(focusX, focusY, focusZ);
-      const wantSe = fpMode ? DRIVER_VIEW_DIST * 1.15 : se;
+      // Prompt 30: the shadow map only needs to cover what is on screen (zoomed in = far sharper shadows and a much
+      // cheaper depth pass), never more than the old fixed extent.
+      let wantSe = se;
+      if (fpMode) wantSe = DRIVER_VIEW_DIST * 1.15;
+      else {
+        const _vh = viewSize / zoomRef.current, _vw = _vh * ((camera.right - camera.left) / (camera.top - camera.bottom || 1));
+        const _rad = 0.5 * Math.hypot(_vw, _vh / Math.sin(CAM_ELEV));
+        wantSe = Math.min(se, Math.max(60, Math.ceil((_rad * 1.3 + 25) / 10) * 10));
+      }
       if (sun.shadow.camera.right !== wantSe) {
         Object.assign(sun.shadow.camera, { left: -wantSe, right: wantSe, top: wantSe, bottom: -wantSe });
         sun.shadow.camera.updateProjectionMatrix();
@@ -16973,6 +17090,7 @@ export default function CityGridIso() {
       }
 
       updateAgents(dt, elapsed);
+      viewCull.apply(fpMode ? null : camera); // Prompt 30: iso view draws only the instances inside the view
 
       const selCar = selectedCarRef.current;
       if (selCar && selCar.active) {
