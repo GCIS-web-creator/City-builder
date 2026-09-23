@@ -135,7 +135,10 @@ export function createHouseInstanceRenderer(scene) {
       // _poolWaterMaterial() in HousingPBR.jsx. onBeforeRender fires automatically whenever this
       // bucket's mesh is actually drawn, so no hook into the main app's render loop is needed.
       const mat = b.material;
-      mesh.onBeforeRender = () => { const sh = mat.userData && mat.userData.shader; if (sh) sh.uniforms.uTime.value = _now() / 1000; };
+      mesh.onBeforeRender = () => {
+        const sh = mat?.userData?.shader;
+        if (sh?.uniforms?.uTime) sh.uniforms.uTime.value = _now() / 1000;
+      };
     }
     return mesh;
   }

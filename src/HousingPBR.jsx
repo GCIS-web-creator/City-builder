@@ -1565,7 +1565,7 @@ function _lotParts(arch, Y, lod, rear = false) {
         // small pool + 2 loungers either side
         const pw = Math.min(2.0, W - 0.8), pd = Math.min(1.3, yzLen - 0.6);
         add('pool', U, solid(0xd8e0dc, { roughness: 0.85 }), _local(0, -0.16, yzc, pw + 0.2, 0.32, pd + 0.2));
-        add('poolwater', U, _poolWaterMaterial(), _local(0, -0.04, yzc, pw, 0.08, pd));
+        add('poolwater', U, { matKey: 'poolwater', material: _poolWaterMaterial() }, _local(0, -0.04, yzc, pw, 0.08, pd));
         [-1, 1].forEach((s) => {
           add('furniture', U, solid(0xe6e2d8, { roughness: 0.8 }), _local(s * (pw / 2 + 0.55), 0.1, yzc, 0.55, 0.16, 1.5));
           add('furniture', U, accent, _local(s * (pw / 2 + 0.55), 0.32, yzc - 0.6, 0.5, 0.35, 0.07));
