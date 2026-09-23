@@ -11125,6 +11125,98 @@ export default function CityGridIso() {
     return ok ? { ok: true, reason: null, plan } : { ok: false, reason: diag.reason || 'finalize_failed', error: diag.error, plan };
   };
 
+  // ---- TERRACE (res_terrace) = same Roadside Plot Cell pipeline as res_low above, fixed size --------
+  // Prompt 24B: unlike res_low (variable size, LOW_DENSITY_CELL_SIZES), a terrace lot is ALWAYS the
+  // full 3-column x PLOT_ROWS(6)-row strip: 3m road frontage x 6m depth. The house sits in the FRONT
+  // 3 rows (touching the road, row 0..2) and the private yard/terrace in the BACK 3 rows (row 3..5) —
+  // the opposite arrangement from res_low's front-yard model — matching the existing
+  // syncTerraceHouseInstance, which already hardcodes yardDepth:3 / yardSign:-1 regardless of what is
+  // passed here. Because a selection is always built from ONE road-side group's own cellMap (never
+  // mixed across groups), requirement #33 (connected-cell / single-frontage) holds by construction;
+  // requirement #35 (no highway frontage) and #34 (no junction-occupied cells) hold too, since
+  // plotLayoutRef.current (computeRoadPlotLayout) already excludes highway sides and clearance-blocked
+  // cells before a cell can exist at all.
+  const makeTerraceLotSelection = (anchor, px, pz) => {
+    const layout = plotLayoutRef.current;
+    if (!layout || !anchor) return null;
+    const g = layout.groups.get(anchor.gid);
+    if (!g) return null;
+    // The drag direction only decides which way the fixed 3-column band extends from the anchor
+    // (requirement #30: never grows past 3x6 even if the pointer travels further).
+    let cur = pickPlotCellInLayout(layout, px, pz, 0);
+    if (!cur || cur.gid !== anchor.gid) cur = anchor;
+    const dir = cur.col >= anchor.col ? 1 : -1;
+    const c0 = dir > 0 ? anchor.col : anchor.col - 2;
+    const c1 = c0 + 2;
+    const cells = [];
+    let missing = 0;
+    for (let c = c0; c <= c1; c++) for (let r = 0; r < PLOT_ROWS; r++) {
+      const cell = g.cellMap.get(c * PLOT_KEY_STRIDE + r);
+      if (cell) cells.push(cell); else missing++;
+    }
+    return { gid: g.gid, group: g, c0, c1, r0: 0, r1: PLOT_ROWS - 1, cols: 3, rows: PLOT_ROWS, cells, missing, anchorRow: 0 };
+  };
+  const evaluateTerraceZone = (sel) => {
+    if (!sel || !sel.cells || !sel.cells.length) return { ok: false, reason: 'selection_invalid' };
+    if (sel.cols !== 3 || sel.rows !== PLOT_ROWS) return { ok: false, reason: 'unsupported_size' }; // only 3x6, never 4x6/5x6/6x6
+    if (sel.missing > 0) return { ok: false, reason: 'missing_cells' };
+    for (const cell of sel.cells) if (!isPlotCellOpen(cell)) return { ok: false, reason: 'cell_blocked' };
+    return { ok: true, reason: null };
+  };
+  // The whole 3x6 lot (house + yard) is the footprint passed to finalizeLot, exactly like the old
+  // pickTerraceOrientation path did — orientation now comes from the real road tangent at this strip
+  // (curved/45°-road safe) instead of a global-X/Z axis-aligned guess.
+  const computeTerraceFootprint = (sel) => {
+    const g = sel.group;
+    let cx = 0, cz = 0, n = 0;
+    for (const cell of sel.cells) { cx += cell.cx; cz += cell.cz; n++; }
+    cx /= n; cz /= n;
+    const first = g.cellMap.get(sel.c0 * PLOT_KEY_STRIDE + 0), last = g.cellMap.get(sel.c1 * PLOT_KEY_STRIDE + 0);
+    let tx, tz;
+    if (first && last) { tx = last.cx - first.cx; tz = last.cz - first.cz; }
+    if (!first || !last || Math.hypot(tx, tz) < 0.5) { tx = sel.cells[0].tan.x; tz = sel.cells[0].tan.z; }
+    const tl = Math.hypot(tx, tz) || 1; tx /= tl; tz /= tl;
+    return { cx, cz, w: 3, d: PLOT_ROWS, rotationY: Math.atan2(-tz, tx), frontSign: -g.sideSign };
+  };
+  const planTerraceHouse = (sel) => {
+    const diag = { parcelFound: false, parcelSource: null, containmentOk: null, footprintClear: null, gradingBuildable: null };
+    const zone = evaluateTerraceZone(sel);
+    if (!zone.ok) return { zoneOk: false, buildOk: false, reason: zone.reason, placement: null, diag };
+    const fp = computeTerraceFootprint(sel);
+    const registryParcel = findParcelForFootprint(buildingParcelRegistryRef.current, fp.cx, fp.cz, fp.w, fp.d, fp.rotationY);
+    diag.parcelFound = !!registryParcel;
+    const plotParcel = createParcelFromRoadsidePlotSelection(sel);
+    diag.parcelSource = registryParcel ? 'registry' : plotParcel ? 'roadside_plot_selection' : null;
+    const parcel = registryParcel || plotParcel;
+    if (!parcel) return { zoneOk: true, buildOk: false, reason: 'parcel_missing', placement: null, diag };
+    diag.containmentOk = plotParcel ? footprintCoveredByPolygon(plotParcel.polygon, fp.cx, fp.cz, fp.w, fp.d, fp.rotationY) : false;
+    if (!diag.containmentOk) return { zoneOk: true, buildOk: false, reason: 'footprint_outside_cells', placement: null, diag };
+    zoneBuildTypeRef.current = TILE_RES;
+    let clearReason;
+    try { clearReason = lotFootprintCheck(fp.cx, fp.cz, fp.w, fp.d, fp.rotationY, { exact: true }); } finally { zoneBuildTypeRef.current = null; }
+    diag.footprintClear = clearReason === null;
+    if (clearReason) return { zoneOk: true, buildOk: false, reason: clearReason, placement: null, diag };
+    const _grade = computeBuildingGrading(fp.cx, fp.cz, fp.w, fp.d, fp.rotationY);
+    diag.gradingBuildable = _grade.buildable;
+    if (!diag.gradingBuildable) return { zoneOk: true, buildOk: false, reason: _grade.strategy === 'water' ? 'terrain_water' : 'terrain_too_steep', placement: null, diag };
+    return { zoneOk: true, buildOk: true, reason: null, placement: { ...fp, parcelId: parcel.id, parcelSource: diag.parcelSource }, diag };
+  };
+  // Commits via the SAME finalizeLot() the old world-space drag path used — reuses collision, terrain
+  // grading, Building Registry, HouseInstanceRenderer sync (syncTerraceHouseInstance) untouched.
+  const buildTerracePlotHouse = (sel) => {
+    const plan = planTerraceHouse(sel);
+    if (!plan.buildOk) { logLowDensityDiag(sel, plan, null, plan.reason); return { ok: false, reason: plan.reason, plan }; }
+    const pl = plan.placement, diag = {};
+    let ok = false;
+    zoneBuildTypeRef.current = TILE_RES;
+    try {
+      ok = finalizeLot('res_terrace', pl.cx, pl.cz, pl.w, pl.d, pl.frontSign, pl.rotationY,
+        { skipRoadAccess: true, initialLevel: 1, exact: true, plotSource: 'roadside_plot_selection', diag });
+    } finally { zoneBuildTypeRef.current = null; }
+    logLowDensityDiag(sel, plan, ok ? 'ok' : 'failed', ok ? null : (diag.reason || 'finalize_failed'));
+    return ok ? { ok: true, reason: null, plan } : { ok: false, reason: diag.reason || 'finalize_failed', error: diag.error, plan };
+  };
+
   // getMicroCellsForFootprint: real oriented-rectangle containment (obbCorners + pointInPolygon,
   // the same primitives Building Placement Parcels already use — Prompt 17/18), never a plain AABB.
   const getMicroCellsForFootprint = (cx, cz, w, h, rotationY = 0) => {
@@ -12748,13 +12840,64 @@ export default function CityGridIso() {
     t.plotSelectionMesh.geometry = geo;
     t.plotSelectionMesh.visible = positions.length > 0;
   };
+  // Prompt 24B/38: shared Roadside Plot Cell preview + commit path for the two direct "place one
+  // building right now" tools — res_terrace (fixed 3x6) and res_low (variable, one of
+  // LOW_DENSITY_CELL_SIZES). Same drag shape as updateMicroZonePreview above (anchor cell -> live
+  // selection -> plan -> colour), but always plans a Building regardless of the city's current
+  // density tier (unlike zone_res, which only auto-plans a house while isLowDensityResidentialNow()).
+  const updatePlotBuildPreview = (tool, ax, az, cx, cz) => {
+    const t = threeRef.current; if (!t || !t.plotSelectionMesh) return;
+    const hide = () => { t.plotSelectionMesh.visible = false; dragRef.current.plotSel = null; dragRef.current.plotValid = false; publishZoneStatus(null, 'preview'); };
+    if (tool !== 'res_terrace' && tool !== 'res_low') { hide(); return; }
+    let anchor = dragRef.current.plotAnchor;
+    if (anchor === undefined) { anchor = pickPlotCellNear(ax, az, 2) || null; dragRef.current.plotAnchor = anchor; }
+    if (!anchor) { hide(); return; }
+    let sel, plan, houseR0, houseRows;
+    if (tool === 'res_terrace') {
+      sel = makeTerraceLotSelection(anchor, cx, cz);
+      plan = sel ? planTerraceHouse(sel) : null;
+      houseR0 = 0; houseRows = 3; // front 3 rows = house, back 3 rows = yard (requirement #7/#8/#9)
+    } else {
+      sel = getPlotSelection(anchor, cx, cz);
+      sel = sel ? makeLowDensityLotSelection(sel) : null;
+      plan = sel ? planLowDensityHouse(sel) : null;
+      houseR0 = sel && sel.lot ? sel.lot.houseR0 : (sel ? sel.r0 : 0);
+      houseRows = sel ? houseRowsOf(sel) : 0;
+    }
+    if (!sel || !sel.cells.length) { hide(); return; }
+    dragRef.current.plotSel = sel;
+    dragRef.current.plotValid = !!(plan && plan.zoneOk);
+    const houseColor = new THREE.Color(0x5ad87a); // requirement #27/#28: HOUSE vs YARD distinction
+    const yardColor = new THREE.Color(0xb8e8c4);   // lighter, transparent-looking green
+    const red = new THREE.Color(0xe05a4f);
+    const positions = [], colors = [];
+    sel.cells.forEach((cell) => {
+      if (isPlotCellReserved(cell)) return;
+      const col = (!plan || !plan.zoneOk) ? red : (cell.row >= houseR0 && cell.row < houseR0 + houseRows ? houseColor : yardColor);
+      const [c0, c1, c2, c3] = cell.corners;
+      for (const c of [c0, c1, c2, c0, c2, c3]) { positions.push(c.x, c.y + PLOT_PREVIEW_LIFT, c.z); colors.push(col.r, col.g, col.b); }
+    });
+    t.plotSelectionMesh.geometry.dispose();
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+    geo.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+    t.plotSelectionMesh.geometry = geo;
+    t.plotSelectionMesh.visible = positions.length > 0;
+    const sizeTxt = tool === 'res_terrace' ? '3 × 6 (house 3×3 + yard 3×3)' : `${sel.cols} × ${houseRows}${sel.lot ? ' + 庭' + sel.lot.yardRows : ''}`;
+    const buildingTxt = tool === 'res_terrace' ? 'テラスハウス' : `${sel.cols} × ${houseRows} House`;
+    publishZoneStatus(!plan || !plan.zoneOk
+      ? { phase: 'preview', zone: 'INVALID', size: sizeTxt, building: '—', reason: plan ? plan.reason : 'selection_invalid' }
+      : plan.buildOk
+        ? { phase: 'preview', zone: 'READY', size: sizeTxt, building: buildingTxt, buildState: 'READY' }
+        : { phase: 'preview', zone: 'READY', size: sizeTxt, building: buildingTxt, buildState: 'BLOCKED', reason: plan.reason });
+  };
   // Hover highlight for the zoning tools: the ONE road-aligned cell under the cursor (replaces the
   // 6m Tile-sized hover square, which is what made the designated area feel Tile-shaped).
   const updatePlotHover = (x, z) => {
     const t = threeRef.current; if (!t || !t.plotHoverMesh) return;
     const tool = toolRef.current;
-    const isZoneTool = tool === 'zone_res' || tool === 'zone_com' || tool === 'zone_ind';
-    if (!isZoneTool || dragRef.current.mode === 'microzone') { t.plotHoverMesh.visible = false; return; }
+    const isZoneTool = tool === 'zone_res' || tool === 'zone_com' || tool === 'zone_ind' || tool === 'res_terrace' || tool === 'res_low';
+    if (!isZoneTool || dragRef.current.mode === 'microzone' || dragRef.current.mode === 'plotbuild') { t.plotHoverMesh.visible = false; return; }
     const cell = pickPlotCellNear(x, z, 0);
     if (!cell || isPlotCellReserved(cell)) { t.plotHoverMesh.visible = false; return; }
     const attr = t.plotHoverMesh.geometry.attributes.position;
@@ -16000,7 +16143,10 @@ export default function CityGridIso() {
     // changed while the overlay was hidden and nothing has requested a rebuild since (belt-and-
     // braces — rebuildRoadsideLandOverlay already keeps it current on every road edit regardless).
     function updateRoadsidePlotOverlayVisibility() {
-      const isZoneTool = toolRef.current === 'zone_res' || toolRef.current === 'zone_com' || toolRef.current === 'zone_ind';
+      // Prompt 24B/38: res_terrace / res_low are direct Roadside Plot Cell placement tools too (TEST 01
+      // — "Terrace tool selected -> roadside cells visible"), so they show the same overlay.
+      const isZoneTool = toolRef.current === 'zone_res' || toolRef.current === 'zone_com' || toolRef.current === 'zone_ind'
+        || toolRef.current === 'res_terrace' || toolRef.current === 'res_low';
       if (isZoneTool && !roadsidePlotCellsRef.current) rebuildRoadsidePlotOverlay();
       roadsidePlotOverlayMesh.visible = isZoneTool;
       if (!isZoneTool) { // Prompt 21H: the hover cell / drag preview only exist while a zoning tool is active
@@ -20352,8 +20498,15 @@ export default function CityGridIso() {
       return;
     }
     const { tx, ty } = worldToTile(point);
-    if (RES_LOT_TYPES[toolRef.current]) {
+    if (toolRef.current === 'res_terrace' || toolRef.current === 'res_low') {
+      // Prompt 24B/38: res_terrace and res_low are unified onto the SAME Roadside Plot Cell selection
+      // pipeline res_low's automatic (zone_res) placement already used — never the legacy 'lot' mode
+      // below (Fail condition: "テラスだけ旧Lot rectangleを表示" / world X/Z rectangle).
+      dragRef.current = { mode: 'plotbuild', plotAnchor: undefined, startX: e.clientX, startY: e.clientY };
+      updatePlotBuildPreview(toolRef.current, point.x, point.z, point.x, point.z);
+    } else if (RES_LOT_TYPES[toolRef.current]) {
       // anchor is a raw World Space point (never a Tile index) — see updateLotPreview.
+      // Still used by res_mid / res_lowrent / res_mixed / res_high (out of scope for Prompt 24B/38).
       dragRef.current = { mode: 'lot', anchorX: point.x, anchorZ: point.z, startX: e.clientX, startY: e.clientY };
       updateLotPreview(toolRef.current, point.x, point.z, point.x, point.z);
     } else if (toolRef.current.startsWith('edu_place_')) {
@@ -20421,6 +20574,8 @@ export default function CityGridIso() {
       updateRoadSelectPreview(dragRef.current.anchorX, dragRef.current.anchorZ, point.x, point.z);
     } else if (dragRef.current.mode === 'microzone') {
       updateMicroZonePreview(toolRef.current, dragRef.current.anchorX, dragRef.current.anchorZ, point.x, point.z);
+    } else if (dragRef.current.mode === 'plotbuild') {
+      updatePlotBuildPreview(toolRef.current, point.x, point.z, point.x, point.z);
     } else if (dragRef.current.mode === 'blockgrid') {
       updateBlockGridPreview(dragRef.current.anchorX, dragRef.current.anchorZ, point.x, point.z);
     } else if (toolRef.current.startsWith('edu_place_')) {
@@ -20578,6 +20733,18 @@ export default function CityGridIso() {
       dragRef.current = { dragging: false, painting: false, anchor: null, startX: 0, startY: 0 };
       return;
     }
+    if (dragRef.current.mode === 'plotbuild') {
+      // Prompt 24B/38 commit — same shape as 'microzone' above, but always builds a Building
+      // (never just paints a zone): res_terrace -> buildTerracePlotHouse, res_low -> buildLowDensityHouse.
+      const t = threeRef.current;
+      if (t?.plotSelectionMesh) t.plotSelectionMesh.visible = false;
+      if (dragRef.current.plotSel && dragRef.current.plotValid) {
+        if (toolRef.current === 'res_terrace') buildTerracePlotHouse(dragRef.current.plotSel);
+        else if (toolRef.current === 'res_low') buildLowDensityHouse(dragRef.current.plotSel);
+      }
+      dragRef.current = { dragging: false, painting: false, anchor: null, startX: 0, startY: 0 };
+      return;
+    }
     if (dragRef.current.mode === 'blockgrid') {
       // Prompt 20K Part S commit — generate the orthogonal road grid over the dragged rectangle.
       const t = threeRef.current;
@@ -20708,7 +20875,7 @@ export default function CityGridIso() {
   const exitPedView = () => { cameraModeRef.current = 'iso'; setCameraMode('iso'); };
   const closePedPanel = () => { setPedPanel(null); selectedPedRef.current = null; if (cameraModeRef.current === 'ped') exitPedView(); };
 
-  const resToolIds = ['zone_res', 'res_terrace', 'res_mid', 'res_lowrent', 'res_mixed', 'res_high'];
+  const resToolIds = ['zone_res', 'res_low', 'res_terrace', 'res_mid', 'res_lowrent', 'res_mixed', 'res_high'];
   const roadToolIds = ROAD_TYPE_KEYS.map((k) => `road_${k}`);
   const eduToolIds = Object.keys(EDUCATION_FACILITIES).map((k) => `edu_place_${k}`);
   // Prompt 20F Part R — additive "高速道路" category (new highway variants + junction presets +
@@ -20965,7 +21132,8 @@ export default function CityGridIso() {
             )}
             {toolCategory === 'res' && (
               <div style={{ display: 'flex', gap: 5, flexWrap: 'wrap', maxWidth: 280, justifyContent: 'flex-end', padding: '8px', background: 'rgba(15, 21, 18, 0.92)', border: '1px solid rgba(90, 144, 216, 0.4)', borderRadius: 4 }}>
-                {toolBtn('zone_res', '低密度住宅', '#5a90d8')}
+                {toolBtn('zone_res', '低密度住宅(区画)', '#5a90d8')}
+                {toolBtn('res_low', '低密度住宅(直接配置)', '#5a90d8')}
                 {toolBtn('res_terrace', 'テラスハウス', '#b08a5a')}
                 {toolBtn('res_mid', '中密度住宅', '#8fa8c8', stats.population < RES_LOT_TYPES.res_mid.unlockPop)}
                 {toolBtn('res_lowrent', '低家賃住宅', '#8a8a82', stats.population < RES_LOT_TYPES.res_lowrent.unlockPop)}
