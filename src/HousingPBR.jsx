@@ -1138,6 +1138,16 @@ function _chimneySpec(L) {
 // 家の実寸倍率: レイアウトは従来どおりロット(w×d)基準で作り、家グループ全体をこの倍率で縮小して描画する。
 // ロット(芝生・フェンス)は縮小しない → 敷地はそのまま、家だけ小さく見えて庭が広くなる。
 export const HOUSE_SCALE = 0.6;
+// Terrace houses are a special case: _terraceLayout() already sizes width/depth to fill the
+// lot cell almost exactly (party-wall fit, see its comment) — if HouseInstanceRenderer then
+// shrinks that footprint uniformly by HOUSE_SCALE like every other house, the walls no longer
+// reach the lot edge and a visible gap/fence opens up between neighbouring terrace houses,
+// which defeats the whole point of a terrace row (houses must sit flush, sharing party walls).
+// So terrace houses get their own per-axis scale instead of the uniform HOUSE_SCALE: full width
+// (x — no shrink, so adjacent houses touch), the normal HOUSE_SCALE on height (y), and depth (z)
+// boosted to 1.5x what the plain HOUSE_SCALE would give, per design request. HOUSE_SCALE itself
+// stays untouched for every other (low-density) house archetype.
+const TERRACE_HOUSE_SCALE = { x: 1, y: HOUSE_SCALE, z: HOUSE_SCALE * 1.5 };
 export const HOUSE_ARCHETYPE_BASES = new Map(LOW_DENSITY_HOUSES.map((h) => [h.id, h]));
 export const HOUSE_ARCHETYPES = new Map();
 const DOOR_PRESETS = ['darkWood', 'rawWoodCedar', 'paintedBlueWood', 'paintedWhiteWood'];
@@ -1216,6 +1226,7 @@ export function getTerraceArchetype(variantIndex = 0) {
       door: DOOR_PRESETS[(seed >> 1) % DOOR_PRESETS.length], trim: matDef.trimColor },
     layout: L, seed, _lodParts: [null, null, null, null],
     features: { porch: false, chimney: false, dormer: false, wraparound: false },
+    houseScale: TERRACE_HOUSE_SCALE, // HouseInstanceRenderer: per-axis override, see comment on TERRACE_HOUSE_SCALE above
   };
   HOUSE_ARCHETYPES.set(id, arch);
   return arch;

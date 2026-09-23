@@ -142,7 +142,11 @@ export function createHouseInstanceRenderer(scene) {
     _p.set(h.position.x, h.position.y, h.position.z);
     _s.set(h.scale, h.scale * h.sy, h.scale);
     _q.setFromAxisAngle(_Y, h.rotationY + (h.yardSign < 0 ? Math.PI : 0)); h.lotMatrix.compose(_p, _q, _s); // yard/fence frame (NOT shrunk): +Z = road side
-    _q.setFromAxisAngle(_Y, h.rotationY); _s.multiplyScalar(HOUSE_SCALE); h.matrix.compose(_p, _q, _s); // house only: HOUSE_SCALE
+    _q.setFromAxisAngle(_Y, h.rotationY);
+    const hs = h.arch && h.arch.houseScale; // per-archetype override (e.g. terrace: full width so party walls touch, deeper footprint)
+    if (hs) _s.set(h.scale * hs.x, h.scale * h.sy * hs.y, h.scale * hs.z);
+    else _s.multiplyScalar(HOUSE_SCALE); // default: uniform HOUSE_SCALE, unchanged
+    h.matrix.compose(_p, _q, _s); // house only: HOUSE_SCALE (or archetype's houseScale override)
     if (h.skirt) {
       _q.setFromAxisAngle(_Y, h.skirt.yaw || 0);
       _p.set(h.position.x, h.position.y - h.skirt.height / 2 + 0.02, h.position.z);
