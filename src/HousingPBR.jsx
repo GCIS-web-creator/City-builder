@@ -1161,7 +1161,7 @@ export function getHouseArchetype(w, d, variantIndex = 0) {
   const cfg = { ...base, widthCells: w, depthCells: d };
   const L = _lowDensityLayout(cfg);
   const arch = {
-    id, baseId: base.id, sizeClass: base.sizeKey, w, d,
+    id, baseId: base.id, sizeClass: base.sizeKey, w, d, kind: 'res_low', // Prompt 39B: renderer kind tag (low/terrace/medium)
     facadeFamily: base.family, roofType: 'gable',
     windowStyle: L.windowXs.length === 2 ? 'double' : 'single', porchStyle: L.hasPorch ? L.porch.style : 'none',
     chimney: L.chimney, dormer: L.dormer, floors: L.floors,
@@ -1228,7 +1228,7 @@ export function getTerraceArchetype(variantIndex = 0) {
   const cfg = { widthCells: 3, depthCells: 3, floors: 3 };
   const L = _terraceLayout(cfg);
   const arch = {
-    id, baseId: base.id, sizeClass: 'terrace_3x3', w: cfg.widthCells, d: cfg.depthCells,
+    id, baseId: base.id, sizeClass: 'terrace_3x3', w: cfg.widthCells, d: cfg.depthCells, kind: 'res_terrace', // Prompt 39B: renderer kind tag
     facadeFamily: base.family, roofType: 'flat',
     windowStyle: L.windowXs.length === 2 ? 'double' : 'single', porchStyle: 'none',
     chimney: false, dormer: false, floors: L.floors,
@@ -1621,3 +1621,365 @@ export function getHouseGeometryStats() {
     geometryCreateMs: +HOUSE_STATS.geometryCreateMs.toFixed(3), geometryKinds: kinds,
   };
 }
+// ============================================================================
+// 10. 中密度住宅（res_mid）― Prompt 39A
+// ----------------------------------------------------------------------------
+// 4x6（建物4x3+奥庭4x3・5階）/ 6x6（建物6x4+奥庭6x2・10階）の集合住宅アーキタイプ。
+// LOW_DENSITY_HOUSES / TERRACE_HOUSES とは完全に独立したデータ・関数群として管理する
+// （既存の res_low / res_terrace の見た目・APIには一切手を入れていない）。
+//
+// メインファイル/HouseInstanceRenderer からの利用例（次Promptで配線予定）:
+//   const arch = getMediumDensityArchetype(w, d, variantIndex); // w=道路側の幅, d=奥行（メートル）
+//   const lod0 = getMediumDensityLodParts(arch, 0);              // kit-of-parts（LOD0=詳細 ... 3=簡略）
+//   const yard = getMediumDensityLotParts(arch, 0);               // 奥庭（建物フットプリント外）
+// 各partは低密度住宅と同じ形状 { part, geoKey, geometry, matKey, material, local, tinted } を返すので、
+// HouseInstanceRenderer の既存インスタンシング経路（geoKey|matKey バケット化）にそのまま乗せられる。
+// ----------------------------------------------------------------------------
+
+// ---- 10.1 サイズクラス定義（幅×奥行、建物本体＋奥庭の内訳、階数、想定収容） -----------------
+const MEDIUM_DENSITY_SIZE_DIMS = {
+  '4x6': { plotW: 4, plotD: 6, bodyD: 3, yardD: 3, floors: 5, households: '40-55', population: '60-180' },
+  '6x6': { plotW: 6, plotD: 6, bodyD: 4, yardD: 2, floors: 10, households: '65-90', population: '150-300' },
+};
+const MEDIUM_DENSITY_FLOOR_H = 2.9;
+
+// ---- 10.2 外観variationパレット（4x6 / 6x6 各8種。色だけでなく、バルコニー配置・窓パターン・
+// 玄関形式・コア位置・屋上設備・左右反転・ファサード分節を組み合わせて差別化する） -----------
+const MID_4X6_VARIANTS = [
+  { facadeMaterial: 'plasterWhite',     accentMaterial: 'brickRed',     roofMaterial: 'metalRoofDark',     balconyType: 'alternating', windowPattern: 'grid',   entranceType: 'canopy',   corePosition: 'rear-center', roofEquipment: ['acCluster', 'waterTank'], mirror: false, segmentation: 'twoTone' },
+  { facadeMaterial: 'concrete',         accentMaterial: 'stoneRough',   roofMaterial: 'asphaltShingleGray', balconyType: 'perUnit',     windowPattern: 'paired', entranceType: 'recessed', corePosition: 'rear-left',   roofEquipment: ['acCluster', 'vent'],       mirror: true,  segmentation: 'verticalBands' },
+  { facadeMaterial: 'plasterCream',     accentMaterial: 'darkWood',     roofMaterial: 'metalRoofDark',     balconyType: 'recessed',    windowPattern: 'grid',   entranceType: 'porch',    corePosition: 'rear-right',  roofEquipment: ['waterTank'],               mirror: false, segmentation: 'frame' },
+  { facadeMaterial: 'concreteRock',     accentMaterial: 'plasterWhite', roofMaterial: 'asphaltShingleGray', balconyType: 'alternating', windowPattern: 'ribbon', entranceType: 'canopy',   corePosition: 'rear-center', roofEquipment: ['acCluster'],               mirror: true,  segmentation: 'plain' },
+  { facadeMaterial: 'plasterBlue',      accentMaterial: 'stoneDark',    roofMaterial: 'metalRoofDark',     balconyType: 'perUnit',     windowPattern: 'grid',   entranceType: 'recessed', corePosition: 'rear-left',   roofEquipment: ['acCluster', 'waterTank', 'vent'], mirror: false, segmentation: 'twoTone' },
+  { facadeMaterial: 'brickRed',         accentMaterial: 'plasterWhite', roofMaterial: 'asphaltShingleGray', balconyType: 'recessed',    windowPattern: 'paired', entranceType: 'porch',    corePosition: 'rear-right',  roofEquipment: ['waterTank'],               mirror: true,  segmentation: 'frame' },
+  { facadeMaterial: 'plasterWhite',     accentMaterial: 'concrete',     roofMaterial: 'metalRoofDark',     balconyType: 'alternating', windowPattern: 'grid',   entranceType: 'canopy',   corePosition: 'rear-center', roofEquipment: ['acCluster'],               mirror: false, segmentation: 'verticalBands' },
+  { facadeMaterial: 'plasterCreamWorn', accentMaterial: 'darkWood',     roofMaterial: 'asphaltShingleGray', balconyType: 'perUnit',     windowPattern: 'ribbon', entranceType: 'recessed', corePosition: 'rear-left',   roofEquipment: ['acCluster', 'vent'],       mirror: true,  segmentation: 'plain' },
+];
+const MID_6X6_VARIANTS = [
+  { facadeMaterial: 'concrete',         accentMaterial: 'brickRed',     roofMaterial: 'metalRoofDark',     balconyType: 'perUnit',     windowPattern: 'grid',   entranceType: 'canopy',   corePosition: 'rear-center', roofEquipment: ['acCluster', 'waterTank'], mirror: false, segmentation: 'twoTone' },
+  { facadeMaterial: 'plasterWhite',     accentMaterial: 'concreteRock', roofMaterial: 'asphaltShingleGray', balconyType: 'alternating', windowPattern: 'ribbon', entranceType: 'recessed', corePosition: 'rear-left',   roofEquipment: ['acCluster', 'vent'],       mirror: true,  segmentation: 'verticalBands' },
+  { facadeMaterial: 'plasterCream',     accentMaterial: 'stoneRough',   roofMaterial: 'metalRoofDark',     balconyType: 'corner',      windowPattern: 'paired', entranceType: 'porch',    corePosition: 'rear-right',  roofEquipment: ['waterTank', 'vent'],       mirror: false, segmentation: 'frame' },
+  { facadeMaterial: 'concreteRock',     accentMaterial: 'plasterWhite', roofMaterial: 'asphaltShingleGray', balconyType: 'perUnit',     windowPattern: 'grid',   entranceType: 'canopy',   corePosition: 'rear-center', roofEquipment: ['acCluster', 'waterTank'], mirror: true,  segmentation: 'plain' },
+  { facadeMaterial: 'plasterBlue',      accentMaterial: 'darkWood',     roofMaterial: 'metalRoofDark',     balconyType: 'alternating', windowPattern: 'ribbon', entranceType: 'recessed', corePosition: 'rear-left',   roofEquipment: ['acCluster'],               mirror: false, segmentation: 'twoTone' },
+  { facadeMaterial: 'brickRed',         accentMaterial: 'stoneDark',    roofMaterial: 'asphaltShingleGray', balconyType: 'corner',      windowPattern: 'grid',   entranceType: 'porch',    corePosition: 'rear-right',  roofEquipment: ['waterTank', 'vent'],       mirror: true,  segmentation: 'frame' },
+  { facadeMaterial: 'plasterWhite',     accentMaterial: 'concrete',     roofMaterial: 'metalRoofDark',     balconyType: 'perUnit',     windowPattern: 'paired', entranceType: 'canopy',   corePosition: 'rear-center', roofEquipment: ['acCluster', 'vent'],       mirror: false, segmentation: 'verticalBands' },
+  { facadeMaterial: 'plasterCreamWorn', accentMaterial: 'brickRed',     roofMaterial: 'asphaltShingleGray', balconyType: 'alternating', windowPattern: 'ribbon', entranceType: 'recessed', corePosition: 'rear-left',   roofEquipment: ['acCluster', 'waterTank'], mirror: true,  segmentation: 'plain' },
+];
+
+function _buildMidDensityList(sizeKey, variants, seedBase) {
+  const dims = MEDIUM_DENSITY_SIZE_DIMS[sizeKey];
+  return variants.map((v, i) => ({
+    id: `mid_${sizeKey}_${String(i + 1).padStart(2, '0')}`,
+    sizeKey,
+    floors: dims.floors,
+    facadeMaterial: v.facadeMaterial,
+    accentMaterial: v.accentMaterial,
+    roofMaterial: v.roofMaterial,
+    balconyType: v.balconyType,
+    windowPattern: v.windowPattern,
+    entranceType: v.entranceType,
+    corePosition: v.corePosition,
+    roofEquipment: v.roofEquipment || [],
+    mirror: !!v.mirror,
+    segmentation: v.segmentation,
+    households: dims.households,
+    population: dims.population,
+    seed: seedBase + i,
+  }));
+}
+
+/** 中密度住宅（res_mid）専用データ。LOW_DENSITY_HOUSES / TERRACE_HOUSES とは別管理。 */
+export const MEDIUM_DENSITY_HOUSES = [
+  ..._buildMidDensityList('4x6', MID_4X6_VARIANTS, 4000),
+  ..._buildMidDensityList('6x6', MID_6X6_VARIANTS, 4100),
+];
+
+const _midDensityBySize = new Map();
+for (const h of MEDIUM_DENSITY_HOUSES) {
+  if (!_midDensityBySize.has(h.sizeKey)) _midDensityBySize.set(h.sizeKey, []);
+  _midDensityBySize.get(h.sizeKey).push(h);
+}
+function _midDensitySizeKey(w, d) { return Math.min(w, d) + 'x' + Math.max(w, d); }
+/** そのセルサイズ(4x6 / 6x6、順不同)で中密度住宅が建築可能か。 */
+export function isMediumDensityHouseSizeAvailable(w, d) { return _midDensityBySize.has(_midDensitySizeKey(w, d)); }
+/** そのセルサイズのvariantプールから1つ返す（variantIndexは配列長で丸める）。 */
+export function getMediumDensityHouseConfigForCell(w, d, variantIndex = 0) {
+  const arr = _midDensityBySize.get(_midDensitySizeKey(w, d));
+  if (!arr || !arr.length) return null;
+  const idx = ((variantIndex % arr.length) + arr.length) % arr.length;
+  return arr[idx];
+}
+
+// ---- 10.3 レイアウト計算 -------------------------------------------------------------------
+// w = 道路側の幅（メートル）, d = 奥行（メートル）。呼び出し側は低密度住宅と同じ規約で
+// 実寸のセル数をそのまま渡すこと（例: 4x6ロット -> w=4, d=6 / 6x6ロット -> w=6, d=6）。
+// 建物本体の奥行(bodyD)・奥庭の奥行(yardD)はsizeKeyから決まる固定比率（4x6:3+3 / 6x6:4+2）。
+function _midDensityLayout(config, w, d) {
+  const dims = MEDIUM_DENSITY_SIZE_DIMS[config.sizeKey];
+  const floors = config.floors || dims.floors;
+  const bodyD = dims.bodyD, yardD = Math.max(0, d - bodyD) || dims.yardD;
+  const width = w, depth = bodyD;
+  const floorH = MEDIUM_DENSITY_FLOOR_H, wallHeight = floorH * floors, baseY = 0.3, parapetH = 0.55;
+
+  const cols = Math.max(2, Math.min(4, Math.round(width / 1.35)));
+  const bayW = width / cols;
+  const mirrorSign = config.mirror ? -1 : 1;
+  const colXs = Array.from({ length: cols }, (_, i) => (-width / 2 + bayW * (i + 0.5)) * mirrorSign).sort((a, b) => a - b);
+
+  let winW, winH;
+  if (config.windowPattern === 'ribbon') { winW = Math.min(bayW * 0.86, bayW - 0.12); winH = floorH * 0.5; }
+  else if (config.windowPattern === 'paired') { winW = Math.min(0.62, bayW * 0.34); winH = floorH * 0.42; }
+  else { winW = Math.min(0.95, bayW * 0.52); winH = floorH * 0.42; } // 'grid'
+
+  const balcW = Math.min(1.6, bayW * 0.82), balcD = config.balconyType === 'recessed' ? 0.5 : 1.05, balcH = 1.0;
+  const entranceW = Math.min(1.8, width * 0.32);
+  const coreW = Math.min(1.6, width * 0.22), coreD = 0.9;
+  let coreX;
+  if (config.corePosition === 'rear-left') coreX = -width / 2 + coreW / 2 + 0.15;
+  else if (config.corePosition === 'rear-right') coreX = width / 2 - coreW / 2 - 0.15;
+  else coreX = 0;
+  coreX *= mirrorSign;
+
+  return {
+    width, depth, yardW: width, yardD, floors, floorH, wallHeight, baseY, parapetH,
+    cols, bayW, colXs, winW, winH, balcW, balcD, balcH, entranceW, coreW, coreD, coreX, mirrorSign,
+  };
+}
+
+function _midHasBalcony(floor, floors, colIdx, cols, balconyType) {
+  if (floor === 0) return false; // 1階は玄関・共用部のためバルコニーなし
+  switch (balconyType) {
+    case 'perUnit': return true;
+    case 'alternating': return (floor % 2 === 1) === (colIdx % 2 === 0);
+    case 'corner': return colIdx === 0 || colIdx === cols - 1;
+    case 'recessed': return true;
+    default: return floor % 2 === 1;
+  }
+}
+
+// ---- 10.4 マテリアル解決（既存のPBR体系 getSharedPBRMaterial / getSharedLiteMaterial / _solid /
+// _glassMaterial をそのまま利用。新規テクスチャは追加しない） --------------------------------
+function _midMatInfo(refs, role) {
+  switch (role) {
+    case 'facade': case 'accent': case 'roof': case 'foundation':
+      return { matKey: `pbr:${refs[role]}`, material: getSharedPBRMaterial(refs[role]) };
+    case 'trim': return { matKey: `solid:${refs.trim}`, material: _solid(refs.trim, { roughness: 0.55 }) };
+    case 'metal': return { matKey: `solid:${refs.metal}`, material: _solid(refs.metal, { roughness: 0.45, metalness: 0.3 }) };
+    case 'glass': return { matKey: 'glass', material: _glassMaterial() };
+    default: return { matKey: `pbr:${refs.facade}`, material: getSharedPBRMaterial(refs.facade) };
+  }
+}
+function _cylMod(r, h) { return _geo(`cyl|${_q(r)}x${_q(h)}`, () => new THREE.CylinderGeometry(r, r, h, 10)); }
+
+// ---- 10.5 LOD0: 詳細kit-of-parts（facade/window/balcony/railing/entrance/roof-parapet/
+// rooftop-equipment/foundation を個別モジュールとして構成。単純な箱は禁止） ----------------
+function _midLod0Parts(arch) {
+  const L = arch.layout, refs = arch.materialRefs, seg = arch.segmentation, list = [];
+  const add = (part, g, role, local, tinted) => list.push({ part, geoKey: g.key, geometry: g.geometry, ..._midMatInfo(refs, role), local, tinted: !!tinted });
+  const U = _unitBox();
+  const unit = (part, role, x, y, z, sx, sy, sz, yaw) => add(part, U, role, _local(x, y, z, sx, sy, sz, yaw), false);
+  const { width, depth, floors, floorH, wallHeight, baseY, parapetH, cols, colXs, winW, winH, balcW, balcD, balcH, entranceW, coreW, coreD, coreX, mirrorSign } = L;
+  const topY = baseY + wallHeight, fz = depth / 2, bz = -depth / 2;
+
+  // --- foundation
+  add('foundation', _boxMod(width + 0.2, baseY, depth + 0.2, Math.max(width, 1) / 2, 0.5), 'foundation', _local(0, baseY / 2, 0), true);
+
+  // --- facade / wall（twoTone は1階を腰壁としてaccent材で分節）
+  const plinthH = seg === 'twoTone' ? floorH : 0;
+  if (plinthH > 0) {
+    add('wall', _boxMod(width, plinthH, depth, Math.max(width, 1) / 2, plinthH / 2), 'accent', _local(0, baseY + plinthH / 2, 0), true);
+    add('wall', _boxMod(width, wallHeight - plinthH, depth, Math.max(width, 1) / 2, (wallHeight - plinthH) / 2), 'facade', _local(0, baseY + plinthH + (wallHeight - plinthH) / 2, 0), true);
+  } else {
+    add('wall', _boxMod(width, wallHeight, depth, Math.max(width, 1) / 2, wallHeight / 2), 'facade', _local(0, baseY + wallHeight / 2, 0), true);
+  }
+  if (seg === 'verticalBands') { // 柱型（縦のファサード分節）
+    for (let c = 1; c < cols; c++) {
+      const px = -width / 2 + L.bayW * c;
+      add('pier', _boxMod(0.18, wallHeight, depth + 0.04, 0.2, wallHeight / 2), 'accent', _local(px, baseY + wallHeight / 2, 0), true);
+    }
+  }
+
+  // --- roof / parapet（陸屋根＋パラペット）＋ 屋上床
+  const a = width + 0.1, b = depth + 0.1;
+  [[a, 0.14, -b / 2 + 0.07], [a, 0.14, b / 2 - 0.07]].forEach(([dx, dz, pz]) => add('parapet', _boxMod(dx, parapetH, dz, Math.max(dx, 1) / 2, 1), 'roof', _local(0, topY + parapetH / 2, pz), true));
+  [[0.14, b, -a / 2 + 0.07], [0.14, b, a / 2 - 0.07]].forEach(([dx, dz, px]) => add('parapet', _boxMod(dx, parapetH, dz, 1, Math.max(dz, 1) / 2), 'roof', _local(px, topY + parapetH / 2, 0), true));
+  add('roofdeck', _boxMod(width - 0.2, 0.06, depth - 0.2, Math.max(width, 1) / 2, Math.max(depth, 1) / 2), 'foundation', _local(0, topY + 0.03, 0), true);
+
+  // --- コア（階段/エレベーター棟）：建物奥側に張り出し。数階おきに小窓
+  const coreH = wallHeight + parapetH + 0.3;
+  add('core', _boxMod(coreW, coreH, coreD, coreW / 1.2, coreH / 2.9), 'accent', _local(coreX, baseY + coreH / 2, bz - coreD / 2), true);
+  for (let f = 1; f < floors; f += 2) {
+    const wy = baseY + floorH * f + floorH * 0.5;
+    unit('glass', 'glass', coreX, wy, bz - coreD - 0.02, coreW * 0.5, 0.5, 0.05);
+  }
+  unit('doorframe', 'trim', coreX, baseY + 1.05, bz - coreD - 0.02, coreW * 0.55, 2.1, 0.06);
+
+  // --- 各階・各バイの窓 + バルコニー（1階は玄関バイを除いて窓のみ）
+  const entranceColIdx = colXs.reduce((best, x, i) => (Math.abs(x) < Math.abs(colXs[best]) ? i : best), 0);
+  for (let f = 0; f < floors; f++) {
+    const wy = baseY + floorH * f + floorH * 0.55;
+    colXs.forEach((x, ci) => {
+      if (f === 0 && ci === entranceColIdx) return; // 玄関バイ
+      const frameRole = seg === 'frame' ? 'accent' : 'trim';
+      if (seg === 'frame') unit('winsurround', 'accent', x, wy, fz + 0.005, winW + 0.3, winH + 0.3, 0.06);
+      unit('winframe', frameRole, x, wy, fz, winW, winH, 0.05);
+      unit('glass', 'glass', x, wy, fz + 0.02, winW - 0.12, winH - 0.12, 0.08);
+      unit('mullion', 'trim', x, wy, fz + 0.06, 0.03, winH - 0.12, 0.03);
+      unit('sill', 'trim', x, wy - winH / 2 - 0.03, fz + 0.05, winW + 0.14, 0.05, 0.14);
+
+      if (_midHasBalcony(f, floors, ci, cols, arch.balconyType)) {
+        const isRecessed = arch.balconyType === 'recessed';
+        const bd = isRecessed ? 0.5 : balcD;
+        const slabY = baseY + floorH * f - 0.05;
+        if (!isRecessed) add('balcslab', _boxMod(balcW, 0.1, bd, balcW / 1.2, 1), 'foundation', _local(x, slabY, fz + bd / 2), true);
+        const railY = slabY + balcH / 2 + 0.05;
+        unit('railing', 'metal', x, railY, fz + bd - 0.03, balcW, balcH * 0.55, 0.04);
+        [-1, 1].forEach((s) => unit('railing', 'metal', x + s * balcW / 2, railY, fz + bd / 2, 0.04, balcH * 0.55, bd));
+        const nBal = 4;
+        for (let k = 0; k < nBal; k++) { const bx = x - balcW / 2 + (k + 0.5) * (balcW / nBal); unit('baluster', 'metal', bx, slabY + balcH * 0.27, fz + bd - 0.03, 0.03, balcH * 0.5, 0.03); }
+      }
+    });
+  }
+
+  // --- 玄関（entranceType別: canopy/recessed/porch）
+  const enX = colXs[entranceColIdx] ?? 0;
+  const doorW = Math.min(entranceW, L.bayW * 0.9), doorH = 2.3;
+  unit('doorframe', 'trim', enX, baseY + doorH / 2, fz, doorW + 0.14, doorH + 0.1, 0.06);
+  unit('door', 'glass', enX, baseY + doorH / 2, fz + 0.03, doorW, doorH, 0.06);
+  if (arch.entranceType === 'canopy') {
+    add('canopy', _boxMod(doorW + 1.0, 0.12, 1.1, (doorW + 1.0) / 1.2, 1), 'accent', _local(enX, baseY + doorH + 0.15, fz + 0.5), true);
+    unit('canopypost', 'metal', enX - (doorW / 2 + 0.3), baseY + doorH * 0.6, fz + 0.95, 0.08, doorH * 1.2, 0.08);
+    unit('canopypost', 'metal', enX + (doorW / 2 + 0.3), baseY + doorH * 0.6, fz + 0.95, 0.08, doorH * 1.2, 0.08);
+  } else if (arch.entranceType === 'porch') {
+    add('stepdeck', _boxMod(doorW + 0.6, 0.15, 0.9, 1, 1), 'foundation', _local(enX, baseY - 0.02, fz + 0.5), true);
+    unit('column', 'trim', enX - (doorW / 2 + 0.25), baseY + doorH * 0.6, fz + 0.85, 0.12, doorH * 1.15, 0.12);
+    unit('column', 'trim', enX + (doorW / 2 + 0.25), baseY + doorH * 0.6, fz + 0.85, 0.12, doorH * 1.15, 0.12);
+  } else { // recessed
+    add('recess', _boxMod(doorW + 0.6, doorH + 0.3, 0.4, 1, 1), 'accent', _local(enX, baseY + (doorH + 0.3) / 2, fz - 0.15), true);
+  }
+
+  // --- 屋上設備（acCluster / waterTank / vent）
+  const eqY = topY + parapetH + 0.05;
+  (arch.roofEquipment || []).forEach((eq, i) => {
+    const ex = (-width / 2 + 0.6 + i * 1.1) * mirrorSign;
+    if (eq === 'acCluster') { for (let k = 0; k < 3; k++) unit('acunit', 'metal', ex + k * 0.45, eqY + 0.2, -depth * 0.15, 0.4, 0.4, 0.4); }
+    else if (eq === 'waterTank') add('watertank', _cylMod(0.45, 1.0), 'metal', _local(0, eqY + 0.5, depth * 0.1), true);
+    else if (eq === 'vent') unit('vent', 'metal', ex, eqY + 0.35, depth * 0.2, 0.25, 0.7, 0.25);
+  });
+
+  return list;
+}
+
+// ---- 10.6 LOD1〜3: 簡略化kit-of-parts。遠距離では窓・手すり等の個別描画を行わない -----------
+function _midUnitParts(arch, lod) {
+  const L = arch.layout, refs = arch.materialRefs, list = [];
+  const add = (part, g, matInfo, local, tinted, extra) => list.push({ part, geoKey: g.key, geometry: g.geometry, ...matInfo, local, tinted, ...extra });
+  const pbr = (k) => ({ matKey: `pbr:${k}`, material: getSharedPBRMaterial(k) });
+  const lite = (k) => ({ matKey: `lite:${k}`, material: getSharedLiteMaterial(k) });
+  const flatFacade = { matKey: 'flat:white', material: _solid(0xffffff, { roughness: 0.9 }) };
+  const { width, depth, floors, floorH, wallHeight, baseY, parapetH, coreW, coreD, coreX } = L;
+  const topY = baseY + wallHeight;
+  const fz = depth / 2, bz = -depth / 2;
+
+  const facadeMat = lod === 1 ? pbr(refs.facade) : lod === 2 ? lite(refs.facade) : flatFacade;
+  const roofMat = lod === 1 ? pbr(refs.roof) : lod === 2 ? lite(refs.roof) : flatFacade;
+  const wallColor = lod === 3 ? { color: _flatRGB(refs.facade) } : null;
+  const roofColor = lod === 3 ? { color: _flatRGB(refs.roof) } : null;
+
+  if (lod === 3) { // Billboard/簡略形: 2パーツのみ
+    add('wall', _unitBoxGeo(1, 1), facadeMat, _local(0, topY / 2, 0, width, topY, depth), true, wallColor);
+    add('roof', _unitBoxGeo(1, 1), roofMat, _local(0, topY + parapetH * 0.5, 0, width, parapetH, depth), true, roofColor);
+    return list;
+  }
+
+  add('foundation', _unitBoxGeo(2, 0.5), pbr(refs.foundation), _local(0, baseY / 2, 0, width + 0.2, baseY, depth + 0.2), true);
+  add('wall', _unitBoxGeo(2, 3), facadeMat, _local(0, baseY + wallHeight / 2, 0, width, wallHeight, depth), true, wallColor);
+  add('parapet', _unitBoxGeo(2, 1), roofMat, _local(0, topY + parapetH / 2, 0, width + 0.1, parapetH, depth + 0.1), true, roofColor);
+  add('core', _unitBoxGeo(1, 3), lod === 1 ? pbr(refs.accent) : lite(refs.accent), _local(coreX, baseY + (wallHeight + parapetH) / 2, bz - coreD / 2, coreW, wallHeight + parapetH, coreD), true);
+
+  if (lod === 1) { // Mid: 窓は2階おき・バルコニーは輪郭のみに間引く（Near=LOD0だけが全窓を描く）
+    const U = _unitBox(), gm = { matKey: 'glass', material: _glassMaterial() };
+    for (let f = 1; f < floors; f += 2) {
+      const wy = baseY + floorH * f + floorH * 0.5;
+      add('glass', U, gm, _local(0, wy, fz + 0.02, width * 0.7, floorH * 0.35, 0.06), false);
+    }
+    if (arch.balconyType !== 'recessed') {
+      for (let f = 2; f < floors; f += 2) {
+        const slabY = baseY + floorH * f - 0.05;
+        add('balcslab', U, { matKey: `solid:${refs.trim}`, material: _solid(refs.trim, { roughness: 0.6 }) }, _local(0, slabY, fz + 0.5, width * 0.65, 0.1, 1.0), false);
+      }
+    }
+    add('entrance', U, gm, _local(0, baseY + 1.15, fz + 0.03, 1.4, 2.3, 0.06), false);
+  }
+  // lod===2: 窓・バルコニーなし。壁+パラペット+コアの塊のみ（Far）
+  return list;
+}
+
+// ---- 10.7 奥庭（lawn/path/fence/植栽）。建物フットプリントには含めない -----------------------
+function _midLotParts(arch, lod) {
+  const L = arch.layout, refs = arch.materialRefs, list = [];
+  const U = _unitBox();
+  const { depth, yardW, yardD, coreX } = L;
+  const bz = -depth / 2, yz0 = bz, yz1 = bz - yardD, yzc = (yz0 + yz1) / 2;
+  list.push({ part: 'lawn', geoKey: U.key, geometry: U.geometry, matKey: 'solid:lawn', material: _solid(0x5c8447, { roughness: 0.95 }), local: _local(0, -0.14, yzc, yardW, 0.3, yardD), tinted: false });
+  if (lod >= 2) return list;
+
+  const xL = -yardW / 2 + 0.06, xR = yardW / 2 - 0.06, zNear = bz - 0.06, zFar = yz1 + 0.06;
+  const hedgeMat = { matKey: 'solid:hedge', material: _solid(0x3e6b3c, { roughness: 0.9 }) };
+  const runs = [[xL, zNear, xL, zFar], [xR, zNear, xR, zFar], [xL, zFar, xR, zFar]]; // 建物側(zNear)は開放
+  runs.forEach(([x0, z0, x1, z1]) => {
+    const len = Math.hypot(x1 - x0, z1 - z0); if (len < 0.3) return;
+    list.push({ part: 'hedge', geoKey: U.key, geometry: U.geometry, ...hedgeMat, local: _local((x0 + x1) / 2, 0.35, (z0 + z1) / 2, z0 === z1 ? len : 0.3, 0.7, z0 === z1 ? 0.3 : len), tinted: false });
+  });
+  if (lod === 1) return list;
+
+  // 通路: コア裏口 -> 庭の中ほどへ
+  const plen = Math.max(0.4, yardD - 0.6);
+  list.push({ part: 'path', geoKey: U.key, geometry: U.geometry, matKey: 'solid:path', material: _solid(0xb0a999, { roughness: 0.9 }), local: _local(coreX, -0.005, bz - 0.3 - plen / 2, 0.9, 0.1, plen), tinted: false });
+  // 植栽（低木2つ）: LOD0のみ
+  const plantMat = { matKey: 'solid:plant', material: _solid(0x466b33, { roughness: 0.85 }) };
+  [-1, 1].forEach((s) => list.push({ part: 'planting', geoKey: U.key, geometry: U.geometry, ...plantMat, local: _local(s * (yardW / 2 - 0.4), 0.2, yz1 + 0.5, 0.5, 0.4, 0.5), tinted: false }));
+  return list;
+}
+
+// ---- 10.8 Renderer連携用API ----------------------------------------------------------------
+export const MEDIUM_DENSITY_ARCHETYPES = new Map();
+/** w=道路側の幅, d=奥行（メートル、getHouseArchetypeと同じ規約）。4x6/6x6のいずれかの実寸でのみヒットする。 */
+export function getMediumDensityArchetype(w, d, variantIndex = 0) {
+  const base = getMediumDensityHouseConfigForCell(w, d, variantIndex);
+  if (!base) return null;
+  const id = `${base.id}@${w}x${d}`;
+  if (MEDIUM_DENSITY_ARCHETYPES.has(id)) return MEDIUM_DENSITY_ARCHETYPES.get(id);
+  const L = _midDensityLayout(base, w, d);
+  const arch = {
+    id, baseId: base.id, sizeClass: base.sizeKey, w, d, kind: 'res_mid',
+    floors: base.floors, roofType: 'flat',
+    materialRefs: { facade: base.facadeMaterial, accent: base.accentMaterial, roof: base.roofMaterial, foundation: 'concrete', trim: 0xe8e4da, metal: 0x3d3d3d },
+    balconyType: base.balconyType, windowPattern: base.windowPattern, entranceType: base.entranceType,
+    corePosition: base.corePosition, roofEquipment: base.roofEquipment || [], mirror: !!base.mirror, segmentation: base.segmentation,
+    households: base.households, population: base.population,
+    // Prompt 39B: unlike res_low/res_terrace, this building's part coordinates already fill the real
+    // lot footprint exactly (no artificial shrink-to-reveal-more-yard) — the yard is its own fixed
+    // allocation (yardD), so HouseInstanceRenderer must NOT apply its default HOUSE_SCALE (0.6) here.
+    houseScale: { x: 1, y: 1, z: 1 },
+    layout: L, seed: base.seed, _lodParts: [null, null, null, null], _lotParts: null,
+  };
+  MEDIUM_DENSITY_ARCHETYPES.set(id, arch);
+  return arch;
+}
+/** Renderable module instances of a medium-density archetype at one LOD (cached on the archetype). */
+export function getMediumDensityLodParts(arch, lod) {
+  if (arch._lodParts[lod]) return arch._lodParts[lod];
+  return (arch._lodParts[lod] = lod === 0 ? _midLod0Parts(arch) : _midUnitParts(arch, lod));
+}
+/** Lot dressing (yard behind the building) for a medium-density archetype: cached per LOD. */
+export function getMediumDensityLotParts(arch, lod) {
+  if (!arch._lotParts) arch._lotParts = new Map();
+  const key = `mid|${lod}`;
+  let l = arch._lotParts.get(key);
+  if (!l) { l = _midLotParts(arch, lod); arch._lotParts.set(key, l); }
+  return l;
+}
+/** Build + cache every LOD of one archetype ahead of a bulk placement. */
+export function prewarmMediumDensityArchetype(arch, lods = [0, 1, 2, 3]) { lods.forEach((l) => getMediumDensityLodParts(arch, l)); getMediumDensityLotParts(arch, 0); return arch; }
+export const MEDIUM_DENSITY_ARCHETYPE_COUNT = MEDIUM_DENSITY_HOUSES.length;

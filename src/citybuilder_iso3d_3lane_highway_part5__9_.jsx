@@ -1,6 +1,6 @@
 import React, { useRef, useEffect, useState, useCallback, useMemo } from 'react';
 import * as THREE from 'three';
-import { buildTerraceHouse, getTerraceHouseConfig, TERRACE_HOUSES, buildLowDensityHouseForCell, getHouseArchetype, getTerraceArchetype, TERRACE_ARCHETYPE_COUNT } from './HousingPBR.jsx';
+import { buildTerraceHouse, getTerraceHouseConfig, TERRACE_HOUSES, buildLowDensityHouseForCell, getHouseArchetype, getTerraceArchetype, TERRACE_ARCHETYPE_COUNT, getMediumDensityArchetype, isMediumDensityHouseSizeAvailable, MEDIUM_DENSITY_ARCHETYPE_COUNT } from './HousingPBR.jsx';
 // Prompt 24A: res_low Roadside-Plot houses are drawn by ONE shared InstancedMesh renderer (no per-house Group).
 import { createHouseInstanceRenderer } from './HouseInstanceRenderer.jsx';
 const HOUSE_RENDERER_IS_DEV = (() => { try { return !!(import.meta && import.meta.env && import.meta.env.DEV); } catch (e) { return false; } })();
@@ -5728,6 +5728,7 @@ const LOW_DENSITY_FAIL_TEXT = {
   selection_invalid: '選択範囲が無効です',
   missing_cells: '選択範囲に欠けたセルがあります(道路や他の区画で切り取られた部分)',
   unsupported_size: '低密度住宅は 3×3 〜 6×6 の決められたセルサイズ(3×4 / 4×6 / 5×6 / 6×6 など)のみ建築できます',
+  unsupported_size_mid: '中密度住宅は 4×6 または 6×6 のみ建築できます',
   cell_blocked: '選択範囲に使用できないセルがあります(建物・道路・建築禁止エリア)',
   not_road_adjacent: '道路に面したセル(道路に一番近い列)からドラッグを始めてください',
   parcel_missing: 'Parcel未生成(選択セルから敷地を作れませんでした)',
@@ -10045,7 +10046,14 @@ export default function CityGridIso() {
   // only — sets lot.buildingId alongside the lot's existing id/gx/gy/etc, never replacing them.
   const registerBuildingForLot = useCallback((lot) => {
     // Prompt 24A: a res_low house records its House Archetype (data only — never a THREE.Group).
-    const houseArch = lot.type === 'res_low' ? getHouseArchetype(lot.footprint.width, lot.footprint.depth, ((lot.id % 10) + 10) % 10) : null;
+    // Prompt 39C: a res_mid house built via the Roadside Plot Cell tool does the same, reconstructing
+    // the archetype's (width, FULL plot depth) convention from footprint.depth + yardDepth — see
+    // syncMidDensityHouseInstance. Keeps Building -> Lot -> Roadside Plot Cells -> archetype ->
+    // households/population traceable through the same registry record shape as res_low.
+    const midArch = lot.type === 'res_mid' && isMediumDensityHouseSizeAvailable(lot.footprint.width, lot.footprint.depth + (lot.yardDepth || 0))
+      ? getMediumDensityArchetype(lot.footprint.width, lot.footprint.depth + (lot.yardDepth || 0), ((lot.id % MEDIUM_DENSITY_ARCHETYPE_COUNT) + MEDIUM_DENSITY_ARCHETYPE_COUNT) % MEDIUM_DENSITY_ARCHETYPE_COUNT)
+      : null;
+    const houseArch = lot.type === 'res_low' ? getHouseArchetype(lot.footprint.width, lot.footprint.depth, ((lot.id % 10) + 10) % 10) : midArch;
     const record = createBuildingRecord({
       shapeType: houseArch ? 'house' : null, seed: houseArch ? lot.id : null, archetypeId: houseArch ? houseArch.id : null,
       kind: 'lot',
@@ -11227,6 +11235,99 @@ export default function CityGridIso() {
     return ok ? { ok: true, reason: null, plan } : { ok: false, reason: diag.reason || 'finalize_failed', error: diag.error, plan };
   };
 
+  // ---- MID-DENSITY (res_mid) Prompt 39C: same Roadside Plot Cell pipeline as res_low/res_terrace
+  // above, but only TWO exact frontage widths are buildable — 4 columns (4x6 lot: 4x3 building +
+  // 4x3 yard, 5 floors) or 6 columns (6x6 lot: 6x4 building + 6x2 yard, 10 floors). Like res_terrace
+  // the lot is always the FULL road-frontage strip depth (PLOT_ROWS=6m); like res_low the frontage
+  // WIDTH is chosen by the player's drag (getPlotSelection). The building always sits on the ROAD
+  // side (row 0 first — terrace's front-of-strip arrangement), with the private yard behind it.
+  const MID_DENSITY_SIZE_SPEC = {
+    4: { houseDepth: 3, yardDepth: 3, floors: 5 },
+    6: { houseDepth: 4, yardDepth: 2, floors: 10 },
+  };
+  const makeMidDensityLotSelection = (sel) => {
+    if (!sel || !sel.group) return sel;
+    const g = sel.group, spec = MID_DENSITY_SIZE_SPEC[sel.cols];
+    const cells = [];
+    let missing = 0;
+    for (let c = sel.c0; c <= sel.c1; c++) for (let r = 0; r < PLOT_ROWS; r++) {
+      const cell = g.cellMap.get(c * PLOT_KEY_STRIDE + r);
+      if (cell) cells.push(cell); else missing++;
+    }
+    const notRoadAdjacent = sel.anchorRow !== 0 || sel.r0 !== 0;
+    if (notRoadAdjacent || !spec) {
+      return { ...sel, r0: 0, r1: PLOT_ROWS - 1, rows: PLOT_ROWS, cells, missing, lot: { invalid: notRoadAdjacent ? 'not_road_adjacent' : 'unsupported_size_mid' } };
+    }
+    return { ...sel, r0: 0, r1: PLOT_ROWS - 1, rows: PLOT_ROWS, cells, missing, lot: { houseRows: spec.houseDepth, yardRows: spec.yardDepth, houseR0: 0, floors: spec.floors } };
+  };
+  const evaluateMidDensityZone = (sel) => {
+    if (!sel || !sel.cells || !sel.cells.length) return { ok: false, reason: 'selection_invalid' };
+    if (sel.lot && sel.lot.invalid) return { ok: false, reason: sel.lot.invalid };
+    if (sel.missing > 0) return { ok: false, reason: 'missing_cells' };
+    for (const cell of sel.cells) if (!isPlotCellOpen(cell)) return { ok: false, reason: 'cell_blocked' };
+    return { ok: true, reason: null };
+  };
+  // House footprint = the ROAD-side rows only (row 0..houseRows-1), mirroring computeTerraceFootprint's
+  // centroid/tangent math (real RoadSegment tangent -> any angle, never global X/Z).
+  const computeMidDensityFootprint = (sel) => {
+    const g = sel.group, hr = sel.lot.houseRows, hr0 = sel.lot.houseR0;
+    const houseCells = sel.cells.filter((cell) => cell.row >= hr0 && cell.row < hr0 + hr);
+    let cx = 0, cz = 0;
+    for (const cell of houseCells) { cx += cell.cx; cz += cell.cz; }
+    cx /= houseCells.length; cz /= houseCells.length;
+    const first = g.cellMap.get(sel.c0 * PLOT_KEY_STRIDE + hr0), last = g.cellMap.get(sel.c1 * PLOT_KEY_STRIDE + hr0);
+    let tx, tz;
+    if (first && last) { tx = last.cx - first.cx; tz = last.cz - first.cz; }
+    if (!first || !last || Math.hypot(tx, tz) < 0.5) { tx = sel.cells[0].tan.x; tz = sel.cells[0].tan.z; }
+    const tl = Math.hypot(tx, tz) || 1; tx /= tl; tz /= tl;
+    const yardRows = sel.lot.yardRows;
+    let dx = 0, dz = 0;
+    if (yardRows > 0) {
+      let yx = 0, yz = 0, n = 0;
+      for (const cell of sel.cells) if (cell.row >= hr0 + hr) { yx += cell.cx; yz += cell.cz; n++; }
+      if (n) { dx = yx / n - cx; dz = yz / n - cz; const dl = Math.hypot(dx, dz) || 1; dx /= dl; dz /= dl; }
+    }
+    return { cx, cz, w: sel.cols, d: hr, rotationY: Math.atan2(-tz, tx), frontSign: -g.sideSign, yardDepth: yardRows, roadDir: { x: dx, z: dz }, floors: sel.lot.floors };
+  };
+  const planMidDensityHouse = (sel) => {
+    const diag = { parcelFound: false, parcelSource: null, containmentOk: null, footprintClear: null, gradingBuildable: null };
+    const zone = evaluateMidDensityZone(sel);
+    if (!zone.ok) return { zoneOk: false, buildOk: false, reason: zone.reason, placement: null, diag };
+    const fp = computeMidDensityFootprint(sel);
+    const registryParcel = findParcelForFootprint(buildingParcelRegistryRef.current, fp.cx, fp.cz, fp.w, fp.d, fp.rotationY);
+    diag.parcelFound = !!registryParcel;
+    const plotParcel = createParcelFromRoadsidePlotSelection(sel);
+    diag.parcelSource = registryParcel ? 'registry' : plotParcel ? 'roadside_plot_selection' : null;
+    const parcel = registryParcel || plotParcel;
+    if (!parcel) return { zoneOk: true, buildOk: false, reason: 'parcel_missing', placement: null, diag };
+    diag.containmentOk = plotParcel ? footprintCoveredByPolygon(plotParcel.polygon, fp.cx, fp.cz, fp.w, fp.d, fp.rotationY) : false;
+    if (!diag.containmentOk) return { zoneOk: true, buildOk: false, reason: 'footprint_outside_cells', placement: null, diag };
+    zoneBuildTypeRef.current = TILE_RES;
+    let clearReason;
+    try { clearReason = lotFootprintCheck(fp.cx, fp.cz, fp.w, fp.d, fp.rotationY, { exact: true }); } finally { zoneBuildTypeRef.current = null; }
+    diag.footprintClear = clearReason === null;
+    if (clearReason) return { zoneOk: true, buildOk: false, reason: clearReason, placement: null, diag };
+    const _grade = computeBuildingGrading(fp.cx, fp.cz, fp.w, fp.d, fp.rotationY);
+    diag.gradingBuildable = _grade.buildable;
+    if (!diag.gradingBuildable) return { zoneOk: true, buildOk: false, reason: _grade.strategy === 'water' ? 'terrain_water' : 'terrain_too_steep', placement: null, diag };
+    return { zoneOk: true, buildOk: true, reason: null, placement: { ...fp, parcelId: parcel.id, parcelSource: diag.parcelSource }, diag };
+  };
+  // Commits via the SAME finalizeLot() res_low/res_terrace already use — collision, terrain grading,
+  // Building Registry, HouseInstanceRenderer sync (syncMidDensityHouseInstance below) all reused.
+  const buildMidDensityHouse = (sel) => {
+    const plan = planMidDensityHouse(sel);
+    if (!plan.buildOk) { logLowDensityDiag(sel, plan, null, plan.reason); return { ok: false, reason: plan.reason, plan }; }
+    const pl = plan.placement, diag = {};
+    let ok = false;
+    zoneBuildTypeRef.current = TILE_RES;
+    try {
+      ok = finalizeLot('res_mid', pl.cx, pl.cz, pl.w, pl.d, pl.frontSign, pl.rotationY,
+        { skipRoadAccess: true, initialLevel: 1, exact: true, plotSource: 'roadside_plot_selection', yardDepth: pl.yardDepth || 0, roadDir: pl.roadDir, diag });
+    } finally { zoneBuildTypeRef.current = null; }
+    logLowDensityDiag(sel, plan, ok ? 'ok' : 'failed', ok ? null : (diag.reason || 'finalize_failed'));
+    return ok ? { ok: true, reason: null, plan } : { ok: false, reason: diag.reason || 'finalize_failed', error: diag.error, plan };
+  };
+
   // getMicroCellsForFootprint: real oriented-rectangle containment (obbCorners + pointInPolygon,
   // the same primitives Building Placement Parcels already use — Prompt 17/18), never a plain AABB.
   const getMicroCellsForFootprint = (cx, cz, w, h, rotationY = 0) => {
@@ -12019,6 +12120,51 @@ export default function CityGridIso() {
     return true;
   }, []);
 
+  // Prompt 39C: res_mid house visual = an INSTANCE in the shared HouseInstanceRenderer, exactly like
+  // res_low/res_terrace above — replaces the old world-space box (buildLotGroup's generic res_mid
+  // branch) for the two archetype-backed sizes (4x6 / 6x6). lot.footprint stores the BUILDING-only
+  // footprint (w x houseDepth); the archetype's own w/d convention is (frontage width, FULL plot
+  // depth), so the full plot depth is reconstructed as footprint.depth + yardDepth (3+3=6 / 4+2=6)
+  // before calling getMediumDensityArchetype — see HousingPBR.jsx §10.3. Returns false (never
+  // throws) for any size getMediumDensityArchetype doesn't recognize — e.g. a zone_res-grown res_mid
+  // lot at 4x5/5x6 (BUILDING_ARCHETYPE_SIZES.res_mid) — so growth-built lots of those sizes keep
+  // falling back to the untouched legacy Group path below (res_mid's zone_res growth behavior is
+  // unchanged; this only replaces rendering for the archetype's own two exact sizes).
+  const syncMidDensityHouseInstance = useCallback((lot, t) => {
+    const hr = t.houseRenderer;
+    if (!hr || lot.type !== 'res_mid' || !(lot.level > 0)) return false;
+    const w = lot.footprint.width, d = lot.footprint.depth;
+    const plotD = d + (lot.yardDepth || 0);
+    if (!isMediumDensityHouseSizeAvailable(w, plotD)) return false;
+    const grading = computeBuildingGrading(lot.position.x, lot.position.z, w, d, lot.rotation || 0);
+    lot.grading = grading;
+    lot.position.y = grading.baseY;
+    const isRetaining = grading.strategy === 'retaining_wall';
+    const needSkirt = grading.strategy !== 'flat' && grading.foundationHeight > 0.05;
+    const variantIndex = ((lot.id % MEDIUM_DENSITY_ARCHETYPE_COUNT) + MEDIUM_DENSITY_ARCHETYPE_COUNT) % MEDIUM_DENSITY_ARCHETYPE_COUNT;
+    const arch = getMediumDensityArchetype(w, plotD, variantIndex);
+    if (!arch) return false;
+    const record = {
+      id: lot.id,
+      archetype: arch,
+      position: { x: lot.position.x, y: grading.baseY, z: lot.position.z },
+      rotationY: (lot.rotation || 0) + ((lot.frontSign ?? -1) < 0 ? Math.PI : 0),
+      scale: 1, level: lot.level, seed: lot.id,
+      // res_mid's yard size is fixed by the archetype itself (getMediumDensityLotParts) — yardDepth/
+      // yardSign/yardRear are only passed to keep the record shape uniform with res_low/res_terrace.
+      yardDepth: lot.yardDepth != null && lot.yardDepth > 0 ? lot.yardDepth : 0, yardSign: -1, yardRear: true,
+      skirt: needSkirt ? { height: grading.foundationHeight + (isRetaining ? 0.3 : 0.05), retaining: isRetaining, width: w * 0.97, depth: d * 0.97, yaw: lot.rotation || 0 } : null,
+    };
+    if (lot.renderHandle != null && hr.hasHouse(lot.renderHandle)) hr.updateHouse(record);
+    else lot.renderHandle = hr.addHouse(record, { immediate: true });
+    if (lot.group) {
+      t.scene.remove(lot.group);
+      lot.group.traverse((o) => { if (o.geometry) o.geometry.dispose(); if (o.material) { const mats = Array.isArray(o.material) ? o.material : [o.material]; mats.forEach((m) => m.dispose()); } });
+      lot.group = null;
+    }
+    return true;
+  }, []);
+
   const rebuildLotGroup = useCallback((lot) => {
     const t = threeRef.current; if (!t) return;
     if (lot.type === 'res_low' && lot.level > 0 && t.houseRenderer) {
@@ -12035,6 +12181,12 @@ export default function CityGridIso() {
         if (!HOUSE_RENDERER_IS_DEV) throw err;
         console.warn('[HouseInstanceRenderer] terrace falling back to legacy Group (dev only):', err);
       }
+    }
+    if (lot.type === 'res_mid' && lot.level > 0 && t.houseRenderer) {
+      // syncMidDensityHouseInstance never throws for an unsupported size (returns false instead —
+      // see its own header comment), so no dev-only gating is needed here: any size it can't handle
+      // just falls straight through to the legacy Group below, in every build, exactly as before.
+      if (syncMidDensityHouseInstance(lot, t)) return;
     }
     if (lot.renderHandle != null && t.houseRenderer) { t.houseRenderer.removeHouse(lot.renderHandle); lot.renderHandle = null; }
     if (lot.group) {
@@ -12072,7 +12224,7 @@ export default function CityGridIso() {
     }
     t.scene.add(group);
     lot.group = group;
-  }, [syncLowDensityHouseInstance]);
+  }, [syncLowDensityHouseInstance, syncTerraceHouseInstance, syncMidDensityHouseInstance]);
 
   // Part 5 (§Homeless: "家を失う"): any household whose homeId still points at a home tile/lot
   // that just got bulldozed/dezoned loses that home and its members are evicted to Homeless —
@@ -12866,13 +13018,28 @@ export default function CityGridIso() {
   const updatePlotBuildPreview = (tool, ax, az, cx, cz) => {
     const t = threeRef.current; if (!t || !t.plotSelectionMesh) return;
     const hide = () => { t.plotSelectionMesh.visible = false; dragRef.current.plotSel = null; dragRef.current.plotValid = false; publishZoneStatus(null, 'preview'); };
-    if (tool !== 'res_terrace') { hide(); return; }
+    if (tool !== 'res_terrace' && tool !== 'res_mid') { hide(); return; }
     let anchor = dragRef.current.plotAnchor;
     if (anchor === undefined) { anchor = pickPlotCellNear(ax, az, 2) || null; dragRef.current.plotAnchor = anchor; }
     if (!anchor) { hide(); return; }
-    const sel = makeTerraceLotSelection(anchor, cx, cz);
-    const plan = sel ? planTerraceHouse(sel) : null;
-    const houseR0 = 0, houseRows = 3; // front 3 rows = house, back 3 rows = yard (requirement #7/#8/#9)
+    let sel, plan, houseR0 = 0, houseRows, sizeTxt, buildingTxt;
+    if (tool === 'res_mid') {
+      // Prompt 39C: frontage width comes from the free drag (like res_low), depth is always the full
+      // PLOT_ROWS strip (like res_terrace) — see makeMidDensityLotSelection.
+      sel = makeMidDensityLotSelection(getPlotSelection(anchor, cx, cz));
+      plan = sel ? planMidDensityHouse(sel) : null;
+      houseRows = sel && sel.lot && sel.lot.houseRows != null ? sel.lot.houseRows : null;
+      const yardRows = sel && sel.lot ? sel.lot.yardRows : null;
+      const floors = sel && sel.lot ? sel.lot.floors : null;
+      sizeTxt = houseRows != null ? `${sel.cols} × 6 (建物${sel.cols}×${houseRows} + 奥庭${sel.cols}×${yardRows})` : (sel ? `${sel.cols} × ${sel.rows}` : '—');
+      buildingTxt = floors != null ? `中密度住宅 ${sel.cols}×6 ${floors}階建て` : '—';
+    } else {
+      sel = makeTerraceLotSelection(anchor, cx, cz);
+      plan = sel ? planTerraceHouse(sel) : null;
+      houseRows = 3; // front 3 rows = house, back 3 rows = yard (requirement #7/#8/#9)
+      sizeTxt = '3 × 6 (house 3×3 + yard 3×3)';
+      buildingTxt = 'テラスハウス';
+    }
     if (!sel || !sel.cells.length) { hide(); return; }
     dragRef.current.plotSel = sel;
     dragRef.current.plotValid = !!(plan && plan.zoneOk);
@@ -12882,7 +13049,7 @@ export default function CityGridIso() {
     const positions = [], colors = [];
     sel.cells.forEach((cell) => {
       if (isPlotCellReserved(cell)) return;
-      const col = (!plan || !plan.zoneOk) ? red : (cell.row >= houseR0 && cell.row < houseR0 + houseRows ? houseColor : yardColor);
+      const col = (!plan || !plan.zoneOk) ? red : (houseRows != null && cell.row >= houseR0 && cell.row < houseR0 + houseRows ? houseColor : yardColor);
       const [c0, c1, c2, c3] = cell.corners;
       for (const c of [c0, c1, c2, c0, c2, c3]) { positions.push(c.x, c.y + PLOT_PREVIEW_LIFT, c.z); colors.push(col.r, col.g, col.b); }
     });
@@ -12892,8 +13059,6 @@ export default function CityGridIso() {
     geo.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
     t.plotSelectionMesh.geometry = geo;
     t.plotSelectionMesh.visible = positions.length > 0;
-    const sizeTxt = '3 × 6 (house 3×3 + yard 3×3)';
-    const buildingTxt = 'テラスハウス';
     publishZoneStatus(!plan || !plan.zoneOk
       ? { phase: 'preview', zone: 'INVALID', size: sizeTxt, building: '—', reason: plan ? plan.reason : 'selection_invalid' }
       : plan.buildOk
@@ -12905,7 +13070,7 @@ export default function CityGridIso() {
   const updatePlotHover = (x, z) => {
     const t = threeRef.current; if (!t || !t.plotHoverMesh) return;
     const tool = toolRef.current;
-    const isZoneTool = tool === 'zone_res' || tool === 'zone_com' || tool === 'zone_ind' || tool === 'res_terrace';
+    const isZoneTool = tool === 'zone_res' || tool === 'zone_com' || tool === 'zone_ind' || tool === 'res_terrace' || tool === 'res_mid';
     if (!isZoneTool || dragRef.current.mode === 'microzone' || dragRef.current.mode === 'plotbuild') { t.plotHoverMesh.visible = false; return; }
     const cell = pickPlotCellNear(x, z, 0);
     if (!cell || isPlotCellReserved(cell)) { t.plotHoverMesh.visible = false; return; }
@@ -16155,8 +16320,9 @@ export default function CityGridIso() {
       // Prompt 24B/38: res_terrace is a direct Roadside Plot Cell placement tool too (TEST 01 —
       // "Terrace tool selected -> roadside cells visible"), so it shows the same overlay.
       // (低密度住宅の直接配置は廃止 — res_low no longer has its own direct-placement tool.)
+      // Prompt 39C: res_mid joins res_terrace as a direct Roadside Plot Cell placement tool.
       const isZoneTool = toolRef.current === 'zone_res' || toolRef.current === 'zone_com' || toolRef.current === 'zone_ind'
-        || toolRef.current === 'res_terrace';
+        || toolRef.current === 'res_terrace' || toolRef.current === 'res_mid';
       if (isZoneTool && !roadsidePlotCellsRef.current) rebuildRoadsidePlotOverlay();
       roadsidePlotOverlayMesh.visible = isZoneTool;
       if (!isZoneTool) { // Prompt 21H: the hover cell / drag preview only exist while a zoning tool is active
@@ -20508,15 +20674,15 @@ export default function CityGridIso() {
       return;
     }
     const { tx, ty } = worldToTile(point);
-    if (toolRef.current === 'res_terrace') {
-      // Prompt 24B/38: res_terrace uses the SAME Roadside Plot Cell selection pipeline zone_res's
-      // automatic res_low placement already used — never the legacy 'lot' mode below (Fail
-      // condition: "テラスだけ旧Lot rectangleを表示" / world X/Z rectangle).
+    if (toolRef.current === 'res_terrace' || toolRef.current === 'res_mid') {
+      // Prompt 24B/38/39C: res_terrace and res_mid use the SAME Roadside Plot Cell selection
+      // pipeline zone_res's automatic res_low placement already used — never the legacy 'lot' mode
+      // below (Fail condition: "テラス/中密度住宅だけ旧Lot rectangleを表示" / world X/Z rectangle).
       dragRef.current = { mode: 'plotbuild', plotAnchor: undefined, startX: e.clientX, startY: e.clientY };
       updatePlotBuildPreview(toolRef.current, point.x, point.z, point.x, point.z);
     } else if (RES_LOT_TYPES[toolRef.current]) {
       // anchor is a raw World Space point (never a Tile index) — see updateLotPreview.
-      // Still used by res_mid / res_lowrent / res_mixed / res_high (out of scope for Prompt 24B/38).
+      // Still used by res_lowrent / res_mixed / res_high (out of scope for Prompt 24B/38/39C).
       dragRef.current = { mode: 'lot', anchorX: point.x, anchorZ: point.z, startX: e.clientX, startY: e.clientY };
       updateLotPreview(toolRef.current, point.x, point.z, point.x, point.z);
     } else if (toolRef.current.startsWith('edu_place_')) {
@@ -20744,13 +20910,14 @@ export default function CityGridIso() {
       return;
     }
     if (dragRef.current.mode === 'plotbuild') {
-      // Prompt 24B/38 commit — same shape as 'microzone' above, but always builds a Building
-      // (never just paints a zone): res_terrace -> buildTerracePlotHouse. (低密度住宅の直接配置は
-      // 廃止 — res_low no longer has a direct "place one building right now" tool/commit path.)
+      // Prompt 24B/38/39C commit — same shape as 'microzone' above, but always builds a Building
+      // (never just paints a zone): res_terrace -> buildTerracePlotHouse, res_mid -> buildMidDensityHouse.
+      // (低密度住宅の直接配置は廃止 — res_low no longer has a direct "place one building right now" tool/commit path.)
       const t = threeRef.current;
       if (t?.plotSelectionMesh) t.plotSelectionMesh.visible = false;
-      if (dragRef.current.plotSel && dragRef.current.plotValid && toolRef.current === 'res_terrace') {
-        buildTerracePlotHouse(dragRef.current.plotSel);
+      if (dragRef.current.plotSel && dragRef.current.plotValid) {
+        if (toolRef.current === 'res_terrace') buildTerracePlotHouse(dragRef.current.plotSel);
+        else if (toolRef.current === 'res_mid') buildMidDensityHouse(dragRef.current.plotSel);
       }
       dragRef.current = { dragging: false, painting: false, anchor: null, startX: 0, startY: 0 };
       return;
@@ -21707,14 +21874,14 @@ Grade: ${((freeRoadDraftStatus?.grade ?? 0) * 100).toFixed(1)}%${freeRoadDraftSt
         </div>
       )}
 
-      {zoneStatus && (tool === 'zone_res' || tool === 'res_terrace') && cameraMode !== 'driver' && cameraMode !== 'ped' && (() => {
+      {zoneStatus && (tool === 'zone_res' || tool === 'res_terrace' || tool === 'res_mid') && cameraMode !== 'driver' && cameraMode !== 'ped' && (() => {
         const z = zoneStatus, isResult = z.phase === 'result';
         const buildColor = z.buildState === 'BUILT' || z.buildState === 'READY' ? '#7fe0a8' : z.buildState === 'BLOCKED' || z.buildState === 'FAILED' ? '#e0a030' : '#a8d8bc';
         const zoneColor = z.zone === 'INVALID' ? '#e05a4f' : '#5a90d8';
         const reasonText = z.reason ? (LOW_DENSITY_FAIL_TEXT[z.reason] || LOW_DENSITY_FAIL_TEXT.unknown) : null;
         return (
           <div style={{ position: 'absolute', bottom: 70, left: '50%', transform: 'translateX(-50%)', padding: '10px 14px', background: 'rgba(15, 21, 18, 0.92)', border: `1px solid ${z.zone === 'INVALID' ? '#e05a4f' : z.buildState === 'BLOCKED' || z.buildState === 'FAILED' ? '#e0a030' : '#5a90d8'}`, borderRadius: 6, color: '#e8e8e8', fontSize: 12, minWidth: 260, maxWidth: 380, pointerEvents: 'none', lineHeight: 1.6 }}>
-            <div style={{ color: zoneColor, fontSize: 13 }}>{tool === 'res_terrace' ? 'テラスハウス' : 'RESIDENTIAL ZONE'}</div>
+            <div style={{ color: zoneColor, fontSize: 13 }}>{tool === 'res_terrace' ? 'テラスハウス' : tool === 'res_mid' ? '中密度住宅' : 'RESIDENTIAL ZONE'}</div>
             <div>{z.size}</div>
             <div>Zone: <span style={{ color: zoneColor }}>{z.zone}</span></div>
             {isResult && z.buildState && (

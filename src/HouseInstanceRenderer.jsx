@@ -1,8 +1,16 @@
 // ============================================================================
-// HouseInstanceRenderer.jsx  (Prompt 24A-R2)
+// HouseInstanceRenderer.jsx  (Prompt 24A-R2, res_mid dispatch added in Prompt 39B)
 // ----------------------------------------------------------------------------
 // House = a light data record.  Drawing = shared module geometry + shared material + InstancedMesh.
-//   record : { id, archetype:{w,d,variantIndex}, position, rotationY, scale, level, seed, skirt }
+//   record : { id, archetype, position, rotationY, scale, level, seed, yardDepth, yardSign, skirt }
+//   archetype is either a resolved archetype object (has .id — from getHouseArchetype /
+//   getTerraceArchetype / getMediumDensityArchetype) or the shorthand { w, d, variantIndex, kind? }.
+//   kind is 'res_low' (default, omit it), 'res_terrace' (pass a resolved terrace archetype — same as
+//   before), or 'res_mid' (either pass { w, d, variantIndex, kind: 'res_mid' } or a resolved
+//   getMediumDensityArchetype(...) object). res_low/res_terrace/res_mid are NOT separate rendering
+//   paths — same records Map, same houseList, same buckets/sectors/InstancedMesh pipeline below;
+//   `kind` only selects which HousingPBR.jsx functions build the kit-of-parts (see _lodPartsFor /
+//   _lotPartsFor above _buildRecord).
 //   Renderer keeps NO Group / Mesh per house. THREE objects are per BUCKET:
 //     bucket key = sector | lod | geometryKey | materialKey     (many houses -> one InstancedMesh)
 //   One house owns SEVERAL instances (one per module of its kit: wall, roof, windows, columns ...),
@@ -12,7 +20,28 @@
 //   geometry creation or dispose. Geometry is created once per module key in HousingPBR.jsx.
 // ============================================================================
 import * as THREE from 'three';
-import { getHouseArchetype, getHouseLodParts, getHouseLotParts, getHouseGeometryStats, getHouseMaterialStats, getSolidMaterial, disposeHouseSharedResources, HOUSE_STATS, HOUSE_SCALE } from './HousingPBR.jsx';
+import {
+  getHouseArchetype, getHouseLodParts, getHouseLotParts,
+  getMediumDensityArchetype, getMediumDensityLodParts, getMediumDensityLotParts,
+  getHouseGeometryStats, getHouseMaterialStats, getSolidMaterial, disposeHouseSharedResources, HOUSE_STATS, HOUSE_SCALE,
+} from './HousingPBR.jsx';
+
+// ---------------------------------------------------------------------------------------------
+// Prompt 39B: res_low / res_terrace / res_mid all share this ONE renderer (bucket/InstancedMesh
+// pipeline below never branches on kind). Only the two calls that fetch an archetype's kit-of-parts
+// need to know which HousingPBR.jsx module built the archetype, because res_mid uses its own
+// LOD/lot functions (different layout shape, no per-instance yardDepth — the yard is a fixed
+// allocation baked into the archetype). Every archetype object — low, terrace, or medium — carries
+// a `kind` tag ('res_low' default for legacy archetypes with none, 'res_terrace', 'res_mid'); that
+// tag is the ONLY thing that determines the dispatch below.
+const RES_MID = 'res_mid';
+function _archKind(arch) { return (arch && arch.kind) || 'res_low'; }
+/** House body kit-of-parts for one archetype at one LOD, regardless of kind. */
+function _lodPartsFor(arch, lod) { return _archKind(arch) === RES_MID ? getMediumDensityLodParts(arch, lod) : getHouseLodParts(arch, lod); }
+/** Lot dressing (yard/fence) for one archetype. res_mid ignores yardDepth/rear — its yard size is
+ * fixed by the archetype (4x6: 3m / 6x6: 2m behind the building) — but still gates on yardDepth>=0
+ * exactly like res_low/res_terrace, so the record shape (`{ ..., yardDepth, yardSign }`) stays uniform. */
+function _lotPartsFor(arch, yardDepth, lod, rear) { return _archKind(arch) === RES_MID ? getMediumDensityLotParts(arch, lod) : getHouseLotParts(arch, yardDepth, lod, rear); }
 
 // World-space sector size per LOD. Near LODs use small sectors (tight frustum culling); far LODs use big
 // ones (everything is on screen when zoomed out anyway) so far houses collapse into a handful of buckets.
@@ -28,13 +57,24 @@ const INITIAL_CAPACITY = 16;
 
 // Shadow policy per LOD (part -> flag). Small detail parts (trim, glass, columns, rails ...) neither cast nor
 // receive: they are a few cm thick and would only cost shadow-pass draw calls.
+// res_mid part names added below (parapet/roofdeck/core/balcslab/canopy/stepdeck/watertank/hedge/
+// planting): same policy as res_low/res_terrace — only Near-LOD structural masses cast shadows, small
+// trims (winframe/glass/mullion/sill/railing/baluster/doorframe/door/canopypost/column/acunit/vent/
+// pier/winsurround/recess) never do, and nothing casts past Mid (LOD2/3), matching CAST[2]/[3] below.
 const CAST = [
-  { wall: 1, roof: 1, porchroof: 1, chimney: 1, dormerwall: 1, dormerroof: 1 },
-  { wall: 1, roof: 1 }, { roof: 1 }, {},
+  { wall: 1, roof: 1, porchroof: 1, chimney: 1, dormerwall: 1, dormerroof: 1, parapet: 1, roofdeck: 1, core: 1, balcslab: 1, canopy: 1 },
+  { wall: 1, roof: 1, parapet: 1, core: 1 }, { roof: 1, parapet: 1 }, {},
 ];
+// Note: lot-dressing parts (lawn, fence, path, and the yard furniture/pool added in HousingPBR.jsx's
+// _lotParts, or hedge/planting added in its res_mid _midLotParts) are attached via _attachParts'
+// second loop below, which hardcodes cast=false for all of them (same treatment as the lawn) — only
+// RECV matters here for 'furniture'/'pool'/'hedge'/'planting'.
 const RECV = [
-  { wall: 1, roof: 1, porchroof: 1, foundation: 1, deck: 1, steps: 1, chimney: 1, door: 1, dormerwall: 1, dormerroof: 1, lawn: 1, path: 1 },
-  { wall: 1, roof: 1, foundation: 1, lawn: 1 }, { wall: 1, roof: 1, porchroof: 1, lawn: 1 }, { lawn: 1 },
+  { wall: 1, roof: 1, porchroof: 1, foundation: 1, deck: 1, steps: 1, chimney: 1, door: 1, dormerwall: 1, dormerroof: 1, lawn: 1, path: 1, furniture: 1, pool: 1,
+    parapet: 1, roofdeck: 1, core: 1, balcslab: 1, canopy: 1, stepdeck: 1, watertank: 1, hedge: 1, planting: 1 },
+  { wall: 1, roof: 1, foundation: 1, lawn: 1, parapet: 1, core: 1, hedge: 1 },
+  { wall: 1, roof: 1, porchroof: 1, lawn: 1, parapet: 1, core: 1 },
+  { lawn: 1 },
 ];
 
 const _now = () => (typeof performance !== 'undefined' ? performance.now() : Date.now());
@@ -90,6 +130,13 @@ export function createHouseInstanceRenderer(scene) {
     mesh.castShadow = b.cast; mesh.receiveShadow = b.recv;
     mesh.visible = b.count > 0 && b.sector.visible;
     mesh.name = `houses|${b.key}`;
+    if (b.part === 'poolwater') {
+      // Pool water's ripple is driven by a uTime uniform on its (single, shared) material — see
+      // _poolWaterMaterial() in HousingPBR.jsx. onBeforeRender fires automatically whenever this
+      // bucket's mesh is actually drawn, so no hook into the main app's render loop is needed.
+      const mat = b.material;
+      mesh.onBeforeRender = () => { const sh = mat.userData && mat.userData.shader; if (sh) sh.uniforms.uTime.value = _now() / 1000; };
+    }
     return mesh;
   }
   function _bucket(sector, lodKey, geoKey, geometry, matKey, material, part, cast, recv, tinted) {
@@ -157,7 +204,7 @@ export function createHouseInstanceRenderer(scene) {
   const _tm = new THREE.Matrix4(), _tc = [1, 1, 1];
   function _attachParts(h, lod) {
     const t0 = _now();
-    const parts = getHouseLodParts(h.arch, lod);   // cached on the archetype; module geometry comes from the shared cache
+    const parts = _lodPartsFor(h.arch, lod);   // cached on the archetype; module geometry comes from the shared cache
     const sector = _sector(h.position.x, h.position.z, lod);
     for (const p of parts) {
       const b = _bucket(sector, lod, p.geoKey, p.geometry, p.matKey, p.material, p.part, CAST[lod][p.part], RECV[lod][p.part], p.tinted);
@@ -167,7 +214,7 @@ export function createHouseInstanceRenderer(scene) {
       h.insts.push(_bucketAdd(b, h, m, c));
     }
     if (h.yardDepth >= 0) { // lot dressing: front yard + fence/wall around the whole lot (same shared-geometry instancing)
-      for (const p of getHouseLotParts(h.arch, h.yardDepth, lod, h.yardRear)) {
+      for (const p of _lotPartsFor(h.arch, h.yardDepth, lod, h.yardRear)) {
         const b = _bucket(sector, lod, p.geoKey, p.geometry, p.matKey, p.material, p.part, false, RECV[lod][p.part], false);
         h.insts.push(_bucketAdd(b, h, _tm.multiplyMatrices(h.lotMatrix, p.local), _WHITE));
       }
@@ -210,8 +257,12 @@ export function createHouseInstanceRenderer(scene) {
   // ---------- public API ----------
   function _buildRecord(rec, existing) {
     const a = rec.archetype;
-    const arch = a.id ? a : getHouseArchetype(a.w, a.d, a.variantIndex || 0);
-    if (!arch) throw new Error(`no low-density house archetype for ${a.w}x${a.d}`);
+    // a.id present = caller already resolved the archetype (getHouseArchetype / getTerraceArchetype /
+    // getMediumDensityArchetype) and just hands the object through — this already works for any kind,
+    // unchanged. a.kind === 'res_mid' is the shorthand form, mirroring the existing {w,d,variantIndex}
+    // convenience for res_low, so callers don't have to import getMediumDensityArchetype themselves.
+    const arch = a.id ? a : (a.kind === 'res_mid' ? getMediumDensityArchetype(a.w, a.d, a.variantIndex || 0) : getHouseArchetype(a.w, a.d, a.variantIndex || 0));
+    if (!arch) throw new Error(`no ${a.kind || 'res_low'} house archetype for ${a.w}x${a.d}`);
     const rnd = _rng(rec.seed == null ? 1 : rec.seed);
     const v = 0.9 + rnd() * 0.13; // subtle per-house tint (seed-driven; NOT per-house geometry)
     const h = existing || { id: rec.id, insts: [], skirtInst: null, matrix: new THREE.Matrix4(), lotMatrix: new THREE.Matrix4(), skirtMatrix: new THREE.Matrix4(), placed: false, lod: 0, listIndex: -1 };
@@ -351,7 +402,7 @@ export function createHouseInstanceRenderer(scene) {
     let bad = 0; const m = new THREE.Matrix4();
     houses.forEach((h) => {
       if (!h.placed) return;
-      const body = getHouseLodParts(h.arch, h.lod), lot = h.yardDepth >= 0 ? getHouseLotParts(h.arch, h.yardDepth, h.lod, h.yardRear) : [];
+      const body = _lodPartsFor(h.arch, h.lod), lot = h.yardDepth >= 0 ? _lotPartsFor(h.arch, h.yardDepth, h.lod, h.yardRear) : [];
       if (h.insts.length !== body.length + lot.length) bad++;
       h.insts.forEach((inst, i) => {
         if (inst.b.owners[inst.slot] !== inst || inst.slot >= inst.b.count || inst.house !== h) { bad++; return; }
