@@ -1,412 +1,1623 @@
 // ============================================================================
-// HouseInstanceRenderer.jsx  (Prompt 24A-R2)
+// HousingPBR.jsx
+// 低密度住宅(res_low) 30種 ・ テラスハウス(res_terrace) 20種
+// PBRマテリアル対応 住宅ジェネレーター
 // ----------------------------------------------------------------------------
-// House = a light data record.  Drawing = shared module geometry + shared material + InstancedMesh.
-//   record : { id, archetype:{w,d,variantIndex}, position, rotationY, scale, level, seed, skirt }
-//   Renderer keeps NO Group / Mesh per house. THREE objects are per BUCKET:
-//     bucket key = sector | lod | geometryKey | materialKey     (many houses -> one InstancedMesh)
-//   One house owns SEVERAL instances (one per module of its kit: wall, roof, windows, columns ...),
-//   possibly several in the same bucket (e.g. 4 window frames = 4 instances of the shared unit box).
-//   Ownership: house.insts = [inst], inst = { house, b, slot }, bucket.owners[slot] = inst.
-//   Add / remove / LOD move / level change = instance-slot bookkeeping only (swap-remove), never
-//   geometry creation or dispose. Geometry is created once per module key in HousingPBR.jsx.
+// 想定リポジトリ構成:
+//   jsx/
+//     HousingPBR.jsx        <- このファイル
+//     Citybuilder_....jsx   <- メインファイル（ここから import して使用）
+//   img/
+//     Rock/     (foundation/ground系)
+//     metal/    (roof/accent系)
+//     Tile/     (roof/wall系)
+//     asphalt/  (wall/concrete系 ※フォルダ名はasphaltだが中身は漆喰/コンクリート主体)
+//     Planks/   (外壁木材/ポーチ床系)
+//
+// メインファイルからの利用例:
+//   import { buildLowDensityHouseByIndex, buildTerraceHouseByIndex } from './HousingPBR.jsx';
+//   const house = buildLowDensityHouseByIndex(seed % 30);
+//   group.add(house);
+//
+// 既存コード（citybuilder_iso3d_3lane_highway_part5.jsx）への組み込みポイント:
+//   - res_low: buildBuildingVariants() / instanceVariants() の代わりに
+//     buildLowDensityHouseByIndex(variantIndex) を各ロットで呼び出す
+//   - res_terrace: buildLotGroup() の res_terrace 分岐内で
+//     buildTerraceHouseByIndex(unitIndex) を各ユニットに割り当てる
+//   （本ファイルは既存の巨大ファイルを直接編集せず、独立モジュールとして
+//    安全に import できる形にしてあります）
 // ============================================================================
+
 import * as THREE from 'three';
-import { getHouseArchetype, getHouseLodParts, getHouseLotParts, getHouseGeometryStats, getHouseMaterialStats, getSolidMaterial, disposeHouseSharedResources, HOUSE_STATS, HOUSE_SCALE } from './HousingPBR.jsx';
 
-// World-space sector size per LOD. Near LODs use small sectors (tight frustum culling); far LODs use big
-// ones (everything is on screen when zoomed out anyway) so far houses collapse into a handful of buckets.
-const SECTOR_SIZE_BY_LOD = [48, 96, 192, 384, 96]; // index 4 = terrain skirts
-const SECTOR_CULL_MARGIN = 26;          // keep shadow casters just outside the view alive
-const ORTHO_T = [70, 140, 300];         // LOD thresholds on (view height + 0.5*dist-to-focus), metres
-const PERSP_T = [45, 100, 200];         // LOD thresholds on camera distance, metres (driver / ped cams)
-const LOD_EXAM_PER_FRAME = 800;         // houses re-evaluated per frame after a view change
-const LOD_MOVES_PER_FRAME = 64;         // max LOD bucket moves per frame
-const PENDING_PER_FRAME = 96;           // queued (bulk) houses placed per frame
-const PENDING_BUDGET_MS = 5;
-const INITIAL_CAPACITY = 16;
+// ----------------------------------------------------------------------------
+// 1. PBRテクスチャ対応表（4K-1.zip / 4K-2.zip / 4K-3.zip 実ファイル準拠）
+// ----------------------------------------------------------------------------
 
-// Shadow policy per LOD (part -> flag). Small detail parts (trim, glass, columns, rails ...) neither cast nor
-// receive: they are a few cm thick and would only cost shadow-pass draw calls.
-const CAST = [
-  { wall: 1, roof: 1, porchroof: 1, chimney: 1, dormerwall: 1, dormerroof: 1 },
-  { wall: 1, roof: 1 }, { roof: 1 }, {},
+const TEXTURE_BASE = 'img/';
+
+// NOTE: 以下3件はダウンロード元でのファイル名ゆれ。中身を目視確認の上、
+// 実ファイル名をリネームするか、このパスを実際のファイル名に合わせて調整してください。
+//   - Planks: wood_Brown_large_diff/nor_gl だが arm だけ wood_Brown_brown_arm
+//   - Planks: pillar_bamboo_wall_diff だが nor_gl/arm は bamboo_wall_*
+//   - asphalt: blue_asphalt_plaster_wall_diff だが nor_gl/arm は blue_plaster_wall_*
+//   - Rock: gravel_floor_02_diff だが nor_gl/arm は gravel_floor_*（_02なし）
+const TEXTURE_FILES = {
+  // ---- WOOD (外壁・木部) ----
+  paintedWhiteWood: { diff: 'Planks/white_planks_clean_diff_4k.jpg', nor: 'Planks/white_planks_clean_nor_gl_4k.jpg', arm: 'Planks/white_planks_clean_arm_4k.jpg' },
+  paintedCreamWood: { diff: 'Planks/Cream_oak_veneer_01_diff_4k.jpg', nor: 'Planks/Cream_oak_veneer_01_nor_gl_4k.jpg', arm: 'Planks/Cream_oak_veneer_01_arm_4k.jpg' },
+  weatheredWood: { diff: 'Planks/wood_planks_grey_diff_4k.jpg', nor: 'Planks/wood_planks_grey_nor_gl_4k.jpg', arm: 'Planks/wood_planks_grey_arm_4k.jpg' },
+  darkWood: { diff: 'Planks/wood_Brown_large_diff_4k.jpg', nor: 'Planks/wood_Brown_large_nor_gl_4k.jpg', arm: 'Planks/wood_Brown_brown_arm_4k.jpg' },
+  paintedBlueWood: { diff: 'Planks/blue_painted_planks_diff_4k.jpg', nor: 'Planks/blue_painted_planks_nor_gl_4k.jpg', arm: 'Planks/blue_painted_planks_arm_4k.jpg' },
+  rawWoodCedar: { diff: 'Planks/japanese_cedar_planks_diff_4k.jpg', nor: 'Planks/japanese_cedar_planks_nor_gl_4k.jpg', arm: 'Planks/japanese_cedar_planks_arm_4k.jpg' },
+  rawWoodHinoki: { diff: 'Planks/hinoki_planks_diff_4k.jpg', nor: 'Planks/hinoki_planks_nor_gl_4k.jpg', arm: 'Planks/hinoki_planks_arm_4k.jpg' },
+  deckWood: { diff: 'Planks/wood_floor_deck_diff_4k.jpg', nor: 'Planks/wood_floor_deck_nor_gl_4k.jpg', arm: 'Planks/wood_floor_deck_arm_4k.jpg' },
+  fenceBamboo: { diff: 'Planks/pillar_bamboo_wall_diff_4k.jpg', nor: 'Planks/bamboo_wall_nor_gl_4k.jpg', arm: 'Planks/bamboo_wall_arm_4k.jpg' },
+
+  // ---- WALL (漆喰・コンクリート・レンガ) ----
+  plasterWhite: { diff: 'asphalt/white_stucco_diff_4k.jpg', nor: 'asphalt/white_stucco_nor_gl_4k.jpg', arm: 'asphalt/white_stucco_arm_4k.jpg' },
+  plasterCreamWorn: { diff: 'asphalt/worn_mossy_plasterwall_diff_4k.jpg', nor: 'asphalt/worn_mossy_plasterwall_nor_gl_4k.jpg', arm: 'asphalt/worn_mossy_plasterwall_arm_4k.jpg' },
+  plasterCream: { diff: 'asphalt/plastered_wall_05_diff_4k.jpg', nor: 'asphalt/plastered_wall_05_nor_gl_4k.jpg', arm: 'asphalt/plastered_wall_05_arm_4k.jpg' },
+  plasterBlue: { diff: 'asphalt/blue_asphalt_plaster_wall_diff_4k.jpg', nor: 'asphalt/blue_plaster_wall_nor_gl_4k.jpg', arm: 'asphalt/blue_plaster_wall_arm_4k.jpg' },
+  concrete: { diff: 'asphalt/cracked_concrete_diff_4k.jpg', nor: 'asphalt/cracked_concrete_nor_gl_4k.jpg', arm: 'asphalt/cracked_concrete_arm_4k.jpg' },
+  concreteRock: { diff: 'asphalt/rock_embedded_concrete_diff_4k.jpg', nor: 'asphalt/rock_embedded_concrete_nor_gl_4k.jpg', arm: 'asphalt/rock_embedded_concrete_arm_4k.jpg' },
+  brickRed: { diff: 'Tile/brick_pavement_04_diff_4k.jpg', nor: 'Tile/brick_pavement_04_nor_gl_4k.jpg', arm: 'Tile/brick_pavement_04_arm_4k.jpg' }, // 暫定素材（本来は舗装用）
+
+  // ---- ROOF ----
+  asphaltShingleBlack: { diff: 'Tile/roof_tiles_diff_4k.jpg', nor: 'Tile/roof_tiles_nor_gl_4k.jpg', arm: 'Tile/roof_tiles_arm_4k.jpg' },
+  asphaltShingleGray: { diff: 'Tile/grey_roof_01_diff_4k.jpg', nor: 'Tile/grey_roof_01_nor_gl_4k.jpg', arm: 'Tile/grey_roof_01_arm_4k.jpg' },
+  tileRoofBrown: { diff: 'Tile/clay_roof_tiles_diff_4k.jpg', nor: 'Tile/clay_roof_tiles_nor_gl_4k.jpg', arm: 'Tile/clay_roof_tiles_arm_4k.jpg' },
+  tileRoofRed: { diff: 'Tile/clay_roof_tiles_02_diff_4k.jpg', nor: 'Tile/clay_roof_tiles_02_nor_gl_4k.jpg', arm: 'Tile/clay_roof_tiles_02_arm_4k.jpg' },
+  metalRoofDark: { diff: 'metal/corrugated_iron_02_diff_4k.jpg', nor: 'metal/corrugated_iron_02_nor_gl_4k.jpg', arm: 'metal/corrugated_iron_02_arm_4k.jpg' },
+
+  // ---- FOUNDATION / GROUND ----
+  stoneRough: { diff: 'Rock/rock_face_03_diff_4k.jpg', nor: 'Rock/rock_face_03_nor_gl_4k.jpg', arm: 'Rock/rock_face_03_arm_4k.jpg' },
+  stoneDark: { diff: 'Rock/dark_rock_diff_4k.jpg', nor: 'Rock/dark_rock_nor_gl_4k.jpg', arm: 'Rock/dark_rock_arm_4k.jpg' },
+};
+
+// ----------------------------------------------------------------------------
+// 2. テクスチャ / マテリアル ローダー（キャッシュ付き）
+// ----------------------------------------------------------------------------
+
+const _textureLoader = new THREE.TextureLoader();
+const _textureCache = new Map();
+const _materialCache = new Map();
+
+function _loadTex(relPath, { srgb = false, repeatX = 1, repeatY = 1 } = {}) {
+  const key = `${relPath}|${repeatX}x${repeatY}|${srgb}`;
+  if (_textureCache.has(key)) return _textureCache.get(key);
+  const tex = _textureLoader.load(TEXTURE_BASE + relPath, undefined, undefined, () => console.warn(`[HousingPBR] legacy texture FAILED: ${TEXTURE_BASE + relPath}`));
+  tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+  tex.repeat.set(repeatX, repeatY);
+  tex.anisotropy = 8;
+  if (srgb && 'colorSpace' in tex) tex.colorSpace = THREE.SRGBColorSpace;
+  _textureCache.set(key, tex);
+  return tex;
+}
+
+/**
+ * PBRプリセット名から MeshStandardMaterial を生成（キャッシュ付き）。
+ * arm テクスチャは R=AO, G=Roughness, B=Metalness のパック済み前提
+ * （Poly Haven形式）。roughnessMap / metalnessMap に同一テクスチャを割り当てる。
+ * ※ aoMap は Three.js 仕様上 uv2 が必要なため、標準BoxGeometryのみを使う
+ *   本モジュールでは未使用（将来 geometry.setAttribute('uv2', ...) で有効化可）。
+ */
+function getPBRMaterial(presetKey, { repeatX = 1, repeatY = 1, tint = null, roughness = 1, metalness = 1 } = {}) {
+  const files = TEXTURE_FILES[presetKey];
+  if (!files) {
+    console.warn(`[HousingPBR] unknown material preset: "${presetKey}" — falling back to solid color`);
+    return getSolidMaterial(tint || 0xcccccc);
+  }
+  const key = `${presetKey}|${repeatX.toFixed(2)}x${repeatY.toFixed(2)}|${tint || ''}`;
+  if (_materialCache.has(key)) return _materialCache.get(key);
+
+  const map = _loadTex(files.diff, { srgb: true, repeatX, repeatY });
+  const normalMap = _loadTex(files.nor, { repeatX, repeatY });
+  const armMap = _loadTex(files.arm, { repeatX, repeatY });
+
+  const mat = new THREE.MeshStandardMaterial({
+    map,
+    normalMap,
+    roughnessMap: armMap,
+    metalnessMap: armMap,
+    roughness,
+    metalness,
+    color: tint ? new THREE.Color(tint) : 0xffffff,
+  });
+  _materialCache.set(key, mat);
+  return mat;
+}
+
+function getSolidMaterial(hexColor, { roughness = 0.7, metalness = 0.0 } = {}) {
+  const key = `solid|${hexColor}|${roughness}|${metalness}`;
+  if (_materialCache.has(key)) return _materialCache.get(key);
+  const mat = new THREE.MeshStandardMaterial({ color: hexColor, roughness, metalness });
+  _materialCache.set(key, mat);
+  return mat;
+}
+
+// ----------------------------------------------------------------------------
+// 3. ジオメトリ・ヘルパー
+// ----------------------------------------------------------------------------
+
+/** 切妻屋根（三角プリズム / 棟はZ軸方向）。妻壁も含めた一体ソリッド形状。 */
+function makeGableRoof({ width, depth, ridgeHeight, overhang = 0.4, material }) {
+  const halfW = width / 2 + overhang;
+  const extrudeDepth = depth + overhang * 2;
+  const shape = new THREE.Shape();
+  shape.moveTo(-halfW, 0);
+  shape.lineTo(0, ridgeHeight);
+  shape.lineTo(halfW, 0);
+  shape.lineTo(-halfW, 0);
+  const geo = new THREE.ExtrudeGeometry(shape, { depth: extrudeDepth, bevelEnabled: false, curveSegments: 1 });
+  geo.translate(0, 0, -extrudeDepth / 2);
+  geo.computeVertexNormals();
+  const mesh = new THREE.Mesh(geo, material);
+  mesh.castShadow = true;
+  return mesh;
+}
+
+/** マンサード屋根（四角錐台。CylinderGeometryのradialSegments=4を45°回転して代用） */
+function makeMansardRoof({ width, depth, height, material }) {
+  const geo = new THREE.CylinderGeometry(width * 0.15, width * 0.62, height, 4, 1);
+  geo.rotateY(Math.PI / 4);
+  const mesh = new THREE.Mesh(geo, material);
+  mesh.scale.z = depth / width;
+  mesh.castShadow = true;
+  return mesh;
+}
+
+// ----------------------------------------------------------------------------
+// 4. 低密度住宅 11サイズ x 10種 = 110種 データ（res_low）
+// ----------------------------------------------------------------------------
+// メインファイルの区画選択セルは 1セル = 1メートル（PLOT_CELL_SIZE）で、低密度住宅は
+// 「選択したセルの実寸そのもの」が建物の間口(width)x奥行(depth)になる（旧30種データは
+// CELL=2.5m換算の架空サイズで作られており、しかもメインファイル側からは一度も
+// 呼び出されていなかった＝実際には使われていなかったので、ここで作り直す）。
+// 許可される区画セルサイズは次の11種類のみ（メインファイル側 LOW_DENSITY_CELL_SIZES と
+// 完全に一致させること）:
+//   3x2(=2x3, 既存互換)  3x3  3x4  3x5  3x6  4x4  4x5  4x6  5x5  5x6  6x6
+// Prompt 23-R2: 5x5 / 5x6 / 6x6 を末尾に追加。既存サイズの配列位置(=sizeIdx=seed)は
+// 変えないので、既に建っている家の見た目/シードは変わらない。
+const LOW_DENSITY_SIZE_CLASSES = ['2x3', '3x3', '3x4', '3x5', '3x6', '4x4', '4x5', '4x6', '5x5', '5x6', '6x6'];
+
+// 外観バリエーション用パレット（10種を作るための素材の組み合わせ。既存のテラスハウス
+// パレットと重複しないよう、低密度住宅らしい戸建て向け素材のみを使用）。
+const LOW_DENSITY_FACADE_PALETTE = [
+  { family: 'classic_white', facadeMaterial: 'paintedWhiteWood', trimColor: 0xf2ede2, foundationMaterial: 'stoneRough' },
+  { family: 'weathered_gray', facadeMaterial: 'weatheredWood', trimColor: 0xf2ede2, foundationMaterial: 'stoneDark' },
+  { family: 'earth_brown', facadeMaterial: 'darkWood', trimColor: 0xe8dcc0, foundationMaterial: 'stoneRough' },
+  { family: 'sage_blue', facadeMaterial: 'paintedBlueWood', trimColor: 0xf2ede2, foundationMaterial: 'stoneDark' },
+  { family: 'cedar_lodge', facadeMaterial: 'rawWoodCedar', trimColor: 0x2a2018, foundationMaterial: 'stoneRough' },
+  { family: 'cedar_hinoki', facadeMaterial: 'rawWoodHinoki', trimColor: 0xf2ede2, foundationMaterial: 'concrete' },
+  { family: 'stucco_white', facadeMaterial: 'plasterWhite', trimColor: 0x2a2018, foundationMaterial: 'stoneRough' },
+  { family: 'stucco_cream', facadeMaterial: 'plasterCream', trimColor: 0xf2ede2, foundationMaterial: 'concrete' },
+  { family: 'stucco_worn', facadeMaterial: 'plasterCreamWorn', trimColor: 0x2a2018, foundationMaterial: 'stoneDark' },
+  { family: 'blue_dark_trim', facadeMaterial: 'paintedBlueWood', trimColor: 0x232323, foundationMaterial: 'concrete' },
 ];
-// Note: lot-dressing parts (lawn, fence, path, and the yard furniture/pool added in HousingPBR.jsx's
-// _lotParts) are attached via _attachParts' second loop below, which hardcodes cast=false for all of
-// them (same treatment as the lawn) — only RECV matters here for 'furniture'/'pool'.
-const RECV = [
-  { wall: 1, roof: 1, porchroof: 1, foundation: 1, deck: 1, steps: 1, chimney: 1, door: 1, dormerwall: 1, dormerroof: 1, lawn: 1, path: 1, furniture: 1, pool: 1 },
-  { wall: 1, roof: 1, foundation: 1, lawn: 1 }, { wall: 1, roof: 1, porchroof: 1, lawn: 1 }, { lawn: 1 },
+const LOW_DENSITY_ROOF_PALETTE = ['asphaltShingleBlack', 'asphaltShingleGray', 'tileRoofBrown', 'tileRoofRed', 'metalRoofDark'];
+
+// 小さいセル(2x3等)ではポーチ／煙突／ドーマーを詰め込むと破綻するため、床面積に応じて
+// 出現条件を絞る（buildLowDensityHouse 側でも同じしきい値で二重にガードする）。
+function _lowDensityFeaturesForSize(w, d, i) {
+  const area = w * d, shortSide = Math.min(w, d);
+  return {
+    porch: area >= 12 ? { present: true, style: i % 3 === 0 && shortSide >= 4 ? 'wraparound' : 'partial' } : { present: false },
+    chimney: area >= 9 && i % 2 === 0,
+    dormer: area >= 16 && i % 3 === 1,
+    floors: 1,
+  };
+}
+
+// 4x4以上のロットだけ形を変える（10種 = 10形）。2x3〜3x6は従来の箱型(gable)のまま。
+const HOUSE_SHAPES = ['L', 'sideGable', 'garage', 'hip', 'gable', 'cross', 'modern', 'Lm', 'garageHip', 'sideGable'];
+export const LOW_DENSITY_HOUSES = LOW_DENSITY_SIZE_CLASSES.flatMap((sizeKey, sizeIdx) => {
+  const [a, b] = sizeKey.split('x').map(Number);
+  return Array.from({ length: 10 }, (_, i) => {
+    const palette = LOW_DENSITY_FACADE_PALETTE[i % LOW_DENSITY_FACADE_PALETTE.length];
+    const roofMaterial = LOW_DENSITY_ROOF_PALETTE[(i + sizeIdx) % LOW_DENSITY_ROOF_PALETTE.length];
+    const feat = _lowDensityFeaturesForSize(a, b, i);
+    return {
+      id: `low_${sizeKey}_${String(i + 1).padStart(2, '0')}`,
+      sizeKey,
+      shape: Math.min(a, b) >= 4 ? HOUSE_SHAPES[i] : 'gable',
+      // widthCells/depthCells はこの変体データの「基準サイズ」。実際に建てる際は
+      // buildLowDensityHouseForCell がロットの実寸 w/d でこれを上書きするので、
+      // 3x2 選択でも 2x3 選択でも同じ10種プールからそのままの向きで建つ。
+      widthCells: a,
+      depthCells: b,
+      family: palette.family,
+      facadeMaterial: palette.facadeMaterial,
+      roofMaterial,
+      trimColor: palette.trimColor,
+      foundationMaterial: palette.foundationMaterial,
+      porch: feat.porch,
+      chimney: feat.chimney,
+      dormer: feat.dormer,
+      floors: feat.floors,
+      seed: 3000 + sizeIdx * 10 + i,
+    };
+  });
+});
+
+// sizeKey ('2x3' 等) -> このサイズの10種の配列。
+const _lowDensityBySize = new Map();
+for (const h of LOW_DENSITY_HOUSES) {
+  if (!_lowDensityBySize.has(h.sizeKey)) _lowDensityBySize.set(h.sizeKey, []);
+  _lowDensityBySize.get(h.sizeKey).push(h);
+}
+function _lowDensitySizeKey(w, d) { return Math.min(w, d) + 'x' + Math.max(w, d); }
+/** そのセルサイズで建築可能かどうか（メインファイル側 LOW_DENSITY_CELL_SIZES と対応）。 */
+export function isLowDensityHouseSizeAvailable(w, d) { return _lowDensityBySize.has(_lowDensitySizeKey(w, d)); }
+/** そのセルサイズの10種のうち1つの設定を返す（variantIndex は 0-9 の範囲に丸められる）。 */
+export function getLowDensityHouseConfigForCell(w, d, variantIndex = 0) {
+  const arr = _lowDensityBySize.get(_lowDensitySizeKey(w, d));
+  if (!arr || !arr.length) return null;
+  const idx = ((variantIndex % arr.length) + arr.length) % arr.length;
+  return arr[idx];
+}
+
+// ----------------------------------------------------------------------------
+// 5. テラスハウス 20種 データ（res_terrace / 連棟住宅参照）
+// ----------------------------------------------------------------------------
+
+export const TERRACE_HOUSES = [
+  { id: 'terrace_001', family: 'red_brick', floors: 3, facadeMaterial: 'brickRed', roofStyle: 'flatParapet', roofMaterial: 'asphaltShingleBlack', stoopSteps: 3, awning: 'green', accessories: ['airConditioner'], partyWall: 'both', seed: 2001 },
+  { id: 'terrace_002', family: 'red_brick', floors: 4, facadeMaterial: 'brickRed', roofStyle: 'flatParapet', roofMaterial: 'asphaltShingleGray', stoopSteps: 4, awning: 'none', accessories: ['satelliteDish'], partyWall: 'both', seed: 2002 },
+  { id: 'terrace_003', family: 'red_brick', floors: 3, facadeMaterial: 'brickRed', roofStyle: 'mansard', roofMaterial: 'tileRoofRed', stoopSteps: 3, awning: 'green', accessories: ['planterBox'], partyWall: 'end', seed: 2003 },
+  { id: 'terrace_004', family: 'red_brick', floors: 4, facadeMaterial: 'brickRed', roofStyle: 'flatParapet', roofMaterial: 'asphaltShingleBlack', stoopSteps: 5, awning: 'navy', accessories: ['airConditioner', 'satelliteDish'], partyWall: 'both', seed: 2004 },
+  { id: 'terrace_005', family: 'red_brick', floors: 3, facadeMaterial: 'brickRed', roofStyle: 'gable', roofMaterial: 'tileRoofBrown', stoopSteps: 3, awning: 'none', accessories: ['planterBox'], partyWall: 'end', seed: 2005 },
+
+  { id: 'terrace_006', family: 'gray_stone', floors: 4, facadeMaterial: 'concrete', roofStyle: 'flatParapet', roofMaterial: 'asphaltShingleGray', stoopSteps: 4, awning: 'none', accessories: ['airConditioner'], partyWall: 'both', seed: 2006 },
+  { id: 'terrace_007', family: 'gray_stone', floors: 3, facadeMaterial: 'concreteRock', roofStyle: 'flatParapet', roofMaterial: 'asphaltShingleBlack', stoopSteps: 3, awning: 'navy', accessories: ['satelliteDish'], partyWall: 'both', seed: 2007 },
+  { id: 'terrace_008', family: 'gray_stone', floors: 4, facadeMaterial: 'concrete', roofStyle: 'mansard', roofMaterial: 'asphaltShingleGray', stoopSteps: 4, awning: 'none', accessories: ['solarPanel'], partyWall: 'end', seed: 2008 },
+  { id: 'terrace_009', family: 'gray_stone', floors: 3, facadeMaterial: 'concreteRock', roofStyle: 'flatParapet', roofMaterial: 'asphaltShingleBlack', stoopSteps: 3, awning: 'green', accessories: ['planterBox', 'airConditioner'], partyWall: 'both', seed: 2009 },
+  { id: 'terrace_010', family: 'gray_stone', floors: 4, facadeMaterial: 'concrete', roofStyle: 'gable', roofMaterial: 'tileRoofBrown', stoopSteps: 5, awning: 'none', accessories: ['satelliteDish'], partyWall: 'both', seed: 2010 },
+
+  { id: 'terrace_011', family: 'cream_stucco', floors: 3, facadeMaterial: 'plasterWhite', roofStyle: 'flatParapet', roofMaterial: 'asphaltShingleGray', stoopSteps: 3, awning: 'green', accessories: ['planterBox'], partyWall: 'end', seed: 2011 },
+  { id: 'terrace_012', family: 'cream_stucco', floors: 4, facadeMaterial: 'plasterCream', roofStyle: 'mansard', roofMaterial: 'tileRoofBrown', stoopSteps: 4, awning: 'navy', accessories: ['airConditioner'], partyWall: 'both', seed: 2012 },
+  { id: 'terrace_013', family: 'cream_stucco', floors: 3, facadeMaterial: 'plasterCreamWorn', roofStyle: 'flatParapet', roofMaterial: 'asphaltShingleBlack', stoopSteps: 3, awning: 'none', accessories: ['satelliteDish', 'planterBox'], partyWall: 'both', seed: 2013 },
+  { id: 'terrace_014', family: 'cream_stucco', floors: 4, facadeMaterial: 'plasterWhite', roofStyle: 'flatParapet', roofMaterial: 'asphaltShingleGray', stoopSteps: 5, awning: 'green', accessories: ['solarPanel'], partyWall: 'end', seed: 2014 },
+  { id: 'terrace_015', family: 'cream_stucco', floors: 3, facadeMaterial: 'plasterCream', roofStyle: 'gable', roofMaterial: 'tileRoofRed', stoopSteps: 3, awning: 'none', accessories: ['airConditioner'], partyWall: 'both', seed: 2015 },
+
+  { id: 'terrace_016', family: 'dark_brown', floors: 4, facadeMaterial: 'darkWood', accentMaterial: 'plasterCreamWorn', roofStyle: 'flatParapet', roofMaterial: 'metalRoofDark', stoopSteps: 4, awning: 'none', accessories: ['airConditioner', 'satelliteDish'], partyWall: 'both', seed: 2016 },
+  { id: 'terrace_017', family: 'dark_brown', floors: 3, facadeMaterial: 'darkWood', accentMaterial: 'plasterWhite', roofStyle: 'mansard', roofMaterial: 'tileRoofBrown', stoopSteps: 3, awning: 'navy', accessories: ['planterBox'], partyWall: 'end', seed: 2017 },
+  { id: 'terrace_018', family: 'dark_brown', floors: 4, facadeMaterial: 'darkWood', accentMaterial: 'concrete', roofStyle: 'flatParapet', roofMaterial: 'asphaltShingleBlack', stoopSteps: 5, awning: 'green', accessories: ['solarPanel', 'airConditioner'], partyWall: 'both', seed: 2018 },
+  { id: 'terrace_019', family: 'dark_brown', floors: 3, facadeMaterial: 'darkWood', accentMaterial: 'brickRed', roofStyle: 'gable', roofMaterial: 'tileRoofRed', stoopSteps: 3, awning: 'none', accessories: ['satelliteDish'], partyWall: 'both', seed: 2019 },
+  { id: 'terrace_020', family: 'dark_brown', floors: 4, facadeMaterial: 'darkWood', accentMaterial: 'plasterCream', roofStyle: 'flatParapet', roofMaterial: 'asphaltShingleGray', stoopSteps: 4, awning: 'navy', accessories: ['planterBox', 'satelliteDish'], partyWall: 'end', seed: 2020 },
 ];
 
+// ----------------------------------------------------------------------------
+// 6. 低密度住宅ビルダー
+// ----------------------------------------------------------------------------
+
+const WINDOW_GLASS = () => getSolidMaterial(0x1c2733, { roughness: 0.15, metalness: 0.1 });
+
+/**
+ * config.widthCells/depthCells は「区画セル数 == メートル数」として直接使う（1セル=1m、
+ * メインファイルの PLOT_CELL_SIZE と同じ単位）。旧バージョンにあった CELL=2.5 倍率は、
+ * この住宅ジェネレーターがメインファイルからまだ一度も呼ばれていなかった頃の名残の
+ * 不整合だったので廃止し、選ばれたロットの実寸にそのまま一致させる。
+ * 最小許容セル(2x3=2m x 3m)でも窓や玄関がめり込まないよう、間口/奥行が小さいほど
+ * 窓の個数・サイズ・付帯物を自動的に簡略化する。
+ */
+export function buildLowDensityHouse(config) {
+  const group = new THREE.Group();
+  group.name = config.id;
+
+  const width = Math.max(1.6, config.widthCells * 0.92);
+  const depthFull = Math.max(1.6, config.depthCells * 0.92);
+  // Prompt 23-R2: the whole house — INCLUDING the front porch and its steps — must stay inside the
+  // selected cells (= the lot footprint, config.widthCells x config.depthCells metres). Before, the
+  // porch + steps stuck out 2-3 m past the front edge (onto the sidewalk / road) and a wraparound porch
+  // was wider than the lot. So when a porch is present the main body is shortened by the porch's
+  // front extension and the whole assembly is re-centred on the footprint (see the end of this function).
+  const hasPorch = !!(config.porch && config.porch.present && depthFull >= 3.2);
+  const porchDepthC = Math.min(1.8, Math.max(0.9, depthFull * 0.3));
+  const stepCountC = porchDepthC >= 1.4 ? 3 : 2;
+  const frontExt = hasPorch ? porchDepthC + 0.34 + (stepCountC - 1) * 0.32 : 0;
+  const depth = hasPorch ? Math.max(2.0, depthFull - frontExt) : depthFull;
+  const floorHeight = 2.9;
+  const wallHeight = floorHeight * (config.floors || 1);
+  const ridgeHeight = wallHeight * 0.5;
+  const baseY = 0.35; // 基礎の高さぶんの底上げ
+
+  const facadeMat = getPBRMaterial(config.facadeMaterial, { repeatX: Math.max(width, 1) / 2, repeatY: wallHeight / 2 });
+  const roofMat = getPBRMaterial(config.roofMaterial, { repeatX: Math.max(width, 1) / 3, repeatY: Math.max(depth, 1) / 3 });
+  const foundationMat = getPBRMaterial(config.foundationMaterial, { repeatX: Math.max(width, 1) / 2, repeatY: 0.5 });
+  const trimMat = getSolidMaterial(config.trimColor);
+
+  // 基礎
+  const foundation = new THREE.Mesh(new THREE.BoxGeometry(width + 0.2, baseY, depth + 0.2), foundationMat);
+  foundation.position.y = baseY / 2;
+  group.add(foundation);
+
+  // 壁本体
+  const walls = new THREE.Mesh(new THREE.BoxGeometry(width, wallHeight, depth), facadeMat);
+  walls.position.y = baseY + wallHeight / 2;
+  walls.castShadow = walls.receiveShadow = true;
+  group.add(walls);
+
+  // 切妻屋根（軒の出は小さい家ほど相対的に抑える）
+  // Prompt 23-R2: eaves are clamped so the roof also stays inside the lot (body is 0.92 of the lot; slack = 4%)
+  const overhang = Math.max(0.08, Math.min(0.5, Math.min(width, depth) * 0.14, Math.min(config.widthCells, config.depthCells) * 0.04));
+  const roof = makeGableRoof({ width, depth, ridgeHeight, overhang, material: roofMat });
+  roof.position.y = baseY + wallHeight;
+  group.add(roof);
+
+  // 窓：間口が狭い(2m台)場合は中央1つ、それ以外は左右2つ。サイズも間口に応じて縮小。
+  const winY = baseY + wallHeight * 0.55;
+  const winW = Math.min(1.05, width * 0.3), winH = Math.min(1.25, wallHeight * 0.42);
+  const glassW = winW - 0.15, glassH = winH - 0.15;
+  const windowXs = width >= 3.2 ? [-width * 0.28, width * 0.28] : [0];
+  // 玄関を中央以外に配置できるときだけ窓を2つとも中央から離す。中央1窓の場合は玄関を脇へ。
+  const doorX = windowXs.length === 1 ? width * 0.26 : 0;
+  windowXs.forEach((x) => {
+    const frame = new THREE.Mesh(new THREE.BoxGeometry(winW, winH, 0.05), trimMat);
+    frame.position.set(x, winY, depth / 2);
+    group.add(frame);
+    const glass = new THREE.Mesh(new THREE.BoxGeometry(glassW, glassH, 0.08), WINDOW_GLASS());
+    glass.position.set(x, winY, depth / 2 + 0.02);
+    group.add(glass);
+  });
+  const doorW = Math.min(0.9, width * 0.32);
+  const door = new THREE.Mesh(new THREE.BoxGeometry(doorW, 1.9, 0.08), getSolidMaterial(0x3a2a1c));
+  door.position.set(doorX, baseY + 0.95, depth / 2 + 0.02);
+  group.add(door);
+
+  // 煙突（間口3m未満では省略 — 壁からはみ出すため）
+  if (config.chimney && width >= 3) {
+    const chimneyMat = getPBRMaterial('brickRed', { repeatX: 0.5, repeatY: 1 });
+    const chimneyH = wallHeight * 0.9 + ridgeHeight * 0.6;
+    const cw = Math.min(0.7, width * 0.16);
+    const chimney = new THREE.Mesh(new THREE.BoxGeometry(cw, chimneyH, cw), chimneyMat);
+    chimney.position.set(width * 0.3, baseY + chimneyH / 2, -depth * 0.2);
+    group.add(chimney);
+  }
+
+  // ドーマー（十分な奥行・間口がある場合のみ）
+  if (config.dormer && width >= 3.6 && depth >= 4.4) {
+    const dw = width * 0.28, dd = depth * 0.22, dh = 0.9;
+    const dormerY = baseY + wallHeight + ridgeHeight * 0.35;
+    const dormerWall = new THREE.Mesh(new THREE.BoxGeometry(dw, dh, dd), facadeMat);
+    dormerWall.position.set(0, dormerY, depth * 0.18);
+    group.add(dormerWall);
+    const dormerRoof = makeGableRoof({ width: dw, depth: dd, ridgeHeight: dh * 0.6, overhang: 0.1, material: roofMat });
+    dormerRoof.position.set(0, dormerY + dh / 2, depth * 0.18);
+    group.add(dormerRoof);
+    const dormerWin = new THREE.Mesh(new THREE.BoxGeometry(0.5, 0.5, 0.06), WINDOW_GLASS());
+    dormerWin.position.set(0, dormerY, depth * 0.18 + dd / 2 + 0.03);
+    group.add(dormerWin);
+  }
+
+  // ポーチ（奥行3.2m未満では省略。前方(道路側の宅地セットバック側)へ張り出すだけなので
+  // 隣接ロットへは食い込まない）
+  if (hasPorch) {
+    const wrap = config.porch.style === 'wraparound' && width >= 4;
+    const porchDepth = porchDepthC;
+    // never wider than the lot itself (a wraparound porch used to overhang the neighbouring lot)
+    const porchWidth = wrap ? Math.min(width + 1.0, config.widthCells - 0.25) : Math.max(1.2, width * 0.55);
+    const deckMat = getPBRMaterial('deckWood', { repeatX: porchWidth / 1.5, repeatY: porchDepth / 1.5 });
+
+    const floor = new THREE.Mesh(new THREE.BoxGeometry(porchWidth, 0.15, porchDepth), deckMat);
+    floor.position.set(0, baseY + 0.08, depth / 2 + porchDepth / 2);
+    group.add(floor);
+
+    const colCount = wrap ? 6 : 4;
+    for (let i = 0; i < colCount; i++) {
+      const t = i / (colCount - 1);
+      const col = new THREE.Mesh(new THREE.CylinderGeometry(0.07, 0.11, 2.2, 8), trimMat);
+      col.position.set(-porchWidth / 2 + t * porchWidth, baseY + 1.25, depth / 2 + porchDepth - 0.1);
+      group.add(col);
+    }
+    const porchRoof = new THREE.Mesh(new THREE.BoxGeometry(Math.min(porchWidth + 0.3, config.widthCells), 0.12, porchDepth + 0.3), roofMat);
+    porchRoof.position.set(0, baseY + 2.4, depth / 2 + porchDepth / 2);
+    group.add(porchRoof);
+
+    const stepCount = stepCountC;
+    for (let s = 0; s < stepCount; s++) {
+      const step = new THREE.Mesh(new THREE.BoxGeometry(Math.min(1.2, porchWidth * 0.8) - s * 0.15, 0.15, 0.32), foundationMat);
+      step.position.set(0, baseY - 0.15 * (stepCount - s) + 0.075, depth / 2 + porchDepth + 0.18 + s * 0.32);
+      group.add(step);
+    }
+  }
+
+  // re-centre body + porch + steps on the lot footprint (everything above is a direct child of `group`)
+  if (frontExt > 0) group.children.forEach((ch) => { ch.position.z -= frontExt / 2; });
+
+  group.userData.houseConfig = config;
+  return group;
+}
+
+/**
+ * ロットの実際の間口(w)x奥行(d)（メートル、= 選択セル数）から、対応するサイズクラスの
+ * 10種プールの中から1棟選んで建てる。w/d はそのまま使う（11サイズのどちらの向きで
+ * 選択されていても、正規化したクラスから10種を探した上で実寸 w/d で建てる）。
+ * サイズが11種のどれにも一致しない場合は null を返す（呼び出し側で建築を拒否すること）。
+ */
+export function buildLowDensityHouseForCell(w, d, variantIndex = 0) {
+  const base = getLowDensityHouseConfigForCell(w, d, variantIndex);
+  if (!base) return null;
+  return buildLowDensityHouse({ ...base, widthCells: w, depthCells: d });
+}
+
+// ----------------------------------------------------------------------------
+// 7. テラスハウスビルダー
+// ----------------------------------------------------------------------------
+
+// Prompt 23-R2 ROOT-CAUSE FIX: buildTerraceHouse below still multiplies by CELL, but the CELL
+// constant was deleted when the low-density generator moved to 1 cell = 1 m (see §6 comment).
+// Every call therefore threw `ReferenceError: CELL is not defined`. The terrace house keeps its
+// original 2.5 m-per-unit proportions (the main file's res_terrace branch rescales it with the
+// matching NATIVE_W = 2.5*1.5 / NATIVE_D = 2.5*2*1.5), so the constant is restored here, scoped
+// to the terrace builder only — low-density houses never use it.
+const CELL = 2.5;
+
+export function buildTerraceHouse(config) {
+  const group = new THREE.Group();
+  group.name = config.id;
+
+  const width = CELL * 1.5;      // 間口(狭小)。土地グリッドに合わせて要調整
+  const depth = CELL * 2 * 1.5;  // 奥行
+  const floorHeight = 3.1;
+  const wallHeight = floorHeight * config.floors;
+
+  const facadeMat = getPBRMaterial(config.facadeMaterial, { repeatX: width / 1.5, repeatY: wallHeight / 1.5 });
+  const accentMat = config.accentMaterial ? getPBRMaterial(config.accentMaterial, { repeatX: width / 1.5, repeatY: 1 }) : null;
+  const roofMat = getPBRMaterial(config.roofMaterial, { repeatX: width / 1.5, repeatY: depth / 3 });
+  const trimMat = getSolidMaterial(0xe4ddc9, { roughness: 0.55 });
+  const glassMat = getSolidMaterial(0x1c2733, { roughness: 0.12, metalness: 0.15 });
+
+  // 正面壁
+  const frontWall = new THREE.Mesh(new THREE.BoxGeometry(width, wallHeight, 0.25), facadeMat);
+  frontWall.position.set(0, wallHeight / 2, depth / 2);
+  group.add(frontWall);
+
+  // 腰壁アクセント（1階部分に別素材を帯状に重ねる。dark_brownファミリー用）
+  if (accentMat) {
+    const skirt = new THREE.Mesh(new THREE.BoxGeometry(width + 0.02, floorHeight * 0.9, 0.27), accentMat);
+    skirt.position.set(0, floorHeight * 0.45, depth / 2);
+    group.add(skirt);
+  }
+
+  // 正面窓（各階2つ、フレーム+マリオン+ガラス — 参考写真のように個々の窓が見えるように）
+  const winW = 0.62, winH = floorHeight * 0.46, winXs = [-width * 0.24, width * 0.24];
+  for (let f = 1; f < config.floors; f++) { // 1階(玄関のある階)は窓なし、2階以上に配置
+    const wy = floorHeight * f + floorHeight * 0.52;
+    winXs.forEach((wx) => {
+      group.add(new THREE.Mesh(new THREE.BoxGeometry(winW + 0.1, winH + 0.1, 0.06), trimMat).translateX(wx).translateY(wy).translateZ(depth / 2 + 0.03));
+      group.add(new THREE.Mesh(new THREE.BoxGeometry(winW, winH, 0.05), glassMat).translateX(wx).translateY(wy).translateZ(depth / 2 + 0.06));
+      group.add(new THREE.Mesh(new THREE.BoxGeometry(winW, 0.035, 0.03), trimMat).translateX(wx).translateY(wy).translateZ(depth / 2 + 0.09)); // 中桟(横)
+      group.add(new THREE.Mesh(new THREE.BoxGeometry(0.035, winH, 0.03), trimMat).translateX(wx).translateY(wy).translateZ(depth / 2 + 0.09)); // 中桟(縦)
+      group.add(new THREE.Mesh(new THREE.BoxGeometry(winW + 0.2, 0.06, 0.16), trimMat).translateX(wx).translateY(wy - winH / 2 - 0.05).translateZ(depth / 2 + 0.09)); // 窓台
+    });
+  }
+  // 最上階バルコニー（id基準で決定的に約1/3の棟に付与 — 参考写真の凹凸あるファサードを再現）
+  const hasBalcony = (config.seed % 3) === 0 && config.floors >= 3;
+  if (hasBalcony) {
+    const by = floorHeight * (config.floors - 1) + 0.05, bz = depth / 2 + 0.5;
+    group.add(new THREE.Mesh(new THREE.BoxGeometry(1.7, 0.08, 0.85), trimMat).translateY(by).translateZ(bz));
+    [-0.78, 0.78].forEach((rx) => group.add(new THREE.Mesh(new THREE.BoxGeometry(0.05, 0.85, 0.85), trimMat).translateX(rx).translateY(by + 0.44).translateZ(bz)));
+    group.add(new THREE.Mesh(new THREE.BoxGeometry(1.7, 0.85, 0.05), trimMat).translateY(by + 0.44).translateZ(bz + 0.4));
+  }
+
+  // 背面壁
+  const backWall = new THREE.Mesh(new THREE.BoxGeometry(width, wallHeight, 0.25), facadeMat);
+  backWall.position.set(0, wallHeight / 2, -depth / 2);
+  group.add(backWall);
+
+  // 側面壁（partyWall='both'の場合は隣棟と共有のため描画しない）
+  if (config.partyWall !== 'both') {
+    const sideSign = 1; // 端ユニットの露出側
+    const side = new THREE.Mesh(new THREE.BoxGeometry(0.25, wallHeight, depth), facadeMat);
+    side.position.set(sideSign * width / 2, wallHeight / 2, 0);
+    group.add(side);
+  }
+
+  // 屋根
+  let roofTopY = wallHeight;
+  if (config.roofStyle === 'flatParapet') {
+    const slab = new THREE.Mesh(new THREE.BoxGeometry(width, 0.2, depth), roofMat);
+    slab.position.set(0, wallHeight + 0.1, 0);
+    group.add(slab);
+    const parapetH = 0.6;
+    const pMat = getSolidMaterial(0xd8d2c4);
+    [
+      [width / 2 - 0.05, 0, 0.1, depth],
+      [-width / 2 + 0.05, 0, 0.1, depth],
+      [0, depth / 2 - 0.05, width, 0.1],
+      [0, -depth / 2 + 0.05, width, 0.1],
+    ].forEach(([px, pz, dx, dz]) => {
+      const seg = new THREE.Mesh(new THREE.BoxGeometry(dx, parapetH, dz), pMat);
+      seg.position.set(px, wallHeight + parapetH / 2, pz);
+      group.add(seg);
+    });
+    // 笠木（パラペット天端のコーニス — 屋根の輪郭を強調し、参考写真の白い縁取りを再現）
+    const copingMat = getSolidMaterial(0xede7d6, { roughness: 0.4 });
+    [[0, depth / 2, width + 0.16, 0.14], [0, -depth / 2, width + 0.16, 0.14], [width / 2, 0, 0.14, depth + 0.16], [-width / 2, 0, 0.14, depth + 0.16]].forEach(([px, pz, dx, dz]) => {
+      group.add(new THREE.Mesh(new THREE.BoxGeometry(dx, 0.06, dz), copingMat).translateX(px).translateY(wallHeight + parapetH + 0.03).translateZ(pz));
+    });
+    roofTopY = wallHeight + 0.3;
+  } else if (config.roofStyle === 'mansard') {
+    const mansardH = wallHeight * 0.28;
+    const roof = makeMansardRoof({ width, depth, height: mansardH, material: roofMat });
+    roof.position.set(0, wallHeight + mansardH / 2, 0);
+    group.add(roof);
+    roofTopY = wallHeight + mansardH;
+  } else {
+    const ridgeHeight = wallHeight * 0.22;
+    const roof = makeGableRoof({ width, depth, ridgeHeight, overhang: 0.25, material: roofMat });
+    roof.position.y = wallHeight;
+    group.add(roof);
+    roofTopY = wallHeight + ridgeHeight;
+  }
+
+  // 玄関ドア + ストゥープ階段
+  const stoopH = 0.15 * config.stoopSteps;
+  const door = new THREE.Mesh(new THREE.BoxGeometry(0.85, 1.95, 0.08), getSolidMaterial(0x2c1d12));
+  door.position.set(0, stoopH + 0.975, depth / 2 + 0.05);
+  group.add(door);
+  // ドア枠 + トランサム窓（参考写真の玄関まわりの縁取りを再現）
+  group.add(new THREE.Mesh(new THREE.BoxGeometry(1.0, 2.25, 0.1), trimMat).translateY(stoopH + 1.1).translateZ(depth / 2 + 0.02));
+  group.add(new THREE.Mesh(new THREE.BoxGeometry(0.85, 0.2, 0.04), glassMat).translateY(stoopH + 2.08).translateZ(depth / 2 + 0.07));
+
+  const stepMat = getPBRMaterial('stoneRough', { repeatX: 1, repeatY: 1 });
+  for (let s = 0; s < config.stoopSteps; s++) {
+    const step = new THREE.Mesh(new THREE.BoxGeometry(1.3, 0.15, 0.32), stepMat);
+    step.position.set(0, 0.075 + s * 0.15, depth / 2 + 0.3 + s * 0.3);
+    group.add(step);
+  }
+  const railMat = getSolidMaterial(0x1a1a1a, { metalness: 0.6, roughness: 0.4 });
+  [-0.6, 0.6].forEach((x) => {
+    const rail = new THREE.Mesh(new THREE.BoxGeometry(0.05, 0.9, config.stoopSteps * 0.3), railMat);
+    rail.position.set(x, 0.45 + stoopH / 2, depth / 2 + 0.3 + (config.stoopSteps * 0.3) / 2);
+    group.add(rail);
+  });
+
+  // オーニング
+  if (config.awning && config.awning !== 'none') {
+    const color = config.awning === 'green' ? 0x2e6b3e : 0x1e335c;
+    const awning = new THREE.Mesh(new THREE.BoxGeometry(1.2, 0.05, 0.6), getSolidMaterial(color));
+    awning.rotation.x = -0.3;
+    awning.position.set(0, stoopH + 2.1, depth / 2 + 0.35);
+    group.add(awning);
+  }
+
+  // 屋上アクセサリ
+  (config.accessories || []).forEach((acc, i) => {
+    const ox = -width / 4 + i * (width / 2);
+    if (acc === 'airConditioner') {
+      const unit = new THREE.Mesh(new THREE.BoxGeometry(0.5, 0.35, 0.35), getSolidMaterial(0xd8d8d8));
+      unit.position.set(ox, roofTopY + 0.17, -depth / 4);
+      group.add(unit);
+    } else if (acc === 'satelliteDish') {
+      const poleMat = getSolidMaterial(0x333333);
+      const pole = new THREE.Mesh(new THREE.CylinderGeometry(0.03, 0.03, 0.6, 6), poleMat);
+      pole.position.set(ox, roofTopY + 0.3, -depth / 4 + 0.4);
+      group.add(pole);
+      const dish = new THREE.Mesh(new THREE.CircleGeometry(0.35, 16), getSolidMaterial(0xcccccc, { metalness: 0.3 }));
+      dish.rotation.y = Math.PI / 4;
+      dish.position.set(ox, roofTopY + 0.6, -depth / 4 + 0.4);
+      group.add(dish);
+    } else if (acc === 'solarPanel') {
+      const panel = new THREE.Mesh(new THREE.BoxGeometry(1.0, 0.05, 1.6), getSolidMaterial(0x1a2436, { metalness: 0.4, roughness: 0.3 }));
+      panel.rotation.x = -0.15;
+      panel.position.set(0, roofTopY + 0.15, 0);
+      group.add(panel);
+    } else if (acc === 'planterBox') {
+      const boxMat = getPBRMaterial('deckWood', { repeatX: 1, repeatY: 1 });
+      const box = new THREE.Mesh(new THREE.BoxGeometry(0.9, 0.25, 0.3), boxMat);
+      box.position.set(0, stoopH + 0.4, depth / 2 + 0.62);
+      group.add(box);
+    }
+  });
+  // 屋上の緑（フラットルーフの棟にだけ、参考写真のような植栽/木を1〜2本追加）
+  if (config.roofStyle === 'flatParapet') {
+    const leafMat = getSolidMaterial(0x3f6b3a, { roughness: 0.9 }), trunkMat = getSolidMaterial(0x4a3222);
+    const tx = width / 4 * (config.seed % 2 === 0 ? 1 : -1);
+    group.add(new THREE.Mesh(new THREE.CylinderGeometry(0.04, 0.04, 0.5, 6), trunkMat).translateX(tx).translateY(roofTopY + 0.25).translateZ(depth / 4));
+    group.add(new THREE.Mesh(new THREE.SphereGeometry(0.32, 8, 6), leafMat).translateX(tx).translateY(roofTopY + 0.62).translateZ(depth / 4));
+  }
+
+  group.userData.houseConfig = config;
+  return group;
+}
+
+// ----------------------------------------------------------------------------
+// 8. 公開ユーティリティ
+// ----------------------------------------------------------------------------
+
+export function getLowDensityHouseConfig(index) {
+  return LOW_DENSITY_HOUSES[((index % LOW_DENSITY_HOUSES.length) + LOW_DENSITY_HOUSES.length) % LOW_DENSITY_HOUSES.length];
+}
+export function getTerraceHouseConfig(index) {
+  return TERRACE_HOUSES[((index % TERRACE_HOUSES.length) + TERRACE_HOUSES.length) % TERRACE_HOUSES.length];
+}
+export function buildLowDensityHouseByIndex(index) {
+  return buildLowDensityHouse(getLowDensityHouseConfig(index));
+}
+export function buildTerraceHouseByIndex(index) {
+  return buildTerraceHouse(getTerraceHouseConfig(index));
+}
+
+export { TEXTURE_BASE, TEXTURE_FILES, getPBRMaterial, getSolidMaterial };
+
+// ============================================================================
+// 9. Prompt 24A-R2 — Modular House Kit + Shared Geometry / Material / Texture caches
+// ----------------------------------------------------------------------------
+// buildLowDensityHouse() / buildLowDensityHouseForCell() above are kept UNCHANGED (legacy / dev
+// fallback + terrace path). HouseInstanceRenderer never calls them.
+//
+// A house archetype is now a *kit-of-parts recipe*: a list of MODULE INSTANCES
+//   { part, geoKey, geometry, matKey, material, local(Matrix4), tinted, color? }
+// Geometry is created once per module KEY (see _geo) and shared by every part / house / archetype
+// that asks for that key:
+//   * unit box  ...... window frame / glass / mullion / sill / door frame / handle / gutter /
+//                      downspout / corner board / chimney cap  (ONE geometry, scale in `local`)
+//   * cylinder ....... porch column (ONE geometry)
+//   * railing(len) ... merged rail + balusters, keyed by length (few distinct lengths)
+//   * door(w,style) .. slab + raised panels (3 styles)
+//   * wall / foundation / deck / porch roof / chimney / dormer boxes, gable slopes, gable ends:
+//       keyed by their dimensions only -> shared by every VARIANT of the same oriented size
+//       (variants differ by Material + feature flags, not by geometry)
+// LOD1..3 keep the size-independent unit geometry path (_unitParts).
+//
+// Textures: ONE async, size-capped, shared load per image file (see _requestSharedTex). Materials
+// start as a flat fallback colour and gain their maps only if the file really loaded, so a missing
+// / unreachable / non-image file can never turn a surface black.
+// ============================================================================
+
+// ---- 9.0 stats ------------------------------------------------------------------------------
+export const HOUSE_STATS = {
+  geometryCreated: 0, geometryHit: 0, geometryMiss: 0, geometryCreateMs: 0,
+  materialCreated: 0, materialHit: 0, materialMiss: 0, materialCreateMs: 0,
+  textureRequested: 0, textureCacheHit: 0, textureLoaded: 0, textureFailed: 0, texturePending: 0,
+  textureBytesEst: 0, failedTextures: [],
+};
+const _q = (v) => Math.round(v * 1000) / 1000;
 const _now = () => (typeof performance !== 'undefined' ? performance.now() : Date.now());
 
-const _Y = new THREE.Vector3(0, 1, 0);
-const _q = new THREE.Quaternion(), _p = new THREE.Vector3(), _s = new THREE.Vector3();
-const _pv = new THREE.Matrix4(), _frustum = new THREE.Frustum();
-const _noRaycast = () => {};
-let _skirtGeo = null;
-const _WHITE = [1, 1, 1];
+// ---- 9.1 shared texture loader ---------------------------------------------------------------
+// The 4K source files stay on disk untouched. On upload they are decoded OFF the main thread with
+// createImageBitmap and down-scaled to HOUSE_TEX_MAX (default 1024, override with
+// window.__HOUSE_TEX_MAX__ = 2048 before the first house). A 4096^2 RGBA texture is ~85 MB of GPU
+// memory with mips; 1024^2 is ~5 MB, and one house needs 15+ maps.
+const _sharedTexEntries = new Map(); // `${path}|${srgb}` -> { url, status:'pending'|'ready'|'failed', tex, waiters }
+const _texQueue = [];
+let _texActive = 0;
+const TEX_CONCURRENCY = 2;
+let _texFetcher = null; // tests can inject (url) => Promise<{ image, flipY } | { texture }>
+export function __setHouseTextureFetcher(fn) { _texFetcher = fn; }
+const _texMax = () => (typeof window !== 'undefined' && window.__HOUSE_TEX_MAX__) || 1024;
 
-function _rng(seed) { // mulberry32
-  let a = (Math.imul((seed | 0) ^ 0x9e3779b9, 2654435761) >>> 0) || 1;
-  return () => { a = (a + 0x6d2b79f5) >>> 0; let t = a; t = Math.imul(t ^ (t >>> 15), t | 1); t ^= t + Math.imul(t ^ (t >>> 7), t | 61); return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+// Fallback decoder: <img>.decode() + canvas down-scale. Used when createImageBitmap refuses a file
+// (unusual JPEG flavours). Runs on the main thread, so it is only the second choice.
+async function _decodeViaImageElement(blob, max) {
+  const u = URL.createObjectURL(blob);
+  try {
+    const img = new Image(); img.decoding = 'async'; img.src = u; await img.decode();
+    const k = Math.min(1, max / Math.max(img.naturalWidth, img.naturalHeight));
+    const w = Math.max(1, Math.round(img.naturalWidth * k)), h = Math.max(1, Math.round(img.naturalHeight * k));
+    const c = document.createElement('canvas'); c.width = w; c.height = h;
+    const g = c.getContext('2d'); g.imageSmoothingQuality = 'high'; g.drawImage(img, 0, 0, w, h);
+    return { image: c, flipY: true, w, h };
+  } finally { URL.revokeObjectURL(u); }
 }
-function levelStyle(level) { return level > 0 ? 'std' : 'none'; }
 
-export function createHouseInstanceRenderer(scene) {
-  const houses = new Map();
-  const houseList = [];               // for round-robin LOD passes
-  const buckets = new Map();
-  const sectors = new Map();
-  const archUse = new Map();          // archetype id -> house count
-  const pending = [];
-  const stats = { updateMs: 0, lastPlaceMs: 0, frame: 0, houseCreateMs: 0, instanceWriteMs: 0, instanceUpdateMs: 0, addCalls: 0 };
-  let ctx = null;                     // last view context (for initial LOD of new houses)
-  let viewSig = '';
-  let lodCursor = 0, lodRemaining = 0;
-  let lastCamera = null;
-  let emptyBuckets = 0;               // buckets currently holding 0 instances (pruned in batches)
-  let forcedLod = null;               // dev/stress: force every house to one LOD
-
-  // ---------- sectors / buckets ----------
-  function _sector(x, z, lodIdx) {
-    const size = SECTOR_SIZE_BY_LOD[lodIdx];
-    const sx = Math.floor(x / size), sz = Math.floor(z / size), key = `${lodIdx}:${sx}_${sz}`;
-    let s = sectors.get(key);
-    if (!s) {
-      s = { key, box: new THREE.Box3(new THREE.Vector3(sx * size - SECTOR_CULL_MARGIN, -40, sz * size - SECTOR_CULL_MARGIN),
-        new THREE.Vector3((sx + 1) * size + SECTOR_CULL_MARGIN, 90, (sz + 1) * size + SECTOR_CULL_MARGIN)), buckets: new Set(), visible: true };
-      sectors.set(key, s);
+async function _defaultFetchTexture(url) {
+  if (typeof fetch === 'function' && typeof createImageBitmap === 'function') {
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const blob = await res.blob();
+    // A dev server that answers a missing file with index.html (HTTP 200) is caught here.
+    if (blob.type && !blob.type.startsWith('image/')) throw new Error(`file not found (server returned "${blob.type}")`);
+    if (blob.size < 2000) throw new Error(`file is only ${blob.size} bytes (empty / Git LFS pointer?)`);
+    const base = { imageOrientation: 'flipY', premultiplyAlpha: 'none', colorSpaceConversion: 'none' };
+    try {
+      const bmp = await createImageBitmap(blob, { ...base, resizeWidth: _texMax(), resizeQuality: 'high' });
+      return { image: bmp, flipY: false, w: bmp.width, h: bmp.height };
+    } catch (e1) { /* fall through */ }
+    try {
+      const bmp = await createImageBitmap(blob, base); // browser without resize options: full-size decode
+      return { image: bmp, flipY: false, w: bmp.width, h: bmp.height };
+    } catch (e2) { /* fall through */ }
+    if (typeof Image !== 'undefined' && typeof document !== 'undefined') {
+      try { return await _decodeViaImageElement(blob, _texMax()); }
+      catch (e3) { throw new Error(`cannot be decoded by the browser at all (${blob.size} bytes, ${blob.type}) - file is probably corrupt/truncated`); }
     }
-    return s;
+    throw new Error(`cannot be decoded (${blob.size} bytes)`);
   }
-  function _makeMesh(b, cap) {
-    const mesh = new THREE.InstancedMesh(b.geometry, b.material, cap);
-    mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
-    if (b.tinted) {
-      mesh.instanceColor = new THREE.InstancedBufferAttribute(new Float32Array(cap * 3).fill(1), 3);
-      mesh.instanceColor.setUsage(THREE.DynamicDrawUsage);
-    }
-    mesh.count = b.count; mesh.frustumCulled = false; mesh.raycast = _noRaycast; // culling is per sector, below
-    mesh.castShadow = b.cast; mesh.receiveShadow = b.recv;
-    mesh.visible = b.count > 0 && b.sector.visible;
-    mesh.name = `houses|${b.key}`;
-    if (b.part === 'poolwater') {
-      // Pool water's ripple is driven by a uTime uniform on its (single, shared) material — see
-      // _poolWaterMaterial() in HousingPBR.jsx. onBeforeRender fires automatically whenever this
-      // bucket's mesh is actually drawn, so no hook into the main app's render loop is needed.
-      const mat = b.material;
-      mesh.onBeforeRender = () => { const sh = mat.userData && mat.userData.shader; if (sh) sh.uniforms.uTime.value = _now() / 1000; };
-    }
-    return mesh;
-  }
-  function _bucket(sector, lodKey, geoKey, geometry, matKey, material, part, cast, recv, tinted) {
-    const key = `${sector.key}|${lodKey}|${geoKey}|${matKey}${tinted ? '+t' : ''}`;
-    let b = buckets.get(key);
-    if (b) return b;
-    b = { key, sector, geometry, material, part, tinted: !!tinted, cast: !!cast, recv: !!recv, count: 0, capacity: INITIAL_CAPACITY, owners: [], mesh: null };
-    b.mesh = _makeMesh(b, b.capacity);
-    emptyBuckets++; // decremented by the first _bucketAdd
-    scene.add(b.mesh);
-    sector.buckets.add(b);
-    buckets.set(key, b);
-    return b;
-  }
-  function _grow(b) {
-    const old = b.mesh, cap = b.capacity * 2;
-    b.capacity = cap;
-    const mesh = _makeMesh(b, cap);
-    mesh.instanceMatrix.array.set(old.instanceMatrix.array.subarray(0, b.count * 16));
-    if (b.tinted) mesh.instanceColor.array.set(old.instanceColor.array.subarray(0, b.count * 3));
-    scene.remove(old); old.dispose(); // frees only the old instance buffers; geometry/material are shared
-    scene.add(mesh); b.mesh = mesh;
-  }
-  function _bucketAdd(b, house, matrix, tint) {
-    if (b.count === b.capacity) _grow(b);
-    if (b.count === 0) emptyBuckets = Math.max(0, emptyBuckets - 1);
-    const slot = b.count++, inst = { house, b, slot };
-    b.owners[slot] = inst;
-    b.mesh.instanceMatrix.array.set(matrix.elements, slot * 16);
-    if (b.tinted) b.mesh.instanceColor.array.set(tint, slot * 3);
-    b.mesh.count = b.count;
-    b.mesh.instanceMatrix.needsUpdate = true; if (b.tinted) b.mesh.instanceColor.needsUpdate = true;
-    b.mesh.visible = b.sector.visible;
-    return inst;
-  }
-  function _bucketRemove(inst) {
-    const b = inst.b, slot = inst.slot, last = b.count - 1;
-    if (slot !== last) { // swap-remove: move the last instance into the vacated slot
-      b.mesh.instanceMatrix.array.copyWithin(slot * 16, last * 16, last * 16 + 16);
-      if (b.tinted) b.mesh.instanceColor.array.copyWithin(slot * 3, last * 3, last * 3 + 3);
-      const moved = b.owners[last]; b.owners[slot] = moved; moved.slot = slot;
-    }
-    b.owners[last] = undefined; b.count = last; b.mesh.count = last;
-    b.mesh.instanceMatrix.needsUpdate = true; if (b.tinted) b.mesh.instanceColor.needsUpdate = true;
-    if (last === 0) { b.mesh.visible = false; emptyBuckets++; }
-  }
+  return new Promise((resolve, reject) => _textureLoader.load(url, (t) => resolve({ texture: t }), undefined, (e) => reject(e && e.message ? e : new Error('image load error'))));
+}
 
-  // ---------- per-house attach / detach ----------
-  function _composeMatrices(h) {
-    _p.set(h.position.x, h.position.y, h.position.z);
-    _s.set(h.scale, h.scale * h.sy, h.scale);
-    _q.setFromAxisAngle(_Y, h.rotationY + (h.yardSign < 0 ? Math.PI : 0)); h.lotMatrix.compose(_p, _q, _s); // yard/fence frame (NOT shrunk): +Z = road side
-    _q.setFromAxisAngle(_Y, h.rotationY);
-    const hs = h.arch && h.arch.houseScale; // per-archetype override (e.g. terrace: full width so party walls touch, deeper footprint)
-    if (hs) _s.set(h.scale * hs.x, h.scale * h.sy * hs.y, h.scale * hs.z);
-    else _s.multiplyScalar(HOUSE_SCALE); // default: uniform HOUSE_SCALE, unchanged
-    h.matrix.compose(_p, _q, _s); // house only: HOUSE_SCALE (or archetype's houseScale override)
-    if (h.skirt) {
-      _q.setFromAxisAngle(_Y, h.skirt.yaw || 0);
-      _p.set(h.position.x, h.position.y - h.skirt.height / 2 + 0.02, h.position.z);
-      _s.set(h.skirt.width, h.skirt.height, h.skirt.depth);
-      h.skirtMatrix.compose(_p, _q, _s);
-    }
-  }
-  const _tm = new THREE.Matrix4(), _tc = [1, 1, 1];
-  function _attachParts(h, lod) {
-    const t0 = _now();
-    const parts = getHouseLodParts(h.arch, lod);   // cached on the archetype; module geometry comes from the shared cache
-    const sector = _sector(h.position.x, h.position.z, lod);
-    for (const p of parts) {
-      const b = _bucket(sector, lod, p.geoKey, p.geometry, p.matKey, p.material, p.part, CAST[lod][p.part], RECV[lod][p.part], p.tinted);
-      const m = p.local ? _tm.multiplyMatrices(h.matrix, p.local) : h.matrix;
-      let c = _WHITE;
-      if (p.tinted) { c = _tc; const base = p.color || _WHITE; c[0] = base[0] * h.tint[0]; c[1] = base[1] * h.tint[1]; c[2] = base[2] * h.tint[2]; }
-      h.insts.push(_bucketAdd(b, h, m, c));
-    }
-    if (h.yardDepth >= 0) { // lot dressing: front yard + fence/wall around the whole lot (same shared-geometry instancing)
-      for (const p of getHouseLotParts(h.arch, h.yardDepth, lod, h.yardRear)) {
-        const b = _bucket(sector, lod, p.geoKey, p.geometry, p.matKey, p.material, p.part, false, RECV[lod][p.part], false);
-        h.insts.push(_bucketAdd(b, h, _tm.multiplyMatrices(h.lotMatrix, p.local), _WHITE));
-      }
-    }
-    h.lod = lod;
-    stats.instanceWriteMs += _now() - t0;
-  }
-  function _detachParts(h) {
-    for (let i = 0; i < h.insts.length; i++) _bucketRemove(h.insts[i]);
-    h.insts.length = 0;
-  }
-  function _attachSkirt(h) {
-    if (!h.skirt) return;
-    if (!_skirtGeo) _skirtGeo = new THREE.BoxGeometry(1, 1, 1);
-    const color = h.skirt.retaining ? 0x5b5750 : 0x8a8378;
-    const b = _bucket(_sector(h.position.x, h.position.z, 4), 'S', 'skirt', _skirtGeo, `solid:${color}`, getSolidMaterial(color, { roughness: 0.95, metalness: 0 }), 'skirt', true, true, false);
-    h.skirtInst = _bucketAdd(b, h, h.skirtMatrix, _WHITE);
-  }
-  function _detachSkirt(h) { if (h.skirtInst) { _bucketRemove(h.skirtInst); h.skirtInst = null; } }
-
-  function _lodFor(h, c, cur) {
-    if (forcedLod !== null) return forcedLod;
-    if (!c) return cur;
-    let m, T;
-    if (c.ortho) { m = c.viewH + 0.5 * Math.hypot(h.position.x - c.fx, h.position.z - c.fz); T = ORTHO_T; }
-    else { m = Math.hypot(h.position.x - c.cx, h.position.y - c.cy, h.position.z - c.cz); T = PERSP_T; }
-    let lod = cur;
-    while (lod < 3 && m > T[lod] * 1.08) lod++;   // hysteresis so houses at a threshold do not flicker
-    while (lod > 0 && m < T[lod - 1] * 0.92) lod--;
-    return lod;
-  }
-
-  function _place(h) {
-    h.lod = ctx || forcedLod !== null ? _lodFor(h, ctx, 0) : 0;
-    _attachParts(h, h.lod);
-    _attachSkirt(h);
-    h.placed = true;
-  }
-
-  // ---------- public API ----------
-  function _buildRecord(rec, existing) {
-    const a = rec.archetype;
-    const arch = a.id ? a : getHouseArchetype(a.w, a.d, a.variantIndex || 0);
-    if (!arch) throw new Error(`no low-density house archetype for ${a.w}x${a.d}`);
-    const rnd = _rng(rec.seed == null ? 1 : rec.seed);
-    const v = 0.9 + rnd() * 0.13; // subtle per-house tint (seed-driven; NOT per-house geometry)
-    const h = existing || { id: rec.id, insts: [], skirtInst: null, matrix: new THREE.Matrix4(), lotMatrix: new THREE.Matrix4(), skirtMatrix: new THREE.Matrix4(), placed: false, lod: 0, listIndex: -1 };
-    h.arch = arch; h.level = rec.level ?? 1; h.style = levelStyle(h.level); h.seed = rec.seed ?? 0;
-    h.position = { x: rec.position.x, y: rec.position.y, z: rec.position.z };
-    h.rotationY = rec.rotationY || 0; h.scale = rec.scale || 1;
-    h.sy = 0.97 + rnd() * 0.07; // height jitter only: footprint stays inside the lot
-    h.tint = [v * (0.985 + rnd() * 0.03), v, v * (0.985 + rnd() * 0.03)];
-    h.skirt = rec.skirt ? { ...rec.skirt } : null;
-    // Part 19: lightweight feature flags come from the archetype (porch / chimney / dormer / wraparound)
-    h.features = arch.features;
-    h.yardDepth = rec.yardDepth == null ? -1 : rec.yardDepth; // -1 = no lot dressing (legacy records); >= 0 = yard depth in metres (fence always drawn)
-    h.yardSign = rec.yardSign < 0 ? -1 : 1;
-    h.yardRear = !!rec.yardRear; // true = closed U-shaped fence open toward the house (private back yard); false = front-yard fence with a road-facing gate
-    _composeMatrices(h);
-    return h;
-  }
-
-  function _unregister(h) {
-    houses.delete(h.id);
-    if (h.listIndex >= 0) { const last = houseList.pop(); if (last !== h) { houseList[h.listIndex] = last; last.listIndex = h.listIndex; } }
-    const n = (archUse.get(h.arch.id) || 1) - 1; if (n <= 0) archUse.delete(h.arch.id); else archUse.set(h.arch.id, n);
-  }
-
-  /** Add a house. immediate=true places its instances now (cheap slot writes); false queues it for batched placement. */
-  function addHouse(rec, opts = {}) {
-    if (houses.has(rec.id)) return updateHouse(rec);
-    const t0 = _now();
-    const h = _buildRecord(rec, null);
-    houses.set(h.id, h); h.listIndex = houseList.push(h) - 1;
-    archUse.set(h.arch.id, (archUse.get(h.arch.id) || 0) + 1);
-    if (opts.immediate === false) pending.push(h);
-    else {
-      try { _place(h); }
-      catch (err) { _detachParts(h); _detachSkirt(h); _unregister(h); throw err; } // throws for a geometry/material failure -> caller rolls the lot back
-    }
-    stats.lastPlaceMs = _now() - t0; stats.houseCreateMs += stats.lastPlaceMs; stats.addCalls++;
-    return h.id;
-  }
-  /** Bulk add: records are queued and placed a few per frame (flushPending, time-budgeted). Archetype kits are built once, on first use. */
-  function addHouses(recs) { return recs.map((r) => addHouse(r, { immediate: false })); }
-  function removeHouse(id) {
-    const h = houses.get(id); if (!h) return false;
-    if (h.placed) { _detachParts(h); _detachSkirt(h); }
-    else { const i = pending.indexOf(h); if (i >= 0) pending.splice(i, 1); }
-    _unregister(h);
-    return true;
-  }
-  /** Re-sync an existing house after a level / grading / archetype change. No geometry is created or disposed. */
-  function updateHouse(rec) {
-    const h = houses.get(rec.id); if (!h) return addHouse(rec);
-    const prevArch = h.arch.id;
-    const wasPlaced = h.placed;
-    if (wasPlaced) { _detachParts(h); _detachSkirt(h); }
-    _buildRecord(rec, h);
-    if (h.arch.id !== prevArch) {
-      const n = (archUse.get(prevArch) || 1) - 1; if (n <= 0) archUse.delete(prevArch); else archUse.set(prevArch, n);
-      archUse.set(h.arch.id, (archUse.get(h.arch.id) || 0) + 1);
-    }
-    if (wasPlaced) _place(h); // level / skirt / transform change = remove instances + add instances (slot bookkeeping only)
-    return h.id;
-  }
-  const setLevel = (id, level) => { const h = houses.get(id); if (!h || h.level === level) return; h.level = level; if (levelStyle(level) !== h.style) { h.style = levelStyle(level); if (h.placed) { _detachParts(h); _attachParts(h, h.lod); } } };
-  const hasHouse = (id) => houses.has(id);
-
-  function flushPending(budgetMs = PENDING_BUDGET_MS) {
-    const t0 = _now(); let n = 0;
-    while (pending.length && n < PENDING_PER_FRAME && _now() - t0 < budgetMs) { _place(pending.shift()); n++; }
-    return n;
-  }
-
-  function _makeCtx(camera, opts) {
-    const f = opts.focus || { x: 0, z: 0 };
-    if (camera.isOrthographicCamera) return { ortho: true, viewH: (camera.top - camera.bottom) / (camera.zoom || 1), fx: f.x, fz: f.z };
-    return { ortho: false, cx: camera.position.x, cy: camera.position.y, cz: camera.position.z };
-  }
-
-  /** Call once per frame with the camera that is about to render. */
-  function update(camera, opts = {}) {
-    const t0 = _now();
-    lastCamera = camera;
-    flushPending();
-    ctx = _makeCtx(camera, opts);
-    const sig = ctx.ortho ? `o|${Math.round(ctx.viewH * 4)}|${Math.round(ctx.fx / 6)}|${Math.round(ctx.fz / 6)}` : `p|${Math.round(ctx.cx / 3)}|${Math.round(ctx.cy / 3)}|${Math.round(ctx.cz / 3)}`;
-    if (sig !== viewSig) { viewSig = sig; lodRemaining = houseList.length; }
-    // per-sector frustum culling (InstancedMesh.frustumCulled is off: one instanced mesh spans many houses)
-    camera.updateMatrixWorld();
-    _pv.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse); _frustum.setFromProjectionMatrix(_pv);
-    sectors.forEach((s) => {
-      const vis = _frustum.intersectsBox(s.box);
-      if (vis !== s.visible) { s.visible = vis; s.buckets.forEach((b) => { b.mesh.visible = vis && b.count > 0; }); }
+function _pumpTexQueue() {
+  while (_texActive < TEX_CONCURRENCY && _texQueue.length) {
+    const e = _texQueue.shift(); _texActive++;
+    (_texFetcher || _defaultFetchTexture)(e.url).then((r) => {
+      let tex = r.texture;
+      if (!tex) { tex = new THREE.Texture(r.image); tex.flipY = r.flipY === undefined ? true : r.flipY; }
+      tex.wrapS = tex.wrapT = THREE.RepeatWrapping; tex.anisotropy = 4;
+      if (e.srgb && 'colorSpace' in tex) tex.colorSpace = THREE.SRGBColorSpace;
+      tex.needsUpdate = true;
+      e.tex = tex; e.status = 'ready'; HOUSE_STATS.textureLoaded++;
+      HOUSE_STATS.textureBytesEst += (r.w || 1024) * (r.h || 1024) * 4 * 1.33;
+    }).catch((err) => {
+      e.status = 'failed'; HOUSE_STATS.textureFailed++; HOUSE_STATS.failedTextures.push(e.url);
+      if (HOUSE_STATS.textureFailed === 7) console.warn('[HousingPBR] more texture failures suppressed — see window.__HOUSE_RENDER_STATS__.failedTextures');
+      else if (HOUSE_STATS.textureFailed < 7) console.warn(`[HousingPBR] texture FAILED: ${e.url} (${err && err.message ? err.message : err}). Surfaces that use it fall back to a flat colour. Check TEXTURE_BASE ("${TEXTURE_BASE}") / the file name / folder case; run window.__HOUSE_TEX_PROBE__() for a full report.`);
+    }).finally(() => {
+      _texActive--; HOUSE_STATS.texturePending = _texQueue.length + _texActive;
+      e.waiters.splice(0).forEach((f) => { try { f(e); } catch (er) { console.error(er); } });
+      _pumpTexQueue();
     });
-    // batched LOD pass: bucket moves only (cached kits -> no geometry generation), capped per frame
-    if (lodRemaining > 0 && houseList.length) {
-      const exam = Math.min(LOD_EXAM_PER_FRAME, lodRemaining); let done = 0, moves = 0;
-      while (done < exam && moves < LOD_MOVES_PER_FRAME) {
-        if (lodCursor >= houseList.length) lodCursor = 0;
-        const h = houseList[lodCursor++]; done++;
-        if (!h.placed) continue;
-        const nl = _lodFor(h, ctx, h.lod);
-        if (nl !== h.lod) { _detachParts(h); _attachParts(h, nl); moves++; }
-      }
-      lodRemaining -= done;
+  }
+  HOUSE_STATS.texturePending = _texQueue.length + _texActive;
+}
+
+function _requestSharedTex(relPath, srgb, cb) {
+  const key = `${relPath}|${srgb ? 1 : 0}`;
+  let e = _sharedTexEntries.get(key);
+  if (e) HOUSE_STATS.textureCacheHit++;
+  else {
+    e = { key, url: TEXTURE_BASE + relPath, srgb: !!srgb, status: 'pending', tex: null, waiters: [] };
+    _sharedTexEntries.set(key, e); HOUSE_STATS.textureRequested++; _texQueue.push(e); _pumpTexQueue();
+  }
+  if (e.status === 'pending') e.waiters.push(cb); else cb(e);
+  return e;
+}
+
+/** Dev diagnostic: HEAD/GET every texture path and report status + content-type (finds 404s and SPA-fallback HTML). */
+export async function probeHouseTextures(presets = Object.keys(TEXTURE_FILES)) {
+  const rows = [];
+  for (const p of presets) for (const kind of ['diff', 'nor', 'arm']) {
+    const url = TEXTURE_BASE + TEXTURE_FILES[p][kind];
+    try { const r = await fetch(url, { method: 'GET' }); const b = await r.blob(); rows.push({ preset: p, kind, url, status: r.status, type: b.type, bytes: b.size, ok: r.ok && (b.type || '').startsWith('image/') }); }
+    catch (err) { rows.push({ preset: p, kind, url, status: 'ERR', type: String(err && err.message), bytes: 0, ok: false }); }
+  }
+  console.table(rows.filter((r) => !r.ok));
+  return rows;
+}
+if (typeof window !== 'undefined') window.__HOUSE_TEX_PROBE__ = probeHouseTextures;
+
+// ---- 9.2 shared materials --------------------------------------------------------------------
+// LOD3 flat colours = fallback colour of every preset (representative average of its diffuse map).
+const FLAT_COLOR = {
+  paintedWhiteWood: 0xd9d6cc, paintedCreamWood: 0xd8c7a0, weatheredWood: 0x8d8a84, darkWood: 0x5a4030,
+  paintedBlueWood: 0x6f8aa0, rawWoodCedar: 0xa0703f, rawWoodHinoki: 0xc9a76f, deckWood: 0x8a6a48, fenceBamboo: 0xb8a070,
+  plasterWhite: 0xe2dfd6, plasterCreamWorn: 0xb9ae8f, plasterCream: 0xd9c9a6, plasterBlue: 0x7d93a8,
+  concrete: 0x8f8d88, concreteRock: 0x85817a, brickRed: 0x8c4a3a,
+  asphaltShingleBlack: 0x3a3836, asphaltShingleGray: 0x6d6f72, tileRoofBrown: 0x7a4a34, tileRoofRed: 0x9a4530, metalRoofDark: 0x4d5155,
+  stoneRough: 0x7c766c, stoneDark: 0x4a4744,
+};
+// Only real metals get a metalness map. Dielectrics (wood / tile / stone / stucco) are forced to
+// metalness 0: this scene has NO environment map, so any metalness > 0 renders as dark/black.
+const METAL_PRESETS = { metalRoofDark: 0.35 };
+const _warnedPreset = new Set();
+
+function _solid(hex, o = {}) {
+  const roughness = o.roughness ?? 0.7, metalness = o.metalness ?? 0;
+  const key = `solid|${hex}|${roughness}|${metalness}`;
+  if (_materialCache.has(key)) { HOUSE_STATS.materialHit++; return _materialCache.get(key); }
+  HOUSE_STATS.materialMiss++; const t0 = _now();
+  const m = getSolidMaterial(hex, { roughness, metalness });
+  HOUSE_STATS.materialCreated++; HOUSE_STATS.materialCreateMs += _now() - t0;
+  return m;
+}
+function _glassMaterial() {
+  const key = 'shared|glass';
+  if (_materialCache.has(key)) { HOUSE_STATS.materialHit++; return _materialCache.get(key); }
+  HOUSE_STATS.materialMiss++; const t0 = _now();
+  const m = new THREE.MeshStandardMaterial({ color: 0x35506a, roughness: 0.12, metalness: 0, emissive: 0x0b1a28, emissiveIntensity: 0.7 });
+  m.name = 'house:glass'; _materialCache.set(key, m);
+  HOUSE_STATS.materialCreated++; HOUSE_STATS.materialCreateMs += _now() - t0;
+  return m;
+}
+const _metalMaterial = () => _solid(0x4a5057, { roughness: 0.45, metalness: 0.3 });
+
+/** Full PBR (diff + normal + ARM) at repeat 1x1 — ONE material per preset, shared by all houses. Starts as a flat fallback colour. */
+export function getSharedPBRMaterial(presetKey) {
+  const files = TEXTURE_FILES[presetKey];
+  if (!files) {
+    if (!_warnedPreset.has(presetKey)) { _warnedPreset.add(presetKey); console.warn(`[HousingPBR] unknown preset "${presetKey}" → flat fallback`); }
+    return _solid(0xb0aca4, { roughness: 0.9 });
+  }
+  const key = `shared|pbr|${presetKey}`;
+  if (_materialCache.has(key)) { HOUSE_STATS.materialHit++; return _materialCache.get(key); }
+  HOUSE_STATS.materialMiss++; const t0 = _now();
+  const mat = new THREE.MeshStandardMaterial({ color: FLAT_COLOR[presetKey] ?? 0xb0aca4, roughness: 0.88, metalness: 0 });
+  mat.name = `house:pbr:${presetKey}`; _materialCache.set(key, mat);
+  HOUSE_STATS.materialCreated++;
+  const got = {}; let left = 3;
+  const finish = () => { // ONE program update per material, once all three maps have settled
+    if (--left) return;
+    if (got.diff.status === 'ready') { mat.map = got.diff.tex; mat.color.setHex(0xffffff); }
+    if (got.nor.status === 'ready') mat.normalMap = got.nor.tex;
+    if (got.arm.status === 'ready') {
+      mat.roughnessMap = got.arm.tex; mat.roughness = 1;
+      if (METAL_PRESETS[presetKey] !== undefined) { mat.metalnessMap = got.arm.tex; mat.metalness = METAL_PRESETS[presetKey]; }
     }
-    if (emptyBuckets > 48) _prune();
-    stats.updateMs = _now() - t0;
-    stats.instanceUpdateMs = stats.updateMs;
-    if (typeof window !== 'undefined' && (++stats.frame % 30) === 0) window.__HOUSE_RENDER_STATS__ = getStats(); // cheap: a few loops every 30 frames
-  }
+    mat.userData.texState = { diff: got.diff.status, nor: got.nor.status, arm: got.arm.status };
+    mat.needsUpdate = true;
+  };
+  _requestSharedTex(files.diff, true, (e) => { got.diff = e; finish(); });
+  _requestSharedTex(files.nor, false, (e) => { got.nor = e; finish(); });
+  _requestSharedTex(files.arm, false, (e) => { got.arm = e; finish(); });
+  HOUSE_STATS.materialCreateMs += _now() - t0;
+  return mat;
+}
 
-  function _prune() { // drop empty buckets (their instance buffers only) so the scene graph does not accumulate dead meshes
-    buckets.forEach((b, k) => { if (b.count === 0) { scene.remove(b.mesh); b.mesh.dispose(); b.sector.buckets.delete(b); buckets.delete(k); } });
-    emptyBuckets = 0;
-  }
+/** LOD2: diffuse map only — same Texture object as the PBR material. */
+export function getSharedLiteMaterial(presetKey) {
+  const files = TEXTURE_FILES[presetKey];
+  if (!files) return _solid(0xb0aca4, { roughness: 0.9 });
+  const key = `shared|lite|${presetKey}`;
+  if (_materialCache.has(key)) { HOUSE_STATS.materialHit++; return _materialCache.get(key); }
+  HOUSE_STATS.materialMiss++; const t0 = _now();
+  const mat = new THREE.MeshStandardMaterial({ color: FLAT_COLOR[presetKey] ?? 0xb0aca4, roughness: 0.85, metalness: 0 });
+  mat.name = `house:lite:${presetKey}`; _materialCache.set(key, mat);
+  HOUSE_STATS.materialCreated++;
+  _requestSharedTex(files.diff, true, (e) => { if (e.status === 'ready') { mat.map = e.tex; mat.color.setHex(0xffffff); mat.needsUpdate = true; } });
+  HOUSE_STATS.materialCreateMs += _now() - t0;
+  return mat;
+}
+function _flatMaterial(presetKey) { return _solid(FLAT_COLOR[presetKey] ?? 0xcccccc, { roughness: 0.9, metalness: 0 }); }
 
-  function getStats() {
-    const inst = [0, 0, 0, 0]; let visibleMeshes = 0, instances = 0, live = 0;
-    buckets.forEach((b) => { if (b.count > 0) { live++; if (b.mesh.visible) visibleMeshes++; instances += b.count; } });
-    houseList.forEach((h) => { if (h.placed) inst[h.lod]++; });
-    const g = getHouseGeometryStats(), m = getHouseMaterialStats();
-    return {
-      houseCount: houses.size, pendingHouses: pending.length, archetypeCount: archUse.size, archetypeCacheSize: g.archetypeCount,
-      geometryCount: g.geometryCount, geometryHit: g.geometryHit, geometryMiss: g.geometryMiss, geometryCreateMs: g.geometryCreateMs,
-      materialCount: m.totalMaterials, materialHit: m.materialHit, materialMiss: m.materialMiss, materialCreateMs: m.materialCreateMs,
-      textureCount: m.totalTextures, textureRequested: m.textureRequested, textureCacheHit: m.textureCacheHit,
-      texturesReady: m.texturesReady, texturesFailed: m.texturesFailed, texturesPending: m.texturesPending, textureBytesEstMB: m.textureBytesEstMB, failedTextures: m.failedTextures,
-      bucketCount: buckets.size, liveBuckets: live, instancedMeshCount: buckets.size, drawCallsVisible: visibleMeshes, instanceCount: instances,
-      instancesPerHouse: houses.size ? +(instances / houses.size).toFixed(1) : 0,
-      housesByLOD: inst, sectors: sectors.size,
-      houseCreateMs: +stats.houseCreateMs.toFixed(3), instanceWriteMs: +stats.instanceWriteMs.toFixed(3), instanceUpdateMs: +stats.instanceUpdateMs.toFixed(3),
-      updateMs: +stats.updateMs.toFixed(3), lastPlaceMs: +stats.lastPlaceMs.toFixed(3),
-    };
-  }
+export function getHouseMaterialStats() {
+  let shared = 0, solid = 0; _materialCache.forEach((_, k) => { if (k.startsWith('shared|')) shared++; else if (k.startsWith('solid|')) solid++; });
+  let ready = 0, failed = 0; _sharedTexEntries.forEach((e) => { if (e.status === 'ready') ready++; else if (e.status === 'failed') failed++; });
+  return {
+    pbrAndLiteMaterials: shared, solidMaterials: solid, totalMaterials: _materialCache.size,
+    sharedTextures: _sharedTexEntries.size, totalTextures: _sharedTexEntries.size + _textureCache.size,
+    texturesReady: ready, texturesFailed: failed, texturesPending: _sharedTexEntries.size - ready - failed,
+    textureRequested: HOUSE_STATS.textureRequested, textureCacheHit: HOUSE_STATS.textureCacheHit,
+    materialHit: HOUSE_STATS.materialHit, materialMiss: HOUSE_STATS.materialMiss, materialCreateMs: +HOUSE_STATS.materialCreateMs.toFixed(3),
+    textureBytesEstMB: +(HOUSE_STATS.textureBytesEst / 1048576).toFixed(1), failedTextures: HOUSE_STATS.failedTextures.slice(),
+  };
+}
 
-  /** Consistency check (dev/test): every instance sits in its owner slot with the right matrix. Returns mismatch count. */
-  function verify() {
-    let bad = 0; const m = new THREE.Matrix4();
-    houses.forEach((h) => {
-      if (!h.placed) return;
-      const body = getHouseLodParts(h.arch, h.lod), lot = h.yardDepth >= 0 ? getHouseLotParts(h.arch, h.yardDepth, h.lod, h.yardRear) : [];
-      if (h.insts.length !== body.length + lot.length) bad++;
-      h.insts.forEach((inst, i) => {
-        if (inst.b.owners[inst.slot] !== inst || inst.slot >= inst.b.count || inst.house !== h) { bad++; return; }
-        const isLot = i >= body.length, p = isLot ? lot[i - body.length] : body[i]; if (!p) return; const base = isLot ? h.lotMatrix : h.matrix; const exp = p.local ? m.multiplyMatrices(base, p.local) : base;
-        const arr = inst.b.mesh.instanceMatrix.array;
-        for (let k = 0; k < 16; k++) if (Math.abs(arr[inst.slot * 16 + k] - exp.elements[k]) > 1e-4) { bad++; break; }
-      });
+// ---- 9.3 shared geometry cache + module builders ---------------------------------------------
+// HOUSE_GEOMETRY_CACHE: module key -> BufferGeometry. Never disposed per house (renderer shutdown only).
+export const HOUSE_GEOMETRY_CACHE = new Map();
+function _geo(key, build) {
+  let g = HOUSE_GEOMETRY_CACHE.get(key);
+  if (g) { HOUSE_STATS.geometryHit++; return { key, geometry: g }; }
+  HOUSE_STATS.geometryMiss++; const t0 = _now();
+  g = build(); HOUSE_GEOMETRY_CACHE.set(key, g);
+  HOUSE_STATS.geometryCreated++; HOUSE_STATS.geometryCreateMs += _now() - t0;
+  return { key, geometry: g };
+}
+export function disposeHouseSharedResources() { // renderer / app shutdown ONLY (never per house)
+  HOUSE_GEOMETRY_CACHE.forEach((g) => g && g.dispose()); HOUSE_GEOMETRY_CACHE.clear();
+  _materialCache.forEach((m) => m.dispose()); _materialCache.clear();
+  _sharedTexEntries.forEach((e) => { if (e.tex) e.tex.dispose(); }); _sharedTexEntries.clear();
+  HOUSE_ARCHETYPES.forEach((a) => { a._lodParts = [null, null, null, null]; a._lotParts = null; });
+}
+
+function _scaleUV(geo, rx, ry) {
+  const uv = geo.attributes.uv; if (!uv) return geo;
+  for (let i = 0; i < uv.count; i++) uv.setXY(i, uv.getX(i) * rx, uv.getY(i) * ry);
+  uv.needsUpdate = true; return geo;
+}
+// Version-independent merge (BufferGeometryUtils.mergeGeometries was renamed between three releases).
+function _mergeGeos(list) {
+  const parts = list.filter(Boolean).map((g) => (g.index ? g.toNonIndexed() : g));
+  if (!parts.length) return null;
+  let total = 0; parts.forEach((g) => { total += g.attributes.position.count; });
+  const pos = new Float32Array(total * 3), nor = new Float32Array(total * 3), uv = new Float32Array(total * 2);
+  let o = 0;
+  parts.forEach((g) => {
+    pos.set(g.attributes.position.array, o * 3);
+    if (g.attributes.normal) nor.set(g.attributes.normal.array, o * 3);
+    if (g.attributes.uv) uv.set(g.attributes.uv.array, o * 2);
+    o += g.attributes.position.count;
+  });
+  const out = new THREE.BufferGeometry();
+  out.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  out.setAttribute('normal', new THREE.BufferAttribute(nor, 3));
+  out.setAttribute('uv', new THREE.BufferAttribute(uv, 2));
+  out.computeBoundingSphere(); out.computeBoundingBox();
+  list.forEach((g) => g && g.dispose()); parts.forEach((g) => g.dispose());
+  return out;
+}
+const _boxAt = (w, h, d, x, y, z, ux = 1, uy = 1) => { const g = new THREE.BoxGeometry(w, h, d); _scaleUV(g, ux, uy); g.translate(x, y, z); return g; };
+
+const _boxMod = (w, h, d, ux = 1, uy = 1) => _geo(`box|${_q(w)}x${_q(h)}x${_q(d)}|uv${_q(ux)}x${_q(uy)}`, () => _scaleUV(new THREE.BoxGeometry(w, h, d), ux, uy));
+const _unitBox = () => _boxMod(1, 1, 1, 1, 1); // shared by every un-textured detail
+const _columnMod = () => _geo('cyl|0.07-0.11-2.2-8', () => new THREE.CylinderGeometry(0.07, 0.11, 2.2, 8));
+
+// Gable roof as TWO slope panels (roof material, explicit UVs at ~2.5 m per tile) + TWO gable-end
+// pentagons (facade material). The old ExtrudeGeometry prism painted the gable ends with the roof
+// texture and let the extrude UV generator stretch the slope UVs; this fixes both.
+function _pushTri(pos, nor, uv, a, b, c, n, ua, ub, uc) {
+  const e1 = [b[0] - a[0], b[1] - a[1], b[2] - a[2]], e2 = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+  const cx = e1[1] * e2[2] - e1[2] * e2[1], cy = e1[2] * e2[0] - e1[0] * e2[2], cz = e1[0] * e2[1] - e1[1] * e2[0];
+  if (cx * n[0] + cy * n[1] + cz * n[2] < 0) { [b, c] = [c, b]; [ub, uc] = [uc, ub]; } // force CCW toward the outward normal
+  [a, b, c].forEach((p) => pos.push(p[0], p[1], p[2])); for (let i = 0; i < 3; i++) nor.push(n[0], n[1], n[2]);
+  uv.push(ua[0], ua[1], ub[0], ub[1], uc[0], uc[1]);
+}
+function _mkGeo(pos, nor, uv) {
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3)); g.setAttribute('normal', new THREE.Float32BufferAttribute(nor, 3)); g.setAttribute('uv', new THREE.Float32BufferAttribute(uv, 2));
+  g.computeBoundingSphere(); g.computeBoundingBox(); return g;
+}
+const ROOF_TILE_M = 2.5, FACADE_TILE_M = 2.0;
+function _gableSlopesMod(width, depth, ridge, ov) {
+  return _geo(`gslope|${_q(width)}x${_q(depth)}|${_q(ridge)}|${_q(ov)}`, () => {
+    const hw = width / 2 + ov, hd = depth / 2 + ov, L = Math.hypot(hw, ridge), r = 1 / ROOF_TILE_M;
+    const pos = [], nor = [], uv = [];
+    const quad = (A, B, C, D, n, uA, uB, uC, uD) => { _pushTri(pos, nor, uv, A, B, C, n, uA, uB, uC); _pushTri(pos, nor, uv, A, C, D, n, uA, uC, uD); };
+    for (const s of [-1, 1]) { // s=-1 left slope, s=+1 right slope
+      const A = [s * hw, 0, -hd], B = [0, ridge, -hd], C = [0, ridge, hd], D = [s * hw, 0, hd], n = [s * ridge / L, hw / L, 0];
+      quad(A, B, C, D, n, [0, 0], [0, L * r], [2 * hd * r, L * r], [2 * hd * r, 0]);
+    }
+    const bn = [0, -1, 0]; // soffit: hides the see-through under the eaves from low cameras
+    quad([-hw, 0, -hd], [hw, 0, -hd], [hw, 0, hd], [-hw, 0, hd], bn, [0, 0], [1, 0], [1, 1], [0, 1]);
+    return _mkGeo(pos, nor, uv);
+  });
+}
+function _gableEndsMod(width, depth, ridge, ov) {
+  return _geo(`gend|${_q(width)}x${_q(depth)}|${_q(ridge)}|${_q(ov)}`, () => {
+    const hw = width / 2, h0 = ridge * ov / (width / 2 + ov), r = 1 / FACADE_TILE_M;
+    const P = [[-hw, 0], [hw, 0], [hw, h0], [0, ridge], [-hw, h0]];
+    const pos = [], nor = [], uv = [];
+    for (const s of [1, -1]) {
+      const z = s * depth / 2, n = [0, 0, s], V = P.map((p) => [p[0], p[1], z]), U = P.map((p) => [p[0] * r, p[1] * r]);
+      for (let i = 1; i < 4; i++) _pushTri(pos, nor, uv, V[0], V[i], V[i + 1], n, U[0], U[i], U[i + 1]);
+    }
+    return _mkGeo(pos, nor, uv);
+  });
+}
+// wall assembly = wall box + facade-coloured gable ends (same material, same size -> ONE geometry / ONE bucket)
+const _bodyMod = (L) => _geo(`body|${_q(L.width)}x${_q(L.wallHeight)}x${_q(L.depth)}|${_q(L.ridgeHeight)}|${_q(L.overhang)}`, () => {
+  const box = _boxAt(L.width, L.wallHeight, L.depth, 0, L.wallHeight / 2, 0, L.uvFacade[0], L.uvFacade[1]);
+  const ends = _gableEndsMod(L.width, L.depth, L.ridgeHeight, L.overhang).geometry.clone().translate(0, L.wallHeight, 0);
+  return _mergeGeos([box, ends]);
+});
+const _dormerBodyMod = (dw, dd, dh, uvf) => _geo(`dbody|${_q(dw)}x${_q(dh)}x${_q(dd)}`, () => {
+  const box = _boxAt(dw, dh, dd, 0, 0, 0, uvf[0], uvf[1]);
+  const ends = _gableEndsMod(dw, dd, dh * 0.6, 0.1).geometry.clone().translate(0, dh / 2, 0);
+  return _mergeGeos([box, ends]);
+});
+// porch stairs: one merged module, origin = centre of the porch front edge on the ground line (baseY); shared by every size with the same top-step width
+const _stairsMod = (topW, count) => _geo(`stairs|${_q(topW)}|${count}`, () => {
+  const list = [];
+  for (let s = 0; s < count; s++) list.push(_boxAt(_q(topW - s * 0.15), 0.15, 0.32, 0, -0.15 * (count - s) + 0.075, 0.18 + s * 0.32, 1, 0.3));
+  return _mergeGeos(list);
+});
+const _doorMod = (doorW, style) => _geo(`door|${_q(doorW)}|${style}`, () => {
+  const u = [0.5, 0.9], list = [_boxAt(doorW, 1.9, 0.07, 0, 0, 0, u[0], u[1])];
+  if (style === 'paneled') [[-1, 0.5, 0.62], [1, 0.5, 0.62], [-1, -0.42, 0.72], [1, -0.42, 0.72]].forEach(([sx, y, h]) => list.push(_boxAt(doorW * 0.34, h, 0.03, sx * doorW * 0.21, y, 0.04, 0.3, 0.4)));
+  else if (style === 'lite') list.push(_boxAt(doorW * 0.6, 1.5, 0.03, 0, 0.05, 0.04, 0.3, 0.8));
+  else list.push(_boxAt(doorW * 0.8, 0.05, 0.03, 0, 0.1, 0.04, 0.3, 0.1)); // flat door: one kick/lock rail
+  return _mergeGeos(list);
+});
+const _railMod = (len) => _geo(`rail|${_q(len)}`, () => {
+  const l = _q(len), list = [_boxAt(l, 0.05, 0.07, 0, 0.9, 0), _boxAt(l, 0.04, 0.05, 0, 0.14, 0)];
+  const n = Math.max(2, Math.floor(l / 0.14));
+  for (let i = 0; i < n; i++) list.push(_boxAt(0.025, 0.76, 0.025, -l / 2 + (i + 0.5) * (l / n), 0.52, 0));
+  return _mergeGeos(list);
+});
+
+// ---- 9.3b house SHAPES (main block + wings, roof kinds) -----------------------------------------
+// roofKind: 'gableZ' (front-facing gable, ridge along Z = original) | 'gableX' (side gable) | 'hip'.
+// Everything is laid out in the MAIN block frame; L.shiftX/Z then re-centres the whole assembly in the lot.
+const SHAPE_WIDTH_FACTOR = { L: 0.62, Lm: 0.62, garage: 0.52, garageHip: 0.52, cross: 0.68, modern: 0.7 };
+const _faceN = (a, b, c) => {
+  const e1 = [b[0] - a[0], b[1] - a[1], b[2] - a[2]], e2 = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+  let n = [e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]];
+  const l = Math.hypot(n[0], n[1], n[2]) || 1; n = n.map((v) => v / l);
+  return n[1] < 0 ? n.map((v) => -v) : n;
+};
+function _hipGeometry(hw, hd, ridge, r) { // eave rectangle +-hw x +-hd at y=0, equal pitch, ridge along the long axis
+  const k = Math.abs(hw - hd), alongX = hw >= hd;
+  const A = [-hw, 0, -hd], B = [hw, 0, -hd], C = [hw, 0, hd], D = [-hw, 0, hd];
+  const R1 = alongX ? [-k, ridge, 0] : [0, ridge, -k], R2 = alongX ? [k, ridge, 0] : [0, ridge, k];
+  const pos = [], nor = [], uv = [];
+  const tri = (a, b, c) => _pushTri(pos, nor, uv, a, b, c, _faceN(a, b, c), [a[0] * r, a[2] * r], [b[0] * r, b[2] * r], [c[0] * r, c[2] * r]);
+  const quad = (a, b, c, d) => { tri(a, b, c); tri(a, c, d); };
+  if (alongX) { quad(A, B, R2, R1); quad(C, D, R1, R2); tri(D, A, R1); tri(B, C, R2); }
+  else { quad(A, D, R2, R1); quad(C, B, R1, R2); tri(A, B, R1); tri(C, D, R2); }
+  _pushTri(pos, nor, uv, A, B, C, [0, -1, 0], [0, 0], [1, 0], [1, 1]); _pushTri(pos, nor, uv, A, C, D, [0, -1, 0], [0, 0], [1, 1], [0, 1]); // soffit
+  return _mkGeo(pos, nor, uv);
+}
+const _hipRoofMod = (w, d, rh, ov) => _geo(`hip|${_q(w)}x${_q(d)}|${_q(rh)}|${_q(ov)}`, () => _hipGeometry(w / 2 + ov, d / 2 + ov, rh, 1 / ROOF_TILE_M));
+const _unitHipGeo = (uv) => _geo(`unit|hip|${uv}`, () => { const g = _hipGeometry(0.5, 0.25, 1, uv); g.scale(1, 1, 2); g.computeVertexNormals(); return g; });
+function _unitFlatGeo(uvx, uvy) { // base at y=0 (not centered) so it drops into the same topY placement as the gable/hip unit roofs
+  return _geo(`unit|flat|${uvx}x${uvy}`, () => { const g = new THREE.BoxGeometry(1, 1, 1); g.translate(0, 0.5, 0); return _scaleUV(g, uvx, uvy); });
+}
+function _unitRoofSpec(kind, w, d, ov) { // unit roof geometry + scale/yaw for LOD1..3
+  const a = w + 2 * ov, b = d + 2 * ov;
+  if (kind === 'gableX') return { geo: _unitGableGeo(1.5, 1.5), sx: b, sz: a, yaw: Math.PI / 2 };
+  if (kind === 'hip') return a >= b ? { geo: _unitHipGeo(1.5), sx: a, sz: b, yaw: 0 } : { geo: _unitHipGeo(1.5), sx: b, sz: a, yaw: Math.PI / 2 };
+  if (kind === 'flat') return { geo: _unitFlatGeo(1.5, 1.5), sx: a, sz: b, yaw: 0 };
+  return { geo: _unitGableGeo(1.5, 1.5), sx: a, sz: b, yaw: 0 };
+}
+function _blockShell(kind, w, d, wh, rh, ov) { // wall module + roof module (+ yaw for both roof and, via yaw, ridge axis) of one block
+  const fac = (ww, dd) => ({ width: ww, depth: dd, wallHeight: wh, ridgeHeight: rh, overhang: ov, uvFacade: [Math.max(ww, 1) / 2, wh / 2] });
+  if (kind === 'gableX') return { wall: _bodyMod(fac(d, w)), roof: _gableSlopesMod(d, w, rh, ov), yaw: Math.PI / 2 };
+  if (kind === 'hip') return { wall: _geo(`hipbody|${_q(w)}x${_q(wh)}x${_q(d)}`, () => _boxAt(w, wh, d, 0, wh / 2, 0, Math.max(w, 1) / 2, wh / 2)), roof: _hipRoofMod(w, d, rh, ov), yaw: 0 };
+  if (kind === 'flat') { // Prompt: terrace houses — flat roof slab (base at y=0, like the other roof modules) instead of a ridge
+    const a = w + 2 * ov, b = d + 2 * ov, rhc = Math.max(0.15, rh);
+    return { wall: _bodyMod(fac(w, d)), roof: _geo(`flatroof|${_q(a)}x${_q(rhc)}x${_q(b)}`, () => _boxAt(a, rhc, b, 0, rhc / 2, 0, Math.max(w, 1) / 2, Math.max(d, 1) / 2)), yaw: 0 };
+  }
+  return { wall: _bodyMod(fac(w, d)), roof: _gableSlopesMod(w, d, rh, ov), yaw: 0 };
+}
+function _applyShape(L, shape, width0) {
+  // Main block keeps its porch/door/windows. Wings extend BACKWARD (and sideways) from it, so the porch side is never covered.
+  const ov = L.overhang, wh = L.wallHeight, w = L.width, pitch = 0.62, dm0 = L.depth;
+  const rhFor = (span, k = 1) => Math.max(0.45, pitch * k * (span / 2 + ov));
+  const m = shape === 'Lm' ? -1 : 1, mx = m * (width0 - w) / 2, wings = [];
+  const twoMass = shape === 'L' || shape === 'Lm' || shape === 'cross' || shape === 'modern';
+  if (twoMass || shape === 'garage' || shape === 'garageHip') { L.depth = Math.max(1.8, dm0 * 0.85); L.uvRoof = [Math.max(w, 1) / 3, Math.max(L.depth, 1) / 3]; }
+  const d = L.depth, ext = Math.max(0.9, dm0 * 0.4), inn = Math.max(0.8, d * 0.45);
+  let garage = null;
+  L.wings = wings; L.roofKind = 'gableZ'; L.garage = null; L.ridgeHeight = rhFor(w);
+  const mainRh = L.ridgeHeight;
+  if (shape === 'sideGable') { L.roofKind = 'gableX'; L.ridgeHeight = rhFor(d); L.dormer = false; }
+  else if (shape === 'hip') { L.roofKind = 'hip'; L.ridgeHeight = rhFor(Math.min(w, d)); L.dormer = false; }
+  else if (shape === 'L' || shape === 'Lm') { // front-facing gable (porch/door) on one side + full-width side-gable wing behind
+    const dw = ext + inn;
+    wings.push({ cx: -mx, cz: -d / 2 - ext + dw / 2, w: width0, d: dw, wh, kind: 'gableX', rh: Math.min(rhFor(dw), mainRh * 0.9), win: true });
+  } else if (shape === 'cross') { // side-gable wing crossing behind the front gable
+    const dw = ext + d - 0.35;
+    wings.push({ cx: 0, cz: -d / 2 - ext + dw / 2, w: width0, d: dw, wh, kind: 'gableX', rh: Math.min(rhFor(dw), mainRh * 0.9), win: true });
+  } else if (shape === 'garage' || shape === 'garageHip') {
+    const hipG = shape === 'garageHip', wg = width0 - w, wgE = wg + 0.1, dg = d + 0.6, zg = d / 2, gcx = -m * (w / 2 + wg / 2 - 0.05);
+    if (hipG) { L.roofKind = 'hip'; L.ridgeHeight = rhFor(Math.min(w, d)); L.dormer = false; }
+    wings.push({ cx: gcx, cz: zg - dg / 2, w: wgE, d: dg, wh: wh * 0.86, kind: hipG ? 'hip' : 'gableZ', rh: hipG ? rhFor(Math.min(wgE, dg)) : Math.min(rhFor(wgE), mainRh * 0.9), garageDoor: true });
+    garage = { cx: gcx, zf: zg, w: wgE };
+  } else if (shape === 'modern') { // low-pitch side gable + taller offset mass at the back
+    L.roofKind = 'gableX'; L.ridgeHeight = rhFor(d, 0.4);
+    const w2 = width0 * 0.52, dw = ext + inn;
+    wings.push({ cx: -mx - m * (width0 / 2 - w2 / 2), cz: -d / 2 - ext + dw / 2, w: w2, d: dw, wh: wh * 1.12, kind: 'gableZ', rh: rhFor(w2, 0.4), win: true });
+  }
+  let x0 = -w / 2, x1 = w / 2, z0 = -d / 2, z1 = d / 2 + L.frontExt;
+  wings.forEach((g) => { x0 = Math.min(x0, g.cx - g.w / 2); x1 = Math.max(x1, g.cx + g.w / 2); z0 = Math.min(z0, g.cz - g.d / 2); z1 = Math.max(z1, g.cz + g.d / 2); });
+  L.shiftX = -(x0 + x1) / 2; L.shiftZ = -(z0 + z1) / 2 + L.frontExt / 2; // parts already carry zs = -frontExt/2
+  if (garage) L.garage = { cx: garage.cx + L.shiftX, zf: garage.zf - L.frontExt / 2 + L.shiftZ, w: garage.w };
+}
+function _wingWindowXs(L, g) { // window centres on the part of a wing's front face that sticks out beside the main block
+  const need = L.winW + 0.5, out = [], a0 = g.cx - g.w / 2, a1 = g.cx + g.w / 2, m0 = -L.width / 2, m1 = L.width / 2;
+  if (m0 - a0 >= need) out.push((a0 + m0) / 2);
+  if (a1 - m1 >= need) out.push((m1 + a1) / 2);
+  return out;
+}
+function _shiftParts(list, L) {
+  if (!L.shiftX && !L.shiftZ) return list;
+  const T = new THREE.Matrix4().makeTranslation(L.shiftX || 0, 0, L.shiftZ || 0);
+  list.forEach((p) => { p.local = new THREE.Matrix4().multiplyMatrices(T, p.local); });
+  return list;
+}
+
+// ---- 9.4 layout (numbers only — exact mirror of the maths in buildLowDensityHouse) --------------
+function _lowDensityLayout(config) {
+  // Prompt 24A-R3: the roof now OVERHANGS the walls by a visible eave (0.2 - 0.42 m, grows with lot size) and the
+  // whole assembly (walls + eaves) still stays inside the lot: the wall box is the lot minus two eaves. Before, the
+  // eave was clamped to ~4 % of the lot (a few cm), which made every house read as a "tofu" block.
+  const minCells = Math.min(config.widthCells, config.depthCells);
+  const overhang = Math.max(0.2, Math.min(0.42, minCells * 0.09));
+  const width0 = Math.max(1.4, config.widthCells - 2 * overhang - 0.06);
+  const shape = config.shape || 'gable';
+  const width = width0 * (SHAPE_WIDTH_FACTOR[shape] || 1); // main block; wings fill the rest of width0
+  const depthFull = Math.max(1.6, config.depthCells - 2 * overhang - 0.06);
+  const hasPorch = !!(config.porch && config.porch.present && config.depthCells >= 4); // (= old depthFull >= 3.2 test, expressed in cells)
+  const porchDepthC = Math.min(1.8, Math.max(0.9, depthFull * 0.3));
+  const stepCountC = porchDepthC >= 1.4 ? 3 : 2;
+  const frontExt = hasPorch ? porchDepthC + 0.34 + (stepCountC - 1) * 0.32 : 0;
+  const depth = hasPorch ? Math.max(2.0, depthFull - frontExt) : depthFull;
+  const floors = config.floors || 1;
+  const wallHeight = 2.9 * floors, ridgeHeight = wallHeight * 0.55, baseY = 0.35;
+  const winW = Math.min(1.05, width * 0.3), winH = Math.min(1.25, wallHeight * 0.42);
+  const windowXs = width >= 3.2 ? [-width * 0.28, width * 0.28] : [0];
+  const L = {
+    width, depth, depthFull, hasPorch, porchDepthC, stepCountC, frontExt, floors, wallHeight, ridgeHeight, baseY, overhang,
+    winY: baseY + wallHeight * 0.55, winW, winH, glassW: winW - 0.15, glassH: winH - 0.15, windowXs,
+    doorX: windowXs.length === 1 ? width * 0.26 : 0, doorW: Math.min(0.9, width * 0.32),
+    chimney: !!(config.chimney && width >= 3),
+    dormer: !!(config.dormer && width >= 3.6 && depth >= 4.4),
+    uvFacade: [Math.max(width, 1) / 2, wallHeight / 2], uvRoof: [Math.max(width, 1) / 3, Math.max(depth, 1) / 3], uvFound: [Math.max(width, 1) / 2, 0.5],
+    widthCells: config.widthCells, depthCells: config.depthCells, dimKey: `${config.widthCells}x${config.depthCells}`, porch: null,
+  };
+  if (hasPorch) {
+    const wrap = config.porch.style === 'wraparound' && width >= 4;
+    const porchWidth = wrap ? Math.min(width + 1.0, config.widthCells - 0.25) : Math.max(1.2, width * 0.55);
+    L.porch = { wrap, style: wrap ? 'wraparound' : 'partial', key: wrap ? 'w' : 'p', depth: porchDepthC, width: porchWidth, colCount: wrap ? 6 : 4, uvDeck: [porchWidth / 1.5, porchDepthC / 1.5] };
+  }
+  if (shape !== 'gable') _applyShape(L, shape, width0);
+  return L;
+}
+// Chimney: top always clears the roof surface at its x by 0.85 m (the legacy formula ended exactly ON the roof
+// surface, so the chimney was practically invisible).
+function _chimneySpec(L) {
+  const x = L.width * 0.3, hw = L.width / 2 + L.overhang;
+  const roofAtX = L.ridgeHeight * Math.max(0, 1 - Math.abs(x) / hw);
+  return { x, z: -L.depth * 0.2, cw: Math.min(0.7, L.width * 0.16), chH: L.wallHeight + roofAtX + 0.85 };
+}
+
+// ---- 9.5 House Archetypes ----------------------------------------------------------------------
+// 家の実寸倍率: レイアウトは従来どおりロット(w×d)基準で作り、家グループ全体をこの倍率で縮小して描画する。
+// ロット(芝生・フェンス)は縮小しない → 敷地はそのまま、家だけ小さく見えて庭が広くなる。
+export const HOUSE_SCALE = 0.6;
+// Terrace houses are a special case: _terraceLayout() already sizes width/depth to fill the
+// lot cell almost exactly (party-wall fit, see its comment) — if HouseInstanceRenderer then
+// shrinks that footprint uniformly by HOUSE_SCALE like every other house, the walls no longer
+// reach the lot edge and a visible gap/fence opens up between neighbouring terrace houses,
+// which defeats the whole point of a terrace row (houses must sit flush, sharing party walls).
+// So terrace houses get their own per-axis scale instead of the uniform HOUSE_SCALE: full width
+// (x — no shrink, so adjacent houses touch), the normal HOUSE_SCALE on height (y), and depth (z)
+// boosted to 1.5x what the plain HOUSE_SCALE would give, per design request. HOUSE_SCALE itself
+// stays untouched for every other (low-density) house archetype.
+const TERRACE_HOUSE_SCALE = { x: 1, y: HOUSE_SCALE, z: HOUSE_SCALE * 1.5 };
+export const HOUSE_ARCHETYPE_BASES = new Map(LOW_DENSITY_HOUSES.map((h) => [h.id, h]));
+export const HOUSE_ARCHETYPES = new Map();
+const DOOR_PRESETS = ['darkWood', 'rawWoodCedar', 'paintedBlueWood', 'paintedWhiteWood'];
+const DOOR_STYLES = ['flat', 'paneled', 'lite'];
+
+export function getHouseArchetype(w, d, variantIndex = 0) {
+  const base = getLowDensityHouseConfigForCell(w, d, variantIndex);
+  if (!base) return null;
+  const id = `${base.id}@${w}x${d}`;
+  if (HOUSE_ARCHETYPES.has(id)) return HOUSE_ARCHETYPES.get(id);
+  const cfg = { ...base, widthCells: w, depthCells: d };
+  const L = _lowDensityLayout(cfg);
+  const arch = {
+    id, baseId: base.id, sizeClass: base.sizeKey, w, d,
+    facadeFamily: base.family, roofType: 'gable',
+    windowStyle: L.windowXs.length === 2 ? 'double' : 'single', porchStyle: L.hasPorch ? L.porch.style : 'none',
+    chimney: L.chimney, dormer: L.dormer, floors: L.floors,
+    doorStyle: DOOR_STYLES[base.seed % DOOR_STYLES.length],
+    materialRefs: { facade: base.facadeMaterial, roof: base.roofMaterial, foundation: base.foundationMaterial, deck: 'deckWood', chimney: 'brickRed',
+      door: DOOR_PRESETS[(base.seed >> 1) % DOOR_PRESETS.length], trim: base.trimColor },
+    layout: L, seed: base.seed, _lodParts: [null, null, null, null],
+    // feature flags (Part 19/20): a house registers instances only for the features that are ON
+    features: { porch: L.hasPorch, chimney: L.chimney, dormer: L.dormer, wraparound: L.hasPorch && L.porch.wrap },
+  };
+  HOUSE_ARCHETYPES.set(id, arch);
+  return arch;
+}
+
+// ---- 9.5b テラスハウス archetype（instanced/LOD経路。低密度住宅と全く同じ getHouseLodParts/getHouseLotParts
+// パイプラインに乗る — HouseInstanceRenderer._buildRecord は archetype に .id があればそれをそのまま使うので、
+// メインファイル側は record.archetype: getTerraceArchetype(variantIndex) を渡すだけでよい（getHouseArchetype
+// 自体・低密度住宅の挙動は一切変更していない）。建物フットプリントは3x3固定、残りの奥3x3は既存の
+// yardDepth（lot dressing）の仕組みでそのまま庭になる。
+function _terraceMaterialDefaults(facadeMaterial) {
+  if (facadeMaterial === 'darkWood') return { trimColor: 0xe4ddc9, foundationMaterial: 'stoneRough' };
+  if (facadeMaterial === 'brickRed') return { trimColor: 0xede7d6, foundationMaterial: 'concrete' };
+  if (String(facadeMaterial).startsWith('plaster')) return { trimColor: 0x2a2018, foundationMaterial: 'stoneRough' };
+  return { trimColor: 0xf2ede2, foundationMaterial: 'concrete' }; // concrete / concreteRock
+}
+function _terraceLayout(config) {
+  const overhang = 0.18; // roof eave / parapet coping overhang — purely a visual projection PAST the wall now, never a wall inset
+  // Prompt: the house fills its ENTIRE 3x3 front cell — both the width (party-wall sides, shared
+  // with the neighbouring house) and the depth (front/back) get only a hairline tolerance, not the
+  // old eave-based inset. The roof/coping overhang below still projects a bit past these walls for
+  // the architectural detail; it just no longer shrinks the walls themselves.
+  // Width needs a wider gap than depth: the roof/parapet coping overhangs the wall by `overhang` on
+  // EVERY side, and side-by-side neighbours share that width axis — if the two walls sat only a
+  // hairline apart (like the front/back, which have no neighbour) each house's coping would project
+  // straight into the next house's coping and the roofs would visibly intersect. Widening the width
+  // gap to clear both overhangs (plus a little slack) keeps the walls close/terrace-like while
+  // leaving the roofs their own room.
+  const partyGapX = overhang * 2 + 0.04; // m — width: must clear coping overhang on both sides
+  const partyGapZ = 0.02; // m — depth: front/back has no neighbour, keep the old hairline tolerance
+  const width = Math.max(1.6, config.widthCells - partyGapX);
+  const depth = Math.max(1.6, config.depthCells - partyGapZ);
+  const floors = config.floors || 3, floorH = 2.9, wallHeight = floorH * floors, baseY = 0.35;
+  const ridgeHeight = 0.4; // flat roof slab thickness (parapet trim is added on top of this in _lod0Parts)
+  const winW = Math.min(0.7, width * 0.28), winH = Math.min(1.1, floorH * 0.42);
+  const windowXs = width >= 1.8 ? [-width * 0.24, width * 0.24] : [0];
+  const windowRows = []; for (let f = 1; f < floors; f++) windowRows.push(baseY + floorH * f + floorH * 0.52); // no windows on the ground floor (door goes there)
+  return {
+    width, depth, depthFull: depth, hasPorch: false, porchDepthC: 0, stepCountC: 0, frontExt: 0, floors, wallHeight, ridgeHeight, baseY, overhang,
+    winY: windowRows[0] ?? (baseY + wallHeight * 0.55), winW, winH, glassW: winW - 0.12, glassH: winH - 0.12, windowXs, windowRows,
+    doorX: 0, doorW: Math.min(0.85, width * 0.32), chimney: false, dormer: false, roofKind: 'flat', wings: [], garage: null, shiftX: 0, shiftZ: 0,
+    uvFacade: [Math.max(width, 1) / 2, wallHeight / 2], uvRoof: [Math.max(width, 1) / 3, Math.max(depth, 1) / 3], uvFound: [Math.max(width, 1) / 2, 0.5],
+    widthCells: config.widthCells, depthCells: config.depthCells, dimKey: `${config.widthCells}x${config.depthCells}`, porch: null,
+    // Prompt: the rear elevation faces the house's own private yard, not a neighbour — it's seen just
+    // as often as the front (party walls hide the sides), so mirror the window rows onto the back
+    // wall too instead of leaving it a bare brick/stucco slab. Low-density houses don't set this.
+    backWindows: true,
+  };
+}
+export function getTerraceArchetype(variantIndex = 0) {
+  const n = TERRACE_HOUSES.length, idx = ((variantIndex % n) + n) % n;
+  const base = TERRACE_HOUSES[idx], id = `${base.id}@terrace3x3`;
+  if (HOUSE_ARCHETYPES.has(id)) return HOUSE_ARCHETYPES.get(id);
+  const matDef = _terraceMaterialDefaults(base.facadeMaterial), seed = 5000 + idx;
+  const cfg = { widthCells: 3, depthCells: 3, floors: 3 };
+  const L = _terraceLayout(cfg);
+  const arch = {
+    id, baseId: base.id, sizeClass: 'terrace_3x3', w: cfg.widthCells, d: cfg.depthCells,
+    facadeFamily: base.family, roofType: 'flat',
+    windowStyle: L.windowXs.length === 2 ? 'double' : 'single', porchStyle: 'none',
+    chimney: false, dormer: false, floors: L.floors,
+    doorStyle: DOOR_STYLES[seed % DOOR_STYLES.length],
+    materialRefs: { facade: base.facadeMaterial, roof: base.roofMaterial, foundation: matDef.foundationMaterial, deck: 'deckWood', chimney: 'brickRed',
+      door: DOOR_PRESETS[(seed >> 1) % DOOR_PRESETS.length], trim: matDef.trimColor },
+    layout: L, seed, _lodParts: [null, null, null, null],
+    features: { porch: false, chimney: false, dormer: false, wraparound: false },
+    houseScale: TERRACE_HOUSE_SCALE, // HouseInstanceRenderer: per-axis override, see comment on TERRACE_HOUSE_SCALE above
+    accessories: base.accessories || [], // rooftop/rear-wall clutter (AC unit, dish, solar panel, planter) — see _lod0Parts
+  };
+  HOUSE_ARCHETYPES.set(id, arch);
+  return arch;
+}
+export const TERRACE_ARCHETYPE_COUNT = TERRACE_HOUSES.length;
+
+// ---- 9.6 LOD0: kit-of-parts recipe -------------------------------------------------------------
+const _lp = new THREE.Vector3(), _ls = new THREE.Vector3(), _lq = new THREE.Quaternion(), _lY = new THREE.Vector3(0, 1, 0);
+function _local(px, py, pz, sx = 1, sy = 1, sz = 1, yaw = 0) {
+  return new THREE.Matrix4().compose(_lp.set(px, py, pz), yaw ? _lq.setFromAxisAngle(_lY, yaw) : _lq.identity(), _ls.set(sx, sy, sz));
+}
+function _matInfo(refs, role) {
+  switch (role) {
+    case 'facade': case 'roof': case 'foundation': case 'deck': case 'chimney': case 'door':
+      return { matKey: `pbr:${refs[role]}`, material: getSharedPBRMaterial(refs[role]) };
+    case 'trim': return { matKey: `solid:${refs.trim}`, material: _solid(refs.trim, { roughness: 0.65 }) };
+    case 'glass': return { matKey: 'glass', material: _glassMaterial() };
+    default: return { matKey: 'metal', material: _metalMaterial() }; // 'metal'
+  }
+}
+
+function _lod0Parts(arch) {
+  const L = arch.layout, refs = arch.materialRefs, zs = -L.frontExt / 2, list = [];
+  const { width, depth, baseY, wallHeight, ridgeHeight, overhang } = L;
+  const add = (part, g, role, local, tinted) => list.push({ part, geoKey: g.key, geometry: g.geometry, ..._matInfo(refs, role), local, tinted: !!tinted });
+  const U = _unitBox();
+  const unit = (part, role, x, y, z, sx, sy, sz) => add(part, U, role, _local(x, y, z + zs, sx, sy, sz), false);
+  const topY = baseY + wallHeight, fz = depth / 2;
+
+  // --- facade / siding, foundation, roof (+ facade-coloured gable ends)
+  const kind = L.roofKind || 'gableZ', shM = _blockShell(kind, width, depth, wallHeight, ridgeHeight, overhang);
+  add('wall', shM.wall, 'facade', _local(0, baseY, zs, 1, 1, 1, shM.yaw), true); // wall box + gable ends
+  add('foundation', _boxMod(width + 0.2, baseY, depth + 0.2, L.uvFound[0], L.uvFound[1]), 'foundation', _local(0, baseY / 2, zs), true);
+  add('roof', shM.roof, 'roof', _local(0, topY, zs, 1, 1, 1, shM.yaw), true);
+
+  // --- metal: gutters, downspouts, chimney cap, door handle
+  const hw = width / 2 + overhang;
+  [-1, 1].forEach((s) => {
+    if (kind === 'gableZ') unit('gutter', 'metal', s * hw, topY + 0.02, 0, 0.07, 0.09, depth + overhang * 2);
+    else unit('gutter', 'metal', 0, topY + 0.02, s * (depth / 2 + overhang), width + overhang * 2, 0.09, 0.07);
+    unit('downspout', 'metal', s * (width / 2 + 0.045), baseY + wallHeight / 2, -depth / 2 + 0.06, 0.06, wallHeight, 0.06);
+  });
+  // --- trim: corner boards
+  [[-1, -1], [1, -1], [-1, 1], [1, 1]].forEach(([sx, sz]) => unit('corner', 'trim', sx * (width / 2 + 0.03), baseY + wallHeight / 2, sz * (depth / 2 + 0.03), 0.09, wallHeight, 0.09));
+
+  // --- windows: frame + glass + mullions + sill (all the shared unit box; size lives in `local`)
+  // Prompt: windowRows (one Y per floor) is optional — when absent this is exactly the old single-row behaviour.
+  (L.windowRows || [L.winY]).forEach((wy) => L.windowXs.forEach((x) => {
+    unit('winframe', 'trim', x, wy, fz, L.winW, L.winH, 0.05);
+    unit('glass', 'glass', x, wy, fz + 0.02, L.glassW, L.glassH, 0.08);
+    unit('mullion', 'trim', x, wy, fz + 0.06, 0.035, L.glassH, 0.03);
+    unit('mullion', 'trim', x, wy, fz + 0.06, L.glassW, 0.035, 0.03);
+    unit('sill', 'trim', x, wy - L.winH / 2 - 0.03, fz + 0.06, L.winW + 0.16, 0.06, 0.16);
+  }));
+  // --- back windows (terrace only, L.backWindows — see its comment): mirror of the front window
+  // rows onto the rear wall so the elevation facing the private yard isn't a bare slab.
+  if (L.backWindows) {
+    const bz = -fz;
+    (L.windowRows || [L.winY]).forEach((wy) => L.windowXs.forEach((x) => {
+      unit('winframe', 'trim', x, wy, bz, L.winW, L.winH, 0.05);
+      unit('glass', 'glass', x, wy, bz - 0.02, L.glassW, L.glassH, 0.08);
+      unit('mullion', 'trim', x, wy, bz - 0.06, 0.035, L.glassH, 0.03);
+      unit('mullion', 'trim', x, wy, bz - 0.06, L.glassW, 0.035, 0.03);
+      unit('sill', 'trim', x, wy - L.winH / 2 - 0.03, bz - 0.06, L.winW + 0.16, 0.06, 0.16);
+    }));
+  }
+  // --- accessories (rooftop / rear-wall clutter): AC condenser unit, satellite dish, solar panel,
+  // planter box — reuses the per-archetype `accessories` list (terrace houses only; low-density
+  // archetypes have no `accessories` field, so this is a no-op for them). Keeps elevations other
+  // than the front facade from reading as flat and featureless.
+  if (arch.accessories && arch.accessories.length) {
+    const bz = -fz, n = arch.accessories.length;
+    arch.accessories.forEach((acc, i) => {
+      const ax = (i - (n - 1) / 2) * (width * 0.3);
+      if (acc === 'airConditioner') {
+        const ay = baseY + 1.05;
+        unit('acunit', 'metal', ax, ay, bz - 0.12, 0.55, 0.38, 0.22);
+        unit('acunit', 'metal', ax, ay - 0.24, bz - 0.12, 0.5, 0.06, 0.2);
+      } else if (acc === 'satelliteDish') {
+        const ay = topY - 0.4;
+        unit('dish', 'metal', width / 2 - 0.3, ay, bz - 0.08, 0.4, 0.4, 0.06);
+        unit('dish', 'metal', width / 2 - 0.3, ay - 0.26, bz - 0.05, 0.05, 0.28, 0.05);
+      } else if (acc === 'solarPanel') {
+        const pTopY = topY + Math.max(0.15, ridgeHeight);
+        unit('solarpanel', 'metal', 0, pTopY + 0.04, 0, width * 0.55, 0.04, depth * 0.45);
+      } else if (acc === 'planterBox') {
+        unit('planter', 'trim', L.doorX + L.doorW * 0.85, baseY + 0.16, fz + 0.18, 0.42, 0.28, 0.22);
+      }
     });
-    buckets.forEach((b) => { for (let i = 0; i < b.count; i++) { const o = b.owners[i]; if (!o || o.slot !== i || o.b !== b) bad++; } });
-    return bad;
   }
-
-  /** Renderer shutdown. Shared geometry / materials / textures are disposed ONLY when opts.disposeShared is true. */
-  function dispose(opts = {}) {
-    buckets.forEach((b) => { scene.remove(b.mesh); b.mesh.dispose(); });
-    buckets.clear(); sectors.clear(); houses.clear(); houseList.length = 0; pending.length = 0; archUse.clear(); emptyBuckets = 0;
-    if (opts.disposeShared) { disposeHouseSharedResources(); if (_skirtGeo) { _skirtGeo.dispose(); _skirtGeo = null; } }
+  // --- parapet (flat-roof houses only): thin lip framing the roof edge, sitting ON the flat roof slab
+  if (L.roofKind === 'flat') {
+    const pH = 0.55, pMat = 'trim', a = width + overhang * 2, b = depth + overhang * 2, pTopY = topY + Math.max(0.15, ridgeHeight);
+    [[a, 0.12, -b / 2 + 0.06], [a, 0.12, b / 2 - 0.06]].forEach(([dx, dz, pz]) => add('parapet', _boxMod(dx, pH, dz, Math.max(dx, 1) / 2, 1), pMat, _local(0, pTopY + pH / 2, pz + zs), true));
+    [[0.12, b, -a / 2 + 0.06], [0.12, b, a / 2 - 0.06]].forEach(([dx, dz, px]) => add('parapet', _boxMod(dx, pH, dz, 1, Math.max(dz, 1) / 2), pMat, _local(px, pTopY + pH / 2, zs), true));
   }
+  // --- door: frame (trim) + wood slab (3 shared styles) + handle (metal)
+  unit('doorframe', 'trim', L.doorX, baseY + 1.0, fz, L.doorW + 0.16, 2.02, 0.05);
+  add('door', _doorMod(L.doorW, arch.doorStyle), 'door', _local(L.doorX, baseY + 0.95, fz + 0.03 + zs), false);
+  unit('handle', 'metal', L.doorX + L.doorW * 0.36, baseY + 0.95, fz + 0.085, 0.045, 0.14, 0.05);
 
-  const setForcedLod = (l) => { forcedLod = l; viewSig = ''; lodRemaining = houseList.length; };
-
-  /** Dev benchmark: places N synthetic houses (all 11 sizes, both orientations), measures placement + LOD settle. */
-  function benchmark(counts = [1, 2, 10, 100, 500, 1000], camera = lastCamera, keep = false) {
-    const sizes = ['2x3', '3x3', '3x4', '3x5', '3x6', '4x4', '4x5', '4x6', '5x5', '5x6', '6x6'].flatMap((k) => { const [a, b] = k.split('x').map(Number); return a === b ? [[a, b]] : [[a, b], [b, a]]; });
-    const rows = [];
-    for (const n of counts) {
-      const ids = []; const t0 = _now(); const w0 = { ...getStats() };
-      for (let i = 0; i < n; i++) {
-        const [w, d] = sizes[i % sizes.length], gx = i % 72, gz = Math.floor(i / 72);
-        const id = `bench_${n}_${i}`; ids.push(id);
-        addHouse({ id, archetype: { w, d, variantIndex: i % 10 }, position: { x: -180 + gx * 5, y: 0, z: -180 + gz * 8 }, rotationY: (i % 8) * 0.4, level: 1, seed: i, yardDepth: i % 4 === 3 ? 0 : Math.min(3, 6 - d), skirt: i % 9 === 0 ? { height: 0.6, retaining: false, width: w * 0.97, depth: d * 0.97, yaw: (i % 8) * 0.4 } : null }, { immediate: true });
-      }
-      const placeMs = _now() - t0;
-      let updMs = 0; if (camera) { viewSig = ''; for (let f = 0; f < 200 && (f === 0 || lodRemaining > 0); f++) { const u0 = _now(); update(camera, { focus: { x: 0, z: 0 } }); updMs += _now() - u0; } }
-      const s = getStats();
-      rows.push({ houses: n, placementMs: +placeMs.toFixed(2), msPerHouse: +(placeMs / n).toFixed(4), lodSettleUpdateMs: +updMs.toFixed(2), newGeometries: s.geometryCount - w0.geometryCount, ...s });
-      if (!keep) { ids.forEach(removeHouse); _prune(); }
+  // --- chimney (only when ON)
+  if (L.chimney) {
+    const c = _chimneySpec(L);
+    add('chimney', _boxMod(c.cw, c.chH, c.cw, 0.5, 1), 'chimney', _local(c.x, baseY + c.chH / 2, c.z + zs), true);
+    unit('chimneycap', 'metal', c.x, baseY + c.chH + 0.04, c.z, c.cw + 0.12, 0.08, c.cw + 0.12);
+  }
+  // --- dormer (only when ON)
+  if (L.dormer) {
+    const dw = width * 0.28, dd = depth * 0.22, dh = 0.9, dY = baseY + wallHeight + ridgeHeight * 0.35, dz = depth * 0.18;
+    add('dormerwall', _dormerBodyMod(dw, dd, dh, L.uvFacade), 'facade', _local(0, dY, dz + zs), true); // dormer box + its gable ends
+    add('dormerroof', _gableSlopesMod(dw, dd, dh * 0.6, 0.1), 'roof', _local(0, dY + dh / 2, dz + zs), true);
+    unit('winframe', 'trim', 0, dY, dz + dd / 2 + 0.01, 0.62, 0.62, 0.05);
+    unit('glass', 'glass', 0, dY, dz + dd / 2 + 0.03, 0.5, 0.5, 0.06);
+  }
+  // --- porch (only when ON): deck, roof, columns, steps, railings
+  if (L.hasPorch) {
+    const p = L.porch, pz = fz + p.depth / 2, deckTop = baseY + 0.155;
+    add('deck', _boxMod(p.width, 0.15, p.depth, p.uvDeck[0], p.uvDeck[1]), 'deck', _local(0, baseY + 0.08, pz + zs), true);
+    add('porchroof', _boxMod(Math.min(p.width + 0.3, L.widthCells), 0.12, p.depth + 0.3, L.uvRoof[0], L.uvRoof[1]), 'roof', _local(0, baseY + 2.4, pz + zs), true);
+    const colZ = fz + p.depth - 0.1, col = _columnMod();
+    for (let i = 0; i < p.colCount; i++) add('column', col, 'trim', _local(-p.width / 2 + (i / (p.colCount - 1)) * p.width, baseY + 1.25, colZ + zs), false);
+    add('steps', _stairsMod(Math.min(1.2, p.width * 0.8), L.stepCountC), 'foundation', _local(0, baseY, fz + p.depth + zs), true);
+    // railings: between columns on the front (entrance bay left open) + both sides of a wraparound porch
+    const seg = p.width / (p.colCount - 1), rl = _q(seg - 0.16);
+    for (let i = 0; i < p.colCount - 1; i++) {
+      const xm = -p.width / 2 + (i + 0.5) * seg;
+      if (Math.abs(xm) < seg * 0.6) continue;
+      add('railing', _railMod(rl), 'trim', _local(xm, deckTop, colZ + zs), false);
     }
-    return rows;
+    if (p.wrap) [-1, 1].forEach((s) => add('railing', _railMod(_q(p.depth - 0.25)), 'trim', _local(s * (p.width / 2 - 0.05), deckTop, fz + p.depth / 2 - 0.05 + zs, 1, 1, 1, Math.PI / 2), false));
+  }
+  // --- wings (shape variants): wall + foundation + roof, garage door / side windows
+  const winAt = (x, z) => {
+    const y = L.winY;
+    unit('winframe', 'trim', x, y, z, L.winW, L.winH, 0.05);
+    unit('glass', 'glass', x, y, z + 0.02, L.glassW, L.glassH, 0.08);
+    unit('mullion', 'trim', x, y, z + 0.06, 0.035, L.glassH, 0.03);
+    unit('mullion', 'trim', x, y, z + 0.06, L.glassW, 0.035, 0.03);
+    unit('sill', 'trim', x, y - L.winH / 2 - 0.03, z + 0.06, L.winW + 0.16, 0.06, 0.16);
+  };
+  (L.wings || []).forEach((g) => {
+    const sh = _blockShell(g.kind, g.w, g.d, g.wh, g.rh, overhang), zF = g.cz + g.d / 2;
+    add('wall', sh.wall, 'facade', _local(g.cx, baseY, g.cz + zs, 1, 1, 1, sh.yaw), true);
+    add('foundation', _boxMod(g.w + 0.2, baseY, g.d + 0.2, g.w / 2, 0.5), 'foundation', _local(g.cx, baseY / 2, g.cz + zs), true);
+    add('roof', sh.roof, 'roof', _local(g.cx, baseY + g.wh, g.cz + zs, 1, 1, 1, sh.yaw), true);
+    if (g.garageDoor) unit('door', 'door', g.cx, baseY + 1.05, zF + 0.03, g.w * 0.8, 2.1, 0.08);
+    else if (g.win) _wingWindowXs(L, g).forEach((x) => winAt(x, zF));
+  });
+  return _shiftParts(list, L);
+}
+
+// ---- 9.7 LOD1..3: UNIT geometry + per-part local matrix ---------------------------------------
+// From LOD1 on the body parts are UNIT boxes / a UNIT gable prism shared by every house of every
+// size; the size is applied by a per-part local matrix. Bucket count is then independent of how many
+// sizes / variants are on the map (only the material varies).
+function _unitBoxGeo(uvx, uvy) { return _boxMod(1, 1, 1, uvx, uvy); }
+function _unitGableGeo(uvx, uvy) {
+  return _geo(`unit|gable|${uvx}x${uvy}`, () => {
+    const shape = new THREE.Shape(); shape.moveTo(-0.5, 0); shape.lineTo(0, 1); shape.lineTo(0.5, 0); shape.lineTo(-0.5, 0);
+    const g = new THREE.ExtrudeGeometry(shape, { depth: 1, bevelEnabled: false, curveSegments: 1 });
+    g.translate(0, 0, -0.5); g.computeVertexNormals(); return _scaleUV(g, uvx, uvy);
+  });
+}
+const _flatRGB = (preset) => { const c = new THREE.Color(FLAT_COLOR[preset] ?? 0xcccccc); return [c.r, c.g, c.b]; };
+
+function _unitParts(arch, lod) {
+  const L = arch.layout, refs = arch.materialRefs, zs = -L.frontExt / 2;
+  const { width, depth, baseY, wallHeight, ridgeHeight } = L;
+  const list = [];
+  const add = (part, g, matInfo, local, tinted, extra) => list.push({ part, geoKey: g.key, geometry: g.geometry, ...matInfo, local, tinted, ...extra });
+  const pbr = (k) => ({ matKey: `pbr:${k}`, material: getSharedPBRMaterial(k) });
+  const facadeMat = lod === 1 ? pbr(refs.facade) : lod === 2 ? { matKey: `lite:${refs.facade}`, material: getSharedLiteMaterial(refs.facade) } : { matKey: 'flat:white', material: _solid(0xffffff, { roughness: 0.9 }) };
+  const roofMat = lod === 1 ? pbr(refs.roof) : lod === 2 ? { matKey: `lite:${refs.roof}`, material: getSharedLiteMaterial(refs.roof) } : { matKey: 'flat:white', material: _solid(0xffffff, { roughness: 0.9 }) };
+  const wallColor = lod === 3 ? { color: _flatRGB(refs.facade) } : null, roofColor = lod === 3 ? { color: _flatRGB(refs.roof) } : null;
+  const ru = _unitRoofSpec(L.roofKind || 'gableZ', width, depth, L.overhang);
+  const roofLocal = _local(0, baseY + wallHeight, zs, ru.sx, ridgeHeight, ru.sz, ru.yaw);
+  if (lod === 1) {
+    add('wall', _unitBoxGeo(2, 1.45), facadeMat, _local(0, baseY + wallHeight / 2, zs, width, wallHeight, depth), true);
+    add('roof', ru.geo, roofMat, roofLocal, true);
+    add('foundation', _unitBoxGeo(2, 0.5), pbr(refs.foundation), _local(0, baseY / 2, zs, width + 0.2, baseY, depth + 0.2), true);
+    if (L.hasPorch) {
+      const p = L.porch;
+      add('deck', _unitBoxGeo(2, 1), pbr(refs.deck), _local(0, baseY + 0.08, depth / 2 + p.depth / 2 + zs, p.width, 0.15, p.depth), true);
+      add('porchroof', _unitBoxGeo(1.5, 1.5), roofMat, _local(0, baseY + 2.4, depth / 2 + p.depth / 2 + zs, Math.min(p.width + 0.3, L.widthCells), 0.12, p.depth + 0.3), true);
+    }
+    if (L.chimney) { const c = _chimneySpec(L); add('chimney', _unitBoxGeo(0.5, 1), pbr(refs.chimney), _local(c.x, baseY + c.chH / 2, c.z + zs, c.cw, c.chH, c.cw), true); }
+    // windows + door: instances of the ONE shared unit box (no size-specific geometry at any LOD)
+    const U = _unitBox(), gm = { matKey: 'glass', material: _glassMaterial() };
+    (L.windowRows || [L.winY]).forEach((wy) => L.windowXs.forEach((x) => add('glass', U, gm, _local(x, wy, depth / 2 + 0.02 + zs, L.glassW, L.glassH, 0.08), false)));
+    add('door', U, { matKey: `flat:${refs.door}`, material: _flatMaterial(refs.door) }, _local(L.doorX, baseY + 0.95, depth / 2 + 0.02 + zs, L.doorW, 1.9, 0.08), false);
+  } else { // LOD2 / LOD3: body reaches the ground (no foundation part), roof, (LOD2) porch roof
+    const h = baseY + wallHeight;
+    add('wall', _unitBoxGeo(2, 1.6), facadeMat, _local(0, h / 2, zs, width, h, depth), true, wallColor);
+    add('roof', ru.geo, roofMat, roofLocal, true, roofColor);
+    if (lod === 2 && L.hasPorch) {
+      const p = L.porch;
+      add('porchroof', _unitBoxGeo(1.5, 1.5), roofMat, _local(0, baseY + 2.4, depth / 2 + p.depth / 2 + zs, Math.min(p.width + 0.3, L.widthCells), 0.12, p.depth + 0.3), true);
+    }
+  }
+  (L.wings || []).forEach((g) => { // shape-variant wings
+    const r2 = _unitRoofSpec(g.kind, g.w, g.d, L.overhang), gh = baseY + g.wh, rl = _local(g.cx, gh, g.cz + zs, r2.sx, g.rh, r2.sz, r2.yaw);
+    if (lod === 1) {
+      add('wall', _unitBoxGeo(2, 1.45), facadeMat, _local(g.cx, baseY + g.wh / 2, g.cz + zs, g.w, g.wh, g.d), true);
+      add('roof', r2.geo, roofMat, rl, true);
+      add('foundation', _unitBoxGeo(2, 0.5), pbr(refs.foundation), _local(g.cx, baseY / 2, g.cz + zs, g.w + 0.2, baseY, g.d + 0.2), true);
+      if (g.garageDoor) add('door', _unitBox(), { matKey: `flat:${refs.door}`, material: _flatMaterial(refs.door) }, _local(g.cx, baseY + 1.05, g.cz + g.d / 2 + 0.02 + zs, g.w * 0.8, 2.1, 0.08), false);
+    } else {
+      add('wall', _unitBoxGeo(2, 1.6), facadeMat, _local(g.cx, gh / 2, g.cz + zs, g.w, gh, g.d), true, wallColor);
+      add('roof', r2.geo, roofMat, rl, true, roofColor);
+    }
+  });
+  return _shiftParts(list, L);
+}
+
+// ---- 9.8 LOT DRESSING: front yard (lawn + path) and the fence / wall around the whole lot ----------------
+// The house record carries yardDepth (metres of lawn between the road and the house, 0 = none). Everything here is
+// expressed in the HOUSE's local frame (origin = house-footprint centre, +Z = entrance/road side) and shares the same
+// instancing path as the house itself, so it costs no THREE object per house:
+//   lawn ..... 1 unit box            path .... 1 unit box           (LOD0-2 / LOD0-1)
+//   fence .... merged picket panel or low masonry wall, keyed by length; posts = the shared unit box   (LOD0)
+//   LOD1 ..... the fence collapses to a few thin boxes; LOD2+ keeps only the lawn.
+// ---- 9.75 Pool water: a shared MeshStandardMaterial with a vertex-shader ripple, so every pool
+// in the city animates from ONE material (no per-house update cost). The uTime uniform is bumped
+// from HouseInstanceRenderer's mesh.onBeforeRender for the 'poolwater' bucket (see there) — nothing
+// in the main render loop needs to know this material exists.
+let _poolWaterMat = null;
+function _poolWaterMaterial() {
+  if (_poolWaterMat) return _poolWaterMat;
+  const mat = new THREE.MeshStandardMaterial({ color: 0x2e86ad, roughness: 0.12, metalness: 0.0, transparent: true, opacity: 0.86 });
+  mat.name = 'house:poolwater';
+  mat.onBeforeCompile = (shader) => {
+    shader.uniforms.uTime = { value: 0 };
+    mat.userData.shader = shader; // HouseInstanceRenderer reads this back to drive the uniform each frame
+    shader.vertexShader = shader.vertexShader
+      .replace('#include <common>', '#include <common>\nuniform float uTime;')
+      .replace('#include <begin_vertex>', '#include <begin_vertex>\n  transformed.y += sin(position.x * 3.1 + uTime * 1.8) * 0.035 + cos(position.z * 2.4 + uTime * 1.3) * 0.03;');
+  };
+  mat.customProgramCacheKey = () => 'poolWaterWave';
+  _poolWaterMat = mat;
+  return mat;
+}
+const YARD_ACCENTS = [0x2e6b3e, 0xb0432e, 0x2a4d7a, 0xc9a227, 0x6b3fa0]; // parasol canopy / cushion colours, picked per archetype seed
+const FENCE_SEG = 2.4; // m max panel length
+const _fencePanelMod = (len, style) => _geo(`fence|${style}|${_q(len)}`, () => {
+  const l = _q(len);
+  if (style === 'wall') return _mergeGeos([_boxAt(l, 0.85, 0.14, 0, 0.425, 0), _boxAt(l + 0.02, 0.06, 0.2, 0, 0.88, 0)]);
+  const list = [_boxAt(l, 0.05, 0.05, 0, 0.32, 0), _boxAt(l, 0.05, 0.05, 0, 0.78, 0)];
+  const n = Math.max(2, Math.round(l / 0.13));
+  for (let i = 0; i < n; i++) list.push(_boxAt(0.07, 0.95, 0.02, -l / 2 + (i + 0.5) * (l / n), 0.475, 0.035));
+  return _mergeGeos(list);
+});
+
+function _lotParts(arch, Y, lod, rear = false) {
+  const L = arch.layout, refs = arch.materialRefs, W = L.widthCells, D = L.depthCells, list = [];
+  const U = _unitBox();
+  const solid = (hex, o) => ({ matKey: `solid:${hex}`, material: _solid(hex, o) });
+  const add = (part, g, mat, local) => list.push({ part, geoKey: g.key, geometry: g.geometry, ...mat, local, tinted: false });
+  const zF = D / 2, zB = -D / 2, zLot = zF + Y;            // lot edges in house-local Z (front edge = road side)
+  add('lawn', U, solid(0x5c8447, { roughness: 0.95 }), _local(0, -0.15, (zB + zLot) / 2, W, 0.36, D + Y)); // whole lot (house is scaled down inside it); top surface at y = +0.03
+  if (lod >= 2) return list;
+
+  const wall = String(refs.facade).startsWith('plaster');   // stucco houses get a low masonry wall, wood houses a picket fence
+  const style = wall ? 'wall' : 'picket';
+  const fenceMat = wall ? solid(FLAT_COLOR[refs.facade] ?? 0xd8d2c4, { roughness: 0.9 }) : solid(refs.trim, { roughness: 0.65 });
+  const xL = -W / 2 + 0.06, xR = W / 2 - 0.06, zBk = zB + 0.06, zFr = zLot - 0.06;
+  // left/right side runs always drawn; the near-house edge (zBk) is only drawn in front-yard mode
+  // (there it closes off the yard behind the house) — in rear mode the house itself is that wall,
+  // so leaving it out is what makes the fence a U-shape open toward the building.
+  const runs = rear ? [[xL, zBk, xL, zFr], [xR, zBk, xR, zFr]] : [[xL, zBk, xL, zFr], [xR, zBk, xR, zFr], [xL, zBk, xR, zBk]];
+  if (rear) {
+    // Private back yard: no street there, so the far/outer edge is one continuous closed run — no gate.
+    runs.push([xL, zFr, xR, zFr]);
+  } else {
+    const gateX = ((L.hasPorch ? 0 : L.doorX) + (L.shiftX || 0)) * HOUSE_SCALE, gate = 0.65;
+    const gaps = [[gateX - gate, gateX + gate]]; // front fence openings: pedestrian gate (+ driveway for garage houses)
+    if (L.garage) { const hgw = L.garage.w * 0.45 * HOUSE_SCALE + 0.1, gx = L.garage.cx * HOUSE_SCALE; gaps.push([gx - hgw, gx + hgw]); }
+    gaps.sort((a, b) => a[0] - b[0]);
+    let fcur = xL;
+    gaps.forEach(([g0, g1]) => { if (g0 - fcur > 0.3) runs.push([fcur, zFr, g0, zFr]); fcur = Math.max(fcur, g1); });
+    if (xR - fcur > 0.3) runs.push([fcur, zFr, xR, zFr]);
   }
 
-  const api = { addHouse, addHouses, removeHouse, updateHouse, setLevel, hasHouse, flushPending, update, getStats, verify, dispose, benchmark, setForcedLod };
-  if (typeof window !== 'undefined') {
-    window.__HOUSE_RENDERER__ = api;
-    window.__HOUSE_BENCH__ = (counts, keep) => { const r = benchmark(counts, lastCamera, keep); console.table(r); return r; };
+  if (lod === 1) { // distant view: one thin board per run
+    runs.forEach(([x0, z0, x1, z1]) => {
+      const len = Math.hypot(x1 - x0, z1 - z0); if (len < 0.3) return;
+      add('fence', U, fenceMat, _local((x0 + x1) / 2, 0.25 * HOUSE_SCALE, (z0 + z1) / 2, z0 === z1 ? len : 0.05, 0.5 * HOUSE_SCALE, z0 === z1 ? 0.05 : len));
+    });
+    return list;
   }
-  return api;
+  const seen = new Set();
+  runs.forEach(([x0, z0, x1, z1]) => {
+    const len = Math.hypot(x1 - x0, z1 - z0); if (len < 0.3) return;
+    const n = Math.max(1, Math.ceil(len / FENCE_SEG)), seg = len / n, yaw = z0 === z1 ? 0 : Math.PI / 2;
+    for (let i = 0; i < n; i++) { const t = (i + 0.5) / n; add('fence', _fencePanelMod(seg, style), fenceMat, _local(x0 + (x1 - x0) * t, 0, z0 + (z1 - z0) * t, 1, HOUSE_SCALE, 1, yaw)); }
+    for (let i = 0; i <= n; i++) {
+      const px = x0 + (x1 - x0) * i / n, pz = z0 + (z1 - z0) * i / n, k = `${px.toFixed(2)}|${pz.toFixed(2)}`;
+      if (seen.has(k)) continue; seen.add(k);
+      add('fencepost', U, fenceMat, _local(px, 0.55 * HOUSE_SCALE, pz, 0.1, 1.1 * HOUSE_SCALE, 0.1));
+    }
+  });
+  if (!rear) {
+    // stone path from the gate to the steps / door — only meaningful when there IS a gate
+    const gateX = ((L.hasPorch ? 0 : L.doorX) + (L.shiftX || 0)) * HOUSE_SCALE;
+    const zStart = (L.depth / 2 + L.frontExt / 2 + (L.shiftZ || 0)) * HOUSE_SCALE, plen = zFr - zStart;
+    if (Y > 0.3 && plen > 0.2) add('path', U, solid(0xb0a999, { roughness: 0.9 }), _local(gateX, -0.005, zStart + plen / 2, 1.0, 0.1, plen));
+    if (L.garage && Y > 0.3) { // driveway from the lot edge to the garage door
+      const g = L.garage, gz = g.zf * HOUSE_SCALE, dl = zFr - gz;
+      if (dl > 0.2) add('path', U, solid(0x8b857a, { roughness: 0.9 }), _local(g.cx * HOUSE_SCALE, -0.005, gz + dl / 2, g.w * 0.85 * HOUSE_SCALE, 0.1, dl));
+    }
+  }
+  // --- yard furniture (private rear yards only, e.g. terrace houses): a parasol+table+chairs set,
+  // a small pool with loungers, or a bistro set for narrower yards — picked deterministically from
+  // the archetype's seed so the ~20 terrace variants show a handful of different yards rather than
+  // one furniture layout repeated on every block. LOD0 only (small decorative detail).
+  if (rear && lod === 0) {
+    const yz0 = zF + 0.5, yz1 = zLot - 0.4, yzLen = yz1 - yz0, yzc = (yz0 + yz1) / 2;
+    if (yzLen > 1.3) {
+      const accent = solid(YARD_ACCENTS[(arch.seed || 0) % YARD_ACCENTS.length], { roughness: 0.75 });
+      const woodMat = solid(0x6b5334, { roughness: 0.7 });
+      const metalMat = solid(0x3d3d3d, { roughness: 0.5 });
+      const pattern = (arch.seed || 0) % 3;
+      if (pattern === 1 && yzLen > 1.8 && W > 2.2) {
+        // small pool + 2 loungers either side
+        const pw = Math.min(2.0, W - 0.8), pd = Math.min(1.3, yzLen - 0.6);
+        add('pool', U, solid(0xd8e0dc, { roughness: 0.85 }), _local(0, -0.16, yzc, pw + 0.2, 0.32, pd + 0.2));
+        add('poolwater', U, _poolWaterMaterial(), _local(0, -0.04, yzc, pw, 0.08, pd));
+        [-1, 1].forEach((s) => {
+          add('furniture', U, solid(0xe6e2d8, { roughness: 0.8 }), _local(s * (pw / 2 + 0.55), 0.1, yzc, 0.55, 0.16, 1.5));
+          add('furniture', U, accent, _local(s * (pw / 2 + 0.55), 0.32, yzc - 0.6, 0.5, 0.35, 0.07));
+        });
+      } else if (pattern === 2) {
+        // compact bistro set: small table + 2 chairs (fits narrower yards)
+        add('furniture', U, woodMat, _local(0, 0.36, yzc, 0.05, 0.72, 0.05));
+        add('furniture', U, woodMat, _local(0, 0.74, yzc, 0.55, 0.04, 0.55));
+        [-0.5, 0.5].forEach((nz) => add('furniture', U, metalMat, _local(0, 0.22, yzc + nz, 0.38, 0.44, 0.38)));
+      } else {
+        // parasol + table + 4 chairs
+        const poleH = 1.9;
+        add('furniture', U, metalMat, _local(0, poleH / 2, yzc, 0.055, poleH, 0.055));
+        add('furniture', U, accent, _local(0, poleH + 0.06, yzc, 1.6, 0.07, 1.6));
+        add('furniture', U, woodMat, _local(0, 0.74, yzc, 0.85, 0.04, 0.85));
+        [[0, -1], [0, 1], [-1, 0], [1, 0]].forEach(([nx, nz]) => {
+          const r = 0.68, sx = nx * r, sz = yzc + nz * r;
+          add('furniture', U, metalMat, _local(sx, 0.22, sz, 0.4, 0.42, 0.4));
+          const bw = nx !== 0 ? 0.05 : 0.38, bd = nx !== 0 ? 0.38 : 0.05;
+          add('furniture', U, metalMat, _local(sx + nx * 0.18, 0.48, sz + nz * 0.18, bw, 0.3, bd));
+        });
+      }
+    }
+  }
+  return list;
+}
+/** Lot dressing (yard + fence) for an archetype: cached per (yardDepth, rear, LOD). Same part shape as getHouseLodParts.
+ * rear=true draws a closed U-shaped fence open toward the house (for a private back yard, e.g. terrace houses);
+ * rear=false (default) draws the original front-yard fence with a pedestrian gate facing the road. */
+export function getHouseLotParts(arch, yardDepth, lod, rear = false) {
+  if (!(yardDepth >= 0)) return [];
+  const key = `${lod}|${_q(yardDepth)}|${rear ? 'rear' : 'front'}`;
+  if (!arch._lotParts) arch._lotParts = new Map();
+  let l = arch._lotParts.get(key);
+  if (!l) { l = _lotParts(arch, yardDepth, lod, rear); arch._lotParts.set(key, l); }
+  return l;
+}
+
+/** Renderable module instances of an archetype at one LOD (cached on the archetype). */
+export function getHouseLodParts(arch, lod) {
+  if (arch._lodParts[lod]) return arch._lodParts[lod];
+  return (arch._lodParts[lod] = lod === 0 ? _lod0Parts(arch) : _unitParts(arch, lod));
+}
+/** Build + cache every LOD of one archetype (call ahead of a bulk placement so no frame pays for it). */
+export function prewarmHouseArchetype(arch, lods = [0, 1, 2, 3]) { lods.forEach((l) => getHouseLodParts(arch, l)); return arch; }
+
+export function getHouseGeometryStats() {
+  const kinds = {};
+  HOUSE_GEOMETRY_CACHE.forEach((_, k) => { const t = k.split('|')[0]; kinds[t] = (kinds[t] || 0) + 1; });
+  return {
+    geometryCount: HOUSE_GEOMETRY_CACHE.size, archetypeCount: HOUSE_ARCHETYPES.size, baseDesignCount: HOUSE_ARCHETYPE_BASES.size,
+    geometryHit: HOUSE_STATS.geometryHit, geometryMiss: HOUSE_STATS.geometryMiss, geometryCreated: HOUSE_STATS.geometryCreated,
+    geometryCreateMs: +HOUSE_STATS.geometryCreateMs.toFixed(3), geometryKinds: kinds,
+  };
 }
