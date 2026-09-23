@@ -1178,14 +1178,14 @@ function _terraceMaterialDefaults(facadeMaterial) {
   return { trimColor: 0xf2ede2, foundationMaterial: 'concrete' }; // concrete / concreteRock
 }
 function _terraceLayout(config) {
-  const overhang = 0.18; // thin eave under the parapet coping — front/back only, see width note below
-  // width = the side-to-side axis, i.e. the shared party-wall faces between this house and its
-  // neighbours in the row. Only a hairline tolerance is subtracted (never the eave overhang) so
-  // the walls sit flush with zero visible gap. depth (front/back, road-facing) still gets the full
-  // eave inset since nothing touches there.
+  const overhang = 0.18; // roof eave / parapet coping overhang — purely a visual projection PAST the wall now, never a wall inset
+  // Prompt: the house fills its ENTIRE 3x3 front cell — both the width (party-wall sides, shared
+  // with the neighbouring house) and the depth (front/back) get only a hairline tolerance, not the
+  // old eave-based inset. The roof/coping overhang below still projects a bit past these walls for
+  // the architectural detail; it just no longer shrinks the walls themselves.
   const partyGap = 0.02; // m — sub-visual tolerance, just enough to avoid z-fighting between lots
   const width = Math.max(1.6, config.widthCells - partyGap);
-  const depth = Math.max(1.6, config.depthCells - 2 * overhang - 0.06);
+  const depth = Math.max(1.6, config.depthCells - partyGap);
   const floors = config.floors || 3, floorH = 2.9, wallHeight = floorH * floors, baseY = 0.35;
   const ridgeHeight = 0.4; // flat roof slab thickness (parapet trim is added on top of this in _lod0Parts)
   const winW = Math.min(0.7, width * 0.28), winH = Math.min(1.1, floorH * 0.42);
@@ -1412,7 +1412,7 @@ const _fencePanelMod = (len, style) => _geo(`fence|${style}|${_q(len)}`, () => {
   return _mergeGeos(list);
 });
 
-function _lotParts(arch, Y, lod) {
+function _lotParts(arch, Y, lod, rear = false) {
   const L = arch.layout, refs = arch.materialRefs, W = L.widthCells, D = L.depthCells, list = [];
   const U = _unitBox();
   const solid = (hex, o) => ({ matKey: `solid:${hex}`, material: _solid(hex, o) });
@@ -1425,14 +1425,22 @@ function _lotParts(arch, Y, lod) {
   const style = wall ? 'wall' : 'picket';
   const fenceMat = wall ? solid(FLAT_COLOR[refs.facade] ?? 0xd8d2c4, { roughness: 0.9 }) : solid(refs.trim, { roughness: 0.65 });
   const xL = -W / 2 + 0.06, xR = W / 2 - 0.06, zBk = zB + 0.06, zFr = zLot - 0.06;
-  const gateX = ((L.hasPorch ? 0 : L.doorX) + (L.shiftX || 0)) * HOUSE_SCALE, gate = 0.65;
-  const runs = [[xL, zBk, xL, zFr], [xR, zBk, xR, zFr], [xL, zBk, xR, zBk]];
-  const gaps = [[gateX - gate, gateX + gate]]; // front fence openings: pedestrian gate (+ driveway for garage houses)
-  if (L.garage) { const hgw = L.garage.w * 0.45 * HOUSE_SCALE + 0.1, gx = L.garage.cx * HOUSE_SCALE; gaps.push([gx - hgw, gx + hgw]); }
-  gaps.sort((a, b) => a[0] - b[0]);
-  let fcur = xL;
-  gaps.forEach(([g0, g1]) => { if (g0 - fcur > 0.3) runs.push([fcur, zFr, g0, zFr]); fcur = Math.max(fcur, g1); });
-  if (xR - fcur > 0.3) runs.push([fcur, zFr, xR, zFr]);
+  // left/right side runs always drawn; the near-house edge (zBk) is only drawn in front-yard mode
+  // (there it closes off the yard behind the house) — in rear mode the house itself is that wall,
+  // so leaving it out is what makes the fence a U-shape open toward the building.
+  const runs = rear ? [[xL, zBk, xL, zFr], [xR, zBk, xR, zFr]] : [[xL, zBk, xL, zFr], [xR, zBk, xR, zFr], [xL, zBk, xR, zBk]];
+  if (rear) {
+    // Private back yard: no street there, so the far/outer edge is one continuous closed run — no gate.
+    runs.push([xL, zFr, xR, zFr]);
+  } else {
+    const gateX = ((L.hasPorch ? 0 : L.doorX) + (L.shiftX || 0)) * HOUSE_SCALE, gate = 0.65;
+    const gaps = [[gateX - gate, gateX + gate]]; // front fence openings: pedestrian gate (+ driveway for garage houses)
+    if (L.garage) { const hgw = L.garage.w * 0.45 * HOUSE_SCALE + 0.1, gx = L.garage.cx * HOUSE_SCALE; gaps.push([gx - hgw, gx + hgw]); }
+    gaps.sort((a, b) => a[0] - b[0]);
+    let fcur = xL;
+    gaps.forEach(([g0, g1]) => { if (g0 - fcur > 0.3) runs.push([fcur, zFr, g0, zFr]); fcur = Math.max(fcur, g1); });
+    if (xR - fcur > 0.3) runs.push([fcur, zFr, xR, zFr]);
+  }
 
   if (lod === 1) { // distant view: one thin board per run
     runs.forEach(([x0, z0, x1, z1]) => {
@@ -1452,22 +1460,27 @@ function _lotParts(arch, Y, lod) {
       add('fencepost', U, fenceMat, _local(px, 0.55 * HOUSE_SCALE, pz, 0.1, 1.1 * HOUSE_SCALE, 0.1));
     }
   });
-  // stone path from the gate to the steps / door
-  const zStart = (L.depth / 2 + L.frontExt / 2 + (L.shiftZ || 0)) * HOUSE_SCALE, plen = zFr - zStart;
-  if (Y > 0.3 && plen > 0.2) add('path', U, solid(0xb0a999, { roughness: 0.9 }), _local(gateX, -0.005, zStart + plen / 2, 1.0, 0.1, plen));
-  if (L.garage && Y > 0.3) { // driveway from the lot edge to the garage door
-    const g = L.garage, gz = g.zf * HOUSE_SCALE, dl = zFr - gz;
-    if (dl > 0.2) add('path', U, solid(0x8b857a, { roughness: 0.9 }), _local(g.cx * HOUSE_SCALE, -0.005, gz + dl / 2, g.w * 0.85 * HOUSE_SCALE, 0.1, dl));
+  if (!rear) {
+    // stone path from the gate to the steps / door — only meaningful when there IS a gate
+    const gateX = ((L.hasPorch ? 0 : L.doorX) + (L.shiftX || 0)) * HOUSE_SCALE;
+    const zStart = (L.depth / 2 + L.frontExt / 2 + (L.shiftZ || 0)) * HOUSE_SCALE, plen = zFr - zStart;
+    if (Y > 0.3 && plen > 0.2) add('path', U, solid(0xb0a999, { roughness: 0.9 }), _local(gateX, -0.005, zStart + plen / 2, 1.0, 0.1, plen));
+    if (L.garage && Y > 0.3) { // driveway from the lot edge to the garage door
+      const g = L.garage, gz = g.zf * HOUSE_SCALE, dl = zFr - gz;
+      if (dl > 0.2) add('path', U, solid(0x8b857a, { roughness: 0.9 }), _local(g.cx * HOUSE_SCALE, -0.005, gz + dl / 2, g.w * 0.85 * HOUSE_SCALE, 0.1, dl));
+    }
   }
   return list;
 }
-/** Lot dressing (yard + fence) for an archetype: cached per (yardDepth, LOD). Same part shape as getHouseLodParts. */
-export function getHouseLotParts(arch, yardDepth, lod) {
+/** Lot dressing (yard + fence) for an archetype: cached per (yardDepth, rear, LOD). Same part shape as getHouseLodParts.
+ * rear=true draws a closed U-shaped fence open toward the house (for a private back yard, e.g. terrace houses);
+ * rear=false (default) draws the original front-yard fence with a pedestrian gate facing the road. */
+export function getHouseLotParts(arch, yardDepth, lod, rear = false) {
   if (!(yardDepth >= 0)) return [];
-  const key = `${lod}|${_q(yardDepth)}`;
+  const key = `${lod}|${_q(yardDepth)}|${rear ? 'rear' : 'front'}`;
   if (!arch._lotParts) arch._lotParts = new Map();
   let l = arch._lotParts.get(key);
-  if (!l) { l = _lotParts(arch, yardDepth, lod); arch._lotParts.set(key, l); }
+  if (!l) { l = _lotParts(arch, yardDepth, lod, rear); arch._lotParts.set(key, l); }
   return l;
 }
 

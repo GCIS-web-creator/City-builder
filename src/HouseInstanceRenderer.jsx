@@ -163,7 +163,7 @@ export function createHouseInstanceRenderer(scene) {
       h.insts.push(_bucketAdd(b, h, m, c));
     }
     if (h.yardDepth >= 0) { // lot dressing: front yard + fence/wall around the whole lot (same shared-geometry instancing)
-      for (const p of getHouseLotParts(h.arch, h.yardDepth, lod)) {
+      for (const p of getHouseLotParts(h.arch, h.yardDepth, lod, h.yardRear)) {
         const b = _bucket(sector, lod, p.geoKey, p.geometry, p.matKey, p.material, p.part, false, RECV[lod][p.part], false);
         h.insts.push(_bucketAdd(b, h, _tm.multiplyMatrices(h.lotMatrix, p.local), _WHITE));
       }
@@ -221,6 +221,7 @@ export function createHouseInstanceRenderer(scene) {
     h.features = arch.features;
     h.yardDepth = rec.yardDepth == null ? -1 : rec.yardDepth; // -1 = no lot dressing (legacy records); >= 0 = yard depth in metres (fence always drawn)
     h.yardSign = rec.yardSign < 0 ? -1 : 1;
+    h.yardRear = !!rec.yardRear; // true = closed U-shaped fence open toward the house (private back yard); false = front-yard fence with a road-facing gate
     _composeMatrices(h);
     return h;
   }
@@ -346,7 +347,7 @@ export function createHouseInstanceRenderer(scene) {
     let bad = 0; const m = new THREE.Matrix4();
     houses.forEach((h) => {
       if (!h.placed) return;
-      const body = getHouseLodParts(h.arch, h.lod), lot = h.yardDepth >= 0 ? getHouseLotParts(h.arch, h.yardDepth, h.lod) : [];
+      const body = getHouseLodParts(h.arch, h.lod), lot = h.yardDepth >= 0 ? getHouseLotParts(h.arch, h.yardDepth, h.lod, h.yardRear) : [];
       if (h.insts.length !== body.length + lot.length) bad++;
       h.insts.forEach((inst, i) => {
         if (inst.b.owners[inst.slot] !== inst || inst.slot >= inst.b.count || inst.house !== h) { bad++; return; }

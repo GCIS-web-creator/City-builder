@@ -12003,8 +12003,10 @@ export default function CityGridIso() {
       // house (lot.yardDepth, from computeTerraceFootprint via finalizeLot) is real reserved space
       // and should be drawn — lawn + fence, exactly like res_low's dressing — just on the back
       // side of the house instead of the front (yardSign:-1 tells HouseInstanceRenderer to draw it
-      // behind the house's local +Z front rather than in front of it).
-      yardDepth: lot.yardDepth != null && lot.yardDepth > 0 ? lot.yardDepth : 3, yardSign: -1,
+      // behind the house's local +Z front rather than in front of it). yardRear:true switches the
+      // fence shape too: closed on the far/outer side (no gate — there's no street back there) and
+      // open on the house-facing side (the house itself is that 4th wall).
+      yardDepth: lot.yardDepth != null && lot.yardDepth > 0 ? lot.yardDepth : 3, yardSign: -1, yardRear: true,
       skirt: needSkirt ? { height: grading.foundationHeight + (isRetaining ? 0.3 : 0.05), retaining: isRetaining, width: w * 0.97, depth: d * 0.97, yaw: lot.rotation || 0 } : null,
     };
     if (lot.renderHandle != null && hr.hasHouse(lot.renderHandle)) hr.updateHouse(record);
