@@ -1,6 +1,6 @@
 import React, { useRef, useEffect, useState, useCallback, useMemo } from 'react';
 import * as THREE from 'three';
-import { buildTerraceHouse, getTerraceHouseConfig, TERRACE_HOUSES, buildLowDensityHouseForCell, getHouseArchetype } from './HousingPBR.jsx';
+import { buildTerraceHouse, getTerraceHouseConfig, TERRACE_HOUSES, buildLowDensityHouseForCell, getHouseArchetype, getTerraceArchetype, TERRACE_ARCHETYPE_COUNT } from './HousingPBR.jsx';
 // Prompt 24A: res_low Roadside-Plot houses are drawn by ONE shared InstancedMesh renderer (no per-house Group).
 import { createHouseInstanceRenderer } from './HouseInstanceRenderer.jsx';
 const HOUSE_RENDERER_IS_DEV = (() => { try { return !!(import.meta && import.meta.env && import.meta.env.DEV); } catch (e) { return false; } })();
@@ -651,9 +651,16 @@ function getRoadLayout(rt) {
   // inside it.
   const medianHalfWidth = rt.median ? Math.max(TILE * 0.05, Math.min(rhw * 0.24, TILE * 0.16)) : 0;
   const carriagewayWidth = Math.max(0.01, rhw - medianHalfWidth);
+  // Prompt 36: reserve a sliver of the carriageway as an outer shoulder BEFORE splitting it into
+  // lanes. Without this, whenever carriagewayWidth/lanesPerSide < STANDARD_LANE_WIDTH (this was
+  // true for four/four_median/highway/eight_median/highway_8), laneWidth below filled the
+  // carriageway edge-to-edge and the outermost lane's paint ended up flush against rhw/curbHalf —
+  // rendered squashed against the pavement edge, i.e. the "outermost lane is almost missing" bug.
+  const outerShoulder = Math.min(TILE * 0.07, carriagewayWidth * 0.1);
+  const usableWidth = Math.max(0.01, carriagewayWidth - outerShoulder);
   // fixed per-lane width, never wider than what the carriageway can actually fit (guards against
   // a pathologically narrow custom road type) — the rest of the carriageway becomes shoulder.
-  const laneWidth = Math.min(STANDARD_LANE_WIDTH, carriagewayWidth / lanesPerSide);
+  const laneWidth = Math.min(STANDARD_LANE_WIDTH, usableWidth / lanesPerSide);
   const laneCenters = [];
   for (let k = 0; k < lanesPerSide; k++) laneCenters.push(medianHalfWidth + laneWidth * (k + 0.5));
   // laneDividers[i] = the boundary between laneCenters[i] and laneCenters[i+1] — computed
@@ -6161,11 +6168,12 @@ function unregisterBuildingRecord(registryMap, tileIndexMap, id, gridSize = GRID
 
 function clampLotSize(type, rawW, rawH) {
   if (type === 'res_terrace') {
-    // Standard terrace lot is always exactly ONE fixed unit: 6m wide (frontage) x 12m deep — a
-    // FIXED World Space size, not "1 Tile x 2 Tiles". The drag direction only picks a starting
-    // guess for which axis is narrow; the real road-facing side is re-checked/auto-corrected
-    // against both road systems in pickTerraceOrientation.
-    return rawW >= rawH ? { w: TILE * 2, h: TILE } : { w: TILE, h: TILE * 2 };
+    // Prompt: was forced to TILE multiples (12m x 6m, "1 Tile x 2 Tiles") — now a FIXED 3m x 6m
+    // World Space footprint, same continuous-meter convention low-density lots already use
+    // (building occupies the front 3x3m; the back 3x3m is the private yard/terrace — see
+    // syncTerraceHouseInstance's yardDepth:3, yardSign:-1 below). The drag direction only picks
+    // which axis is the 6m one; pickTerraceOrientation still re-checks the real road-facing side.
+    return rawW >= rawH ? { w: 6, h: 3 } : { w: 3, h: 6 };
   }
   // Free World Space footprint, in meters — deliberately NEVER rounded/forced to a Tile (TILE=6)
   // multiple, so sizes like 8x8 / 4x8 / 8x4 / 3x6 / 6x12 / 12x4 are all valid continuous sizes.
@@ -11802,7 +11810,7 @@ export default function CityGridIso() {
   // whichever orientation is clear at all) if neither/both look equally good.
   const pickTerraceOrientation = useCallback((ax, az, cx, cz) => {
     const dxAbs = Math.abs(cx - ax), dzAbs = Math.abs(cz - az);
-    const primary = dxAbs >= dzAbs ? { w: TILE * 2, h: TILE } : { w: TILE, h: TILE * 2 };
+    const primary = dxAbs >= dzAbs ? { w: 6, h: 3 } : { w: 3, h: 6 };
     const alt = { w: primary.h, h: primary.w };
     const tryOrientation = (dims) => {
       const x0 = cx >= ax ? ax : ax - dims.w;
@@ -11865,6 +11873,41 @@ export default function CityGridIso() {
     return true;
   }, []);
 
+  // Prompt: res_terrace house visual = an INSTANCE in the shared HouseInstanceRenderer, exactly like
+  // res_low above — replaces the old per-lot buildTerraceHouse() THREE.Group (unique geometry per
+  // house, scaled non-uniformly to whatever footprint the player dragged). The lot is now a FIXED
+  // 3m x 6m footprint (see clampLotSize): the archetype itself is a fixed 3x3m building (see
+  // getTerraceArchetype in HousingPBR.jsx), and yardDepth:3 fills the remaining 3x3m as a private
+  // yard/terrace — yardSign:-1 puts that yard BEHIND the house instead of res_low's front-lawn side.
+  const syncTerraceHouseInstance = useCallback((lot, t) => {
+    const hr = t.houseRenderer;
+    if (!hr || lot.type !== 'res_terrace' || !(lot.level > 0)) return false;
+    const w = lot.footprint.width, d = lot.footprint.depth;
+    const grading = computeBuildingGrading(lot.position.x, lot.position.z, w, d, lot.rotation || 0);
+    lot.grading = grading;
+    lot.position.y = grading.baseY;
+    const isRetaining = grading.strategy === 'retaining_wall';
+    const needSkirt = grading.strategy !== 'flat' && grading.foundationHeight > 0.05;
+    const variantIndex = ((lot.id % TERRACE_ARCHETYPE_COUNT) + TERRACE_ARCHETYPE_COUNT) % TERRACE_ARCHETYPE_COUNT;
+    const record = {
+      id: lot.id,
+      archetype: getTerraceArchetype(variantIndex), // full archetype object (has .id) -> HouseInstanceRenderer uses it as-is, no getHouseArchetype lookup involved
+      position: { x: lot.position.x, y: grading.baseY, z: lot.position.z },
+      rotationY: (lot.rotation || 0) + ((lot.frontSign ?? -1) < 0 ? Math.PI : 0),
+      scale: 1, level: lot.level, seed: lot.id,
+      yardDepth: 3, yardSign: -1, // fixed 3x3m back yard/terrace
+      skirt: needSkirt ? { height: grading.foundationHeight + (isRetaining ? 0.3 : 0.05), retaining: isRetaining, width: w * 0.97, depth: d * 0.97, yaw: lot.rotation || 0 } : null,
+    };
+    if (lot.renderHandle != null && hr.hasHouse(lot.renderHandle)) hr.updateHouse(record);
+    else lot.renderHandle = hr.addHouse(record, { immediate: true });
+    if (lot.group) {
+      t.scene.remove(lot.group);
+      lot.group.traverse((o) => { if (o.geometry) o.geometry.dispose(); if (o.material) { const mats = Array.isArray(o.material) ? o.material : [o.material]; mats.forEach((m) => m.dispose()); } });
+      lot.group = null;
+    }
+    return true;
+  }, []);
+
   const rebuildLotGroup = useCallback((lot) => {
     const t = threeRef.current; if (!t) return;
     if (lot.type === 'res_low' && lot.level > 0 && t.houseRenderer) {
@@ -11873,6 +11916,13 @@ export default function CityGridIso() {
         // Development-only fallback to the legacy per-house Group path; production never silently falls back.
         if (!HOUSE_RENDERER_IS_DEV || !isLowDensityHouseSizeAvailableForLot(lot)) throw err;
         console.warn('[HouseInstanceRenderer] falling back to legacy Group (dev only):', err);
+      }
+    }
+    if (lot.type === 'res_terrace' && lot.level > 0 && t.houseRenderer) {
+      try { if (syncTerraceHouseInstance(lot, t)) return; }
+      catch (err) {
+        if (!HOUSE_RENDERER_IS_DEV) throw err;
+        console.warn('[HouseInstanceRenderer] terrace falling back to legacy Group (dev only):', err);
       }
     }
     if (lot.renderHandle != null && t.houseRenderer) { t.houseRenderer.removeHouse(lot.renderHandle); lot.renderHandle = null; }
@@ -16791,7 +16841,15 @@ export default function CityGridIso() {
               { dx: 1, dz: 1, axis: 'ns' }, { dx: -1, dz: 1, axis: 'ew' },
             ];
             corners.forEach(({ dx, dz, axis }) => {
-              dummy.position.set(wx + dx * poleOff, terrainHeight(wx + dx * poleOff, wz + dz * poleOff) + ROAD_TOP_Y, wz + dz * poleOff); dummy.rotation.set(0, 0, 0); dummy.scale.set(1, 1, 1); dummy.updateMatrix();
+              // Prompt 36: face each head toward the traffic lane it actually governs instead of
+              // leaving every corner at rotation 0 (which made all 4 heads point the same way and
+              // made it impossible to tell which light belonged to which direction). 'ns' heads
+              // use the same base orientation the straight N-S road texture uses (rotY=0), 'ew'
+              // heads use the E-W orientation (rotY=PI/2) — matching isEW's convention above —
+              // and the two corners sharing an axis are additionally flipped 180 deg from each
+              // other so the pair faces opposite approaches rather than being duplicates.
+              const signalRotY = (axis === 'ew' ? Math.PI / 2 : 0) + ((axis === 'ew' ? dx : dz) > 0 ? Math.PI : 0);
+              dummy.position.set(wx + dx * poleOff, terrainHeight(wx + dx * poleOff, wz + dz * poleOff) + ROAD_TOP_Y, wz + dz * poleOff); dummy.rotation.set(0, signalRotY, 0); dummy.scale.set(1, 1, 1); dummy.updateMatrix();
               signalPoleMesh.setMatrixAt(signalPoleCount++, dummy.matrix);
               signalHousingMesh.setMatrixAt(signalHousingCount++, dummy.matrix);
               if (axis === 'ns') {

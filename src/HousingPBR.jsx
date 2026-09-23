@@ -465,6 +465,8 @@ export function buildTerraceHouse(config) {
   const facadeMat = getPBRMaterial(config.facadeMaterial, { repeatX: width / 1.5, repeatY: wallHeight / 1.5 });
   const accentMat = config.accentMaterial ? getPBRMaterial(config.accentMaterial, { repeatX: width / 1.5, repeatY: 1 }) : null;
   const roofMat = getPBRMaterial(config.roofMaterial, { repeatX: width / 1.5, repeatY: depth / 3 });
+  const trimMat = getSolidMaterial(0xe4ddc9, { roughness: 0.55 });
+  const glassMat = getSolidMaterial(0x1c2733, { roughness: 0.12, metalness: 0.15 });
 
   // 正面壁
   const frontWall = new THREE.Mesh(new THREE.BoxGeometry(width, wallHeight, 0.25), facadeMat);
@@ -476,6 +478,27 @@ export function buildTerraceHouse(config) {
     const skirt = new THREE.Mesh(new THREE.BoxGeometry(width + 0.02, floorHeight * 0.9, 0.27), accentMat);
     skirt.position.set(0, floorHeight * 0.45, depth / 2);
     group.add(skirt);
+  }
+
+  // 正面窓（各階2つ、フレーム+マリオン+ガラス — 参考写真のように個々の窓が見えるように）
+  const winW = 0.62, winH = floorHeight * 0.46, winXs = [-width * 0.24, width * 0.24];
+  for (let f = 1; f < config.floors; f++) { // 1階(玄関のある階)は窓なし、2階以上に配置
+    const wy = floorHeight * f + floorHeight * 0.52;
+    winXs.forEach((wx) => {
+      group.add(new THREE.Mesh(new THREE.BoxGeometry(winW + 0.1, winH + 0.1, 0.06), trimMat).translateX(wx).translateY(wy).translateZ(depth / 2 + 0.03));
+      group.add(new THREE.Mesh(new THREE.BoxGeometry(winW, winH, 0.05), glassMat).translateX(wx).translateY(wy).translateZ(depth / 2 + 0.06));
+      group.add(new THREE.Mesh(new THREE.BoxGeometry(winW, 0.035, 0.03), trimMat).translateX(wx).translateY(wy).translateZ(depth / 2 + 0.09)); // 中桟(横)
+      group.add(new THREE.Mesh(new THREE.BoxGeometry(0.035, winH, 0.03), trimMat).translateX(wx).translateY(wy).translateZ(depth / 2 + 0.09)); // 中桟(縦)
+      group.add(new THREE.Mesh(new THREE.BoxGeometry(winW + 0.2, 0.06, 0.16), trimMat).translateX(wx).translateY(wy - winH / 2 - 0.05).translateZ(depth / 2 + 0.09)); // 窓台
+    });
+  }
+  // 最上階バルコニー（id基準で決定的に約1/3の棟に付与 — 参考写真の凹凸あるファサードを再現）
+  const hasBalcony = (config.seed % 3) === 0 && config.floors >= 3;
+  if (hasBalcony) {
+    const by = floorHeight * (config.floors - 1) + 0.05, bz = depth / 2 + 0.5;
+    group.add(new THREE.Mesh(new THREE.BoxGeometry(1.7, 0.08, 0.85), trimMat).translateY(by).translateZ(bz));
+    [-0.78, 0.78].forEach((rx) => group.add(new THREE.Mesh(new THREE.BoxGeometry(0.05, 0.85, 0.85), trimMat).translateX(rx).translateY(by + 0.44).translateZ(bz)));
+    group.add(new THREE.Mesh(new THREE.BoxGeometry(1.7, 0.85, 0.05), trimMat).translateY(by + 0.44).translateZ(bz + 0.4));
   }
 
   // 背面壁
@@ -509,6 +532,11 @@ export function buildTerraceHouse(config) {
       seg.position.set(px, wallHeight + parapetH / 2, pz);
       group.add(seg);
     });
+    // 笠木（パラペット天端のコーニス — 屋根の輪郭を強調し、参考写真の白い縁取りを再現）
+    const copingMat = getSolidMaterial(0xede7d6, { roughness: 0.4 });
+    [[0, depth / 2, width + 0.16, 0.14], [0, -depth / 2, width + 0.16, 0.14], [width / 2, 0, 0.14, depth + 0.16], [-width / 2, 0, 0.14, depth + 0.16]].forEach(([px, pz, dx, dz]) => {
+      group.add(new THREE.Mesh(new THREE.BoxGeometry(dx, 0.06, dz), copingMat).translateX(px).translateY(wallHeight + parapetH + 0.03).translateZ(pz));
+    });
     roofTopY = wallHeight + 0.3;
   } else if (config.roofStyle === 'mansard') {
     const mansardH = wallHeight * 0.28;
@@ -529,6 +557,9 @@ export function buildTerraceHouse(config) {
   const door = new THREE.Mesh(new THREE.BoxGeometry(0.85, 1.95, 0.08), getSolidMaterial(0x2c1d12));
   door.position.set(0, stoopH + 0.975, depth / 2 + 0.05);
   group.add(door);
+  // ドア枠 + トランサム窓（参考写真の玄関まわりの縁取りを再現）
+  group.add(new THREE.Mesh(new THREE.BoxGeometry(1.0, 2.25, 0.1), trimMat).translateY(stoopH + 1.1).translateZ(depth / 2 + 0.02));
+  group.add(new THREE.Mesh(new THREE.BoxGeometry(0.85, 0.2, 0.04), glassMat).translateY(stoopH + 2.08).translateZ(depth / 2 + 0.07));
 
   const stepMat = getPBRMaterial('stoneRough', { repeatX: 1, repeatY: 1 });
   for (let s = 0; s < config.stoopSteps; s++) {
@@ -580,6 +611,13 @@ export function buildTerraceHouse(config) {
       group.add(box);
     }
   });
+  // 屋上の緑（フラットルーフの棟にだけ、参考写真のような植栽/木を1〜2本追加）
+  if (config.roofStyle === 'flatParapet') {
+    const leafMat = getSolidMaterial(0x3f6b3a, { roughness: 0.9 }), trunkMat = getSolidMaterial(0x4a3222);
+    const tx = width / 4 * (config.seed % 2 === 0 ? 1 : -1);
+    group.add(new THREE.Mesh(new THREE.CylinderGeometry(0.04, 0.04, 0.5, 6), trunkMat).translateX(tx).translateY(roofTopY + 0.25).translateZ(depth / 4));
+    group.add(new THREE.Mesh(new THREE.SphereGeometry(0.32, 8, 6), leafMat).translateX(tx).translateY(roofTopY + 0.62).translateZ(depth / 4));
+  }
 
   group.userData.houseConfig = config;
   return group;
@@ -984,16 +1022,24 @@ function _hipGeometry(hw, hd, ridge, r) { // eave rectangle +-hw x +-hd at y=0, 
 }
 const _hipRoofMod = (w, d, rh, ov) => _geo(`hip|${_q(w)}x${_q(d)}|${_q(rh)}|${_q(ov)}`, () => _hipGeometry(w / 2 + ov, d / 2 + ov, rh, 1 / ROOF_TILE_M));
 const _unitHipGeo = (uv) => _geo(`unit|hip|${uv}`, () => { const g = _hipGeometry(0.5, 0.25, 1, uv); g.scale(1, 1, 2); g.computeVertexNormals(); return g; });
+function _unitFlatGeo(uvx, uvy) { // base at y=0 (not centered) so it drops into the same topY placement as the gable/hip unit roofs
+  return _geo(`unit|flat|${uvx}x${uvy}`, () => { const g = new THREE.BoxGeometry(1, 1, 1); g.translate(0, 0.5, 0); return _scaleUV(g, uvx, uvy); });
+}
 function _unitRoofSpec(kind, w, d, ov) { // unit roof geometry + scale/yaw for LOD1..3
   const a = w + 2 * ov, b = d + 2 * ov;
   if (kind === 'gableX') return { geo: _unitGableGeo(1.5, 1.5), sx: b, sz: a, yaw: Math.PI / 2 };
   if (kind === 'hip') return a >= b ? { geo: _unitHipGeo(1.5), sx: a, sz: b, yaw: 0 } : { geo: _unitHipGeo(1.5), sx: b, sz: a, yaw: Math.PI / 2 };
+  if (kind === 'flat') return { geo: _unitFlatGeo(1.5, 1.5), sx: a, sz: b, yaw: 0 };
   return { geo: _unitGableGeo(1.5, 1.5), sx: a, sz: b, yaw: 0 };
 }
 function _blockShell(kind, w, d, wh, rh, ov) { // wall module + roof module (+ yaw for both roof and, via yaw, ridge axis) of one block
   const fac = (ww, dd) => ({ width: ww, depth: dd, wallHeight: wh, ridgeHeight: rh, overhang: ov, uvFacade: [Math.max(ww, 1) / 2, wh / 2] });
   if (kind === 'gableX') return { wall: _bodyMod(fac(d, w)), roof: _gableSlopesMod(d, w, rh, ov), yaw: Math.PI / 2 };
   if (kind === 'hip') return { wall: _geo(`hipbody|${_q(w)}x${_q(wh)}x${_q(d)}`, () => _boxAt(w, wh, d, 0, wh / 2, 0, Math.max(w, 1) / 2, wh / 2)), roof: _hipRoofMod(w, d, rh, ov), yaw: 0 };
+  if (kind === 'flat') { // Prompt: terrace houses — flat roof slab (base at y=0, like the other roof modules) instead of a ridge
+    const a = w + 2 * ov, b = d + 2 * ov, rhc = Math.max(0.15, rh);
+    return { wall: _bodyMod(fac(w, d)), roof: _geo(`flatroof|${_q(a)}x${_q(rhc)}x${_q(b)}`, () => _boxAt(a, rhc, b, 0, rhc / 2, 0, Math.max(w, 1) / 2, Math.max(d, 1) / 2)), yaw: 0 };
+  }
   return { wall: _bodyMod(fac(w, d)), roof: _gableSlopesMod(w, d, rh, ov), yaw: 0 };
 }
 function _applyShape(L, shape, width0) {
@@ -1120,6 +1166,57 @@ export function getHouseArchetype(w, d, variantIndex = 0) {
   return arch;
 }
 
+// ---- 9.5b テラスハウス archetype（instanced/LOD経路。低密度住宅と全く同じ getHouseLodParts/getHouseLotParts
+// パイプラインに乗る — HouseInstanceRenderer._buildRecord は archetype に .id があればそれをそのまま使うので、
+// メインファイル側は record.archetype: getTerraceArchetype(variantIndex) を渡すだけでよい（getHouseArchetype
+// 自体・低密度住宅の挙動は一切変更していない）。建物フットプリントは3x3固定、残りの奥3x3は既存の
+// yardDepth（lot dressing）の仕組みでそのまま庭になる。
+function _terraceMaterialDefaults(facadeMaterial) {
+  if (facadeMaterial === 'darkWood') return { trimColor: 0xe4ddc9, foundationMaterial: 'stoneRough' };
+  if (facadeMaterial === 'brickRed') return { trimColor: 0xede7d6, foundationMaterial: 'concrete' };
+  if (String(facadeMaterial).startsWith('plaster')) return { trimColor: 0x2a2018, foundationMaterial: 'stoneRough' };
+  return { trimColor: 0xf2ede2, foundationMaterial: 'concrete' }; // concrete / concreteRock
+}
+function _terraceLayout(config) {
+  const overhang = 0.18; // thin eave under the parapet coping
+  const width = Math.max(1.6, config.widthCells - 2 * overhang - 0.06);
+  const depth = Math.max(1.6, config.depthCells - 2 * overhang - 0.06);
+  const floors = config.floors || 3, floorH = 2.9, wallHeight = floorH * floors, baseY = 0.35;
+  const ridgeHeight = 0.4; // flat roof slab thickness (parapet trim is added on top of this in _lod0Parts)
+  const winW = Math.min(0.7, width * 0.28), winH = Math.min(1.1, floorH * 0.42);
+  const windowXs = width >= 1.8 ? [-width * 0.24, width * 0.24] : [0];
+  const windowRows = []; for (let f = 1; f < floors; f++) windowRows.push(baseY + floorH * f + floorH * 0.52); // no windows on the ground floor (door goes there)
+  return {
+    width, depth, depthFull: depth, hasPorch: false, porchDepthC: 0, stepCountC: 0, frontExt: 0, floors, wallHeight, ridgeHeight, baseY, overhang,
+    winY: windowRows[0] ?? (baseY + wallHeight * 0.55), winW, winH, glassW: winW - 0.12, glassH: winH - 0.12, windowXs, windowRows,
+    doorX: 0, doorW: Math.min(0.85, width * 0.32), chimney: false, dormer: false, roofKind: 'flat', wings: [], garage: null, shiftX: 0, shiftZ: 0,
+    uvFacade: [Math.max(width, 1) / 2, wallHeight / 2], uvRoof: [Math.max(width, 1) / 3, Math.max(depth, 1) / 3], uvFound: [Math.max(width, 1) / 2, 0.5],
+    widthCells: config.widthCells, depthCells: config.depthCells, dimKey: `${config.widthCells}x${config.depthCells}`, porch: null,
+  };
+}
+export function getTerraceArchetype(variantIndex = 0) {
+  const n = TERRACE_HOUSES.length, idx = ((variantIndex % n) + n) % n;
+  const base = TERRACE_HOUSES[idx], id = `${base.id}@terrace3x3`;
+  if (HOUSE_ARCHETYPES.has(id)) return HOUSE_ARCHETYPES.get(id);
+  const matDef = _terraceMaterialDefaults(base.facadeMaterial), seed = 5000 + idx;
+  const cfg = { widthCells: 3, depthCells: 3, floors: 3 };
+  const L = _terraceLayout(cfg);
+  const arch = {
+    id, baseId: base.id, sizeClass: 'terrace_3x3', w: cfg.widthCells, d: cfg.depthCells,
+    facadeFamily: base.family, roofType: 'flat',
+    windowStyle: L.windowXs.length === 2 ? 'double' : 'single', porchStyle: 'none',
+    chimney: false, dormer: false, floors: L.floors,
+    doorStyle: DOOR_STYLES[seed % DOOR_STYLES.length],
+    materialRefs: { facade: base.facadeMaterial, roof: base.roofMaterial, foundation: matDef.foundationMaterial, deck: 'deckWood', chimney: 'brickRed',
+      door: DOOR_PRESETS[(seed >> 1) % DOOR_PRESETS.length], trim: matDef.trimColor },
+    layout: L, seed, _lodParts: [null, null, null, null],
+    features: { porch: false, chimney: false, dormer: false, wraparound: false },
+  };
+  HOUSE_ARCHETYPES.set(id, arch);
+  return arch;
+}
+export const TERRACE_ARCHETYPE_COUNT = TERRACE_HOUSES.length;
+
 // ---- 9.6 LOD0: kit-of-parts recipe -------------------------------------------------------------
 const _lp = new THREE.Vector3(), _ls = new THREE.Vector3(), _lq = new THREE.Quaternion(), _lY = new THREE.Vector3(0, 1, 0);
 function _local(px, py, pz, sx = 1, sy = 1, sz = 1, yaw = 0) {
@@ -1160,13 +1257,20 @@ function _lod0Parts(arch) {
   [[-1, -1], [1, -1], [-1, 1], [1, 1]].forEach(([sx, sz]) => unit('corner', 'trim', sx * (width / 2 + 0.03), baseY + wallHeight / 2, sz * (depth / 2 + 0.03), 0.09, wallHeight, 0.09));
 
   // --- windows: frame + glass + mullions + sill (all the shared unit box; size lives in `local`)
-  L.windowXs.forEach((x) => {
-    unit('winframe', 'trim', x, L.winY, fz, L.winW, L.winH, 0.05);
-    unit('glass', 'glass', x, L.winY, fz + 0.02, L.glassW, L.glassH, 0.08);
-    unit('mullion', 'trim', x, L.winY, fz + 0.06, 0.035, L.glassH, 0.03);
-    unit('mullion', 'trim', x, L.winY, fz + 0.06, L.glassW, 0.035, 0.03);
-    unit('sill', 'trim', x, L.winY - L.winH / 2 - 0.03, fz + 0.06, L.winW + 0.16, 0.06, 0.16);
-  });
+  // Prompt: windowRows (one Y per floor) is optional — when absent this is exactly the old single-row behaviour.
+  (L.windowRows || [L.winY]).forEach((wy) => L.windowXs.forEach((x) => {
+    unit('winframe', 'trim', x, wy, fz, L.winW, L.winH, 0.05);
+    unit('glass', 'glass', x, wy, fz + 0.02, L.glassW, L.glassH, 0.08);
+    unit('mullion', 'trim', x, wy, fz + 0.06, 0.035, L.glassH, 0.03);
+    unit('mullion', 'trim', x, wy, fz + 0.06, L.glassW, 0.035, 0.03);
+    unit('sill', 'trim', x, wy - L.winH / 2 - 0.03, fz + 0.06, L.winW + 0.16, 0.06, 0.16);
+  }));
+  // --- parapet (flat-roof houses only): thin lip framing the roof edge, sitting ON the flat roof slab
+  if (L.roofKind === 'flat') {
+    const pH = 0.55, pMat = 'trim', a = width + overhang * 2, b = depth + overhang * 2, pTopY = topY + Math.max(0.15, ridgeHeight);
+    [[a, 0.12, -b / 2 + 0.06], [a, 0.12, b / 2 - 0.06]].forEach(([dx, dz, pz]) => add('parapet', _boxMod(dx, pH, dz, Math.max(dx, 1) / 2, 1), pMat, _local(0, pTopY + pH / 2, pz + zs), true));
+    [[0.12, b, -a / 2 + 0.06], [0.12, b, a / 2 - 0.06]].forEach(([dx, dz, px]) => add('parapet', _boxMod(dx, pH, dz, 1, Math.max(dz, 1) / 2), pMat, _local(px, pTopY + pH / 2, zs), true));
+  }
   // --- door: frame (trim) + wood slab (3 shared styles) + handle (metal)
   unit('doorframe', 'trim', L.doorX, baseY + 1.0, fz, L.doorW + 0.16, 2.02, 0.05);
   add('door', _doorMod(L.doorW, arch.doorStyle), 'door', _local(L.doorX, baseY + 0.95, fz + 0.03 + zs), false);
@@ -1260,7 +1364,7 @@ function _unitParts(arch, lod) {
     if (L.chimney) { const c = _chimneySpec(L); add('chimney', _unitBoxGeo(0.5, 1), pbr(refs.chimney), _local(c.x, baseY + c.chH / 2, c.z + zs, c.cw, c.chH, c.cw), true); }
     // windows + door: instances of the ONE shared unit box (no size-specific geometry at any LOD)
     const U = _unitBox(), gm = { matKey: 'glass', material: _glassMaterial() };
-    L.windowXs.forEach((x) => add('glass', U, gm, _local(x, L.winY, depth / 2 + 0.02 + zs, L.glassW, L.glassH, 0.08), false));
+    (L.windowRows || [L.winY]).forEach((wy) => L.windowXs.forEach((x) => add('glass', U, gm, _local(x, wy, depth / 2 + 0.02 + zs, L.glassW, L.glassH, 0.08), false)));
     add('door', U, { matKey: `flat:${refs.door}`, material: _flatMaterial(refs.door) }, _local(L.doorX, baseY + 0.95, depth / 2 + 0.02 + zs, L.doorW, 1.9, 0.08), false);
   } else { // LOD2 / LOD3: body reaches the ground (no foundation part), roof, (LOD2) porch roof
     const h = baseY + wallHeight;
