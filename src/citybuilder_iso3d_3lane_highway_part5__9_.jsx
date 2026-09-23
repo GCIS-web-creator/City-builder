@@ -11998,11 +11998,13 @@ export default function CityGridIso() {
       rotationY: (lot.rotation || 0) + ((lot.frontSign ?? -1) < 0 ? Math.PI : 0),
       scale: 1, level: lot.level, seed: lot.id,
       // Prompt: terrace houses share party walls with their neighbours and sit flush against the
-      // road, like a real terrace/row-house street — no front-yard lawn or picket fence/wall is
-      // drawn around them (yardDepth: -1 = no lot dressing at all, see HouseInstanceRenderer).
-      // The 3x3m private yard behind the house (lot.yardDepth, from computeTerraceFootprint via
-      // finalizeLot) still exists purely for cell reservation — it is just never drawn.
-      yardDepth: -1, yardSign: -1,
+      // road, like a real terrace/row-house street — so there is still no front-yard lawn/fence
+      // (the house itself sits on row 0, right at the road). The 3x3m PRIVATE yard behind the
+      // house (lot.yardDepth, from computeTerraceFootprint via finalizeLot) is real reserved space
+      // and should be drawn — lawn + fence, exactly like res_low's dressing — just on the back
+      // side of the house instead of the front (yardSign:-1 tells HouseInstanceRenderer to draw it
+      // behind the house's local +Z front rather than in front of it).
+      yardDepth: lot.yardDepth != null && lot.yardDepth > 0 ? lot.yardDepth : 3, yardSign: -1,
       skirt: needSkirt ? { height: grading.foundationHeight + (isRetaining ? 0.3 : 0.05), retaining: isRetaining, width: w * 0.97, depth: d * 0.97, yaw: lot.rotation || 0 } : null,
     };
     if (lot.renderHandle != null && hr.hasHouse(lot.renderHandle)) hr.updateHouse(record);
@@ -21703,14 +21705,14 @@ Grade: ${((freeRoadDraftStatus?.grade ?? 0) * 100).toFixed(1)}%${freeRoadDraftSt
         </div>
       )}
 
-      {zoneStatus && tool === 'zone_res' && cameraMode !== 'driver' && cameraMode !== 'ped' && (() => {
+      {zoneStatus && (tool === 'zone_res' || tool === 'res_terrace') && cameraMode !== 'driver' && cameraMode !== 'ped' && (() => {
         const z = zoneStatus, isResult = z.phase === 'result';
         const buildColor = z.buildState === 'BUILT' || z.buildState === 'READY' ? '#7fe0a8' : z.buildState === 'BLOCKED' || z.buildState === 'FAILED' ? '#e0a030' : '#a8d8bc';
         const zoneColor = z.zone === 'INVALID' ? '#e05a4f' : '#5a90d8';
         const reasonText = z.reason ? (LOW_DENSITY_FAIL_TEXT[z.reason] || LOW_DENSITY_FAIL_TEXT.unknown) : null;
         return (
           <div style={{ position: 'absolute', bottom: 70, left: '50%', transform: 'translateX(-50%)', padding: '10px 14px', background: 'rgba(15, 21, 18, 0.92)', border: `1px solid ${z.zone === 'INVALID' ? '#e05a4f' : z.buildState === 'BLOCKED' || z.buildState === 'FAILED' ? '#e0a030' : '#5a90d8'}`, borderRadius: 6, color: '#e8e8e8', fontSize: 12, minWidth: 260, maxWidth: 380, pointerEvents: 'none', lineHeight: 1.6 }}>
-            <div style={{ color: zoneColor, fontSize: 13 }}>RESIDENTIAL ZONE</div>
+            <div style={{ color: zoneColor, fontSize: 13 }}>{tool === 'res_terrace' ? 'テラスハウス' : 'RESIDENTIAL ZONE'}</div>
             <div>{z.size}</div>
             <div>Zone: <span style={{ color: zoneColor }}>{z.zone}</span></div>
             {isResult && z.buildState && (

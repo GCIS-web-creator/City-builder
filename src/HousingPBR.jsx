@@ -1178,8 +1178,13 @@ function _terraceMaterialDefaults(facadeMaterial) {
   return { trimColor: 0xf2ede2, foundationMaterial: 'concrete' }; // concrete / concreteRock
 }
 function _terraceLayout(config) {
-  const overhang = 0.18; // thin eave under the parapet coping
-  const width = Math.max(1.6, config.widthCells - 2 * overhang - 0.06);
+  const overhang = 0.18; // thin eave under the parapet coping — front/back only, see width note below
+  // width = the side-to-side axis, i.e. the shared party-wall faces between this house and its
+  // neighbours in the row. Only a hairline tolerance is subtracted (never the eave overhang) so
+  // the walls sit flush with zero visible gap. depth (front/back, road-facing) still gets the full
+  // eave inset since nothing touches there.
+  const partyGap = 0.02; // m — sub-visual tolerance, just enough to avoid z-fighting between lots
+  const width = Math.max(1.6, config.widthCells - partyGap);
   const depth = Math.max(1.6, config.depthCells - 2 * overhang - 0.06);
   const floors = config.floors || 3, floorH = 2.9, wallHeight = floorH * floors, baseY = 0.35;
   const ridgeHeight = 0.4; // flat roof slab thickness (parapet trim is added on top of this in _lod0Parts)
