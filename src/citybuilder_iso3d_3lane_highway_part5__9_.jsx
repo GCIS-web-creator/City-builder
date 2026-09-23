@@ -5945,9 +5945,12 @@ const ZONE_COLORS = {
 // adapter fell back to 'res_terrace', i.e. a scaled terrace house), and finalizeLot's mesh build ran
 // the terrace builder. Population/height numbers are the same as the terrace type it replaces.
 // It is NOT a toolbar tool (no button uses this key), it only exists for lots created from a zone.
+// Prompt: res_low = 1棟1世帯（2〜4人）、res_terrace = 1棟10世帯（20〜40人）。households is informational
+// (matches the res_mid pattern below) — actual per-lot household COUNT is still driven by the
+// generic spawnCitizens/resHomePool pipeline, which does not yet read this field (see spawnCitizens).
 const RES_LOT_TYPES = {
-  res_low: { label: '低密度住宅', unlockPop: 0, hMin: 3.4, hMax: 4.4, pop: [2, 30], jobs: [0, 0], color: 0xb08a5a, roof: 0x7a4a34 },
-  res_terrace: { label: 'テラスハウス', unlockPop: 0, hMin: 3.4, hMax: 4.4, pop: [2, 30], jobs: [0, 0], color: 0xb08a5a, roof: 0x7a4a34 },
+  res_low: { label: '低密度住宅', unlockPop: 0, hMin: 3.4, hMax: 4.4, pop: [2, 4], households: 1, jobs: [0, 0], color: 0xb08a5a, roof: 0x7a4a34 },
+  res_terrace: { label: 'テラスハウス', unlockPop: 0, hMin: 3.4, hMax: 4.4, pop: [20, 40], households: 10, jobs: [0, 0], color: 0xb08a5a, roof: 0x7a4a34 },
   res_mid: { label: '中密度住宅', unlockPop: 200, hMin: 9, hMax: 18, pop: [60, 300], jobs: [0, 0], color: 0x8fa8c8, roof: 0x4a6a90 },
   res_lowrent: { label: '低家賃住宅', unlockPop: 400, hMin: 12, hMax: 22, pop: [200, 300], jobs: [0, 0], color: 0x8a8a82, roof: 0x5a5a54 },
   res_mixed: { label: '複合住宅', unlockPop: 600, hMin: 10, hMax: 20, pop: [50, 100], jobs: [10, 40], color: 0xd8b878, roof: 0x8a97a0 },
