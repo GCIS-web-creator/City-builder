@@ -1983,3 +1983,273 @@ export function getMediumDensityLotParts(arch, lod) {
 /** Build + cache every LOD of one archetype ahead of a bulk placement. */
 export function prewarmMediumDensityArchetype(arch, lods = [0, 1, 2, 3]) { lods.forEach((l) => getMediumDensityLodParts(arch, l)); getMediumDensityLotParts(arch, 0); return arch; }
 export const MEDIUM_DENSITY_ARCHETYPE_COUNT = MEDIUM_DENSITY_HOUSES.length;
+
+// ============================================================================
+// 11. 高密度住宅（res_high）— 高級タワーマンション 1種（8x6ロット / 40階建て）
+// ----------------------------------------------------------------------------
+// 区画指定は 8(幅) x 6(奥行) だが、実際の建物本体は 8x8 の大きさになる：低層部（ポディウム、
+// 4階分）はロットぴったり(8x6, 道路側フラット)に収まり、その上のタワー部分だけが奥行を
+// 8mまで拡張する（＝ロットの奥、道路と反対側に2mだけカンチレバーで張り出す）。フロント
+// 側（道路側）の面はポディウム・タワーとも常に同じZ位置＝ロット前端にフラットで、道路側
+// には絶対に張り出さない（中密度住宅で発生した「庭が道路側にはみ出る」不具合の再発防止:
+// _highLotParts / _highLod0Parts のどのパーツも fz(ロット前端) を超えて前方向に伸びない）。
+// res_mid (§10) と全く同じ kit-of-parts / archetype キャッシュ方式・Renderer連携APIを踏襲。
+// ============================================================================
+
+const HIGH_DENSITY_FLOOR_H = 3.05; // 高級仕様: 一般住宅よりやや高い天井高
+const HIGH_DENSITY_SIZE_DIMS = {
+  '8x6': { podiumD: 6, towerD: 8, podiumFloors: 4, floors: 40, households: '140-200', population: '320-560' },
+};
+
+// バリエーション: 外装(タワー/ポディウム)・冠部・バルコニー配置・コア位置・トリム(ゴールド/
+// プラチナ/ブロンズ)・ミラーの組み合わせ。全て同じ 8x6 サイズクラスのみ対応。
+const HIGH_DENSITY_VARIANTS = [
+  { facadeMaterial: 'plasterBlue',  podiumMaterial: 'stoneDark',    crownMaterial: 'metalRoofDark', balconyType: 'corner',  corePosition: 'rear-left',   mirror: false, trimColor: 0xC9A227, metalColor: 0x2b2b2e },
+  { facadeMaterial: 'concrete',     podiumMaterial: 'stoneRough',   crownMaterial: 'metalRoofDark', balconyType: 'perUnit', corePosition: 'rear-right',  mirror: true,  trimColor: 0xB8B8C0, metalColor: 0x33343a },
+  { facadeMaterial: 'plasterWhite', podiumMaterial: 'concreteRock', crownMaterial: 'metalRoofDark', balconyType: 'corner',  corePosition: 'rear-center', mirror: false, trimColor: 0x8a5a2b, metalColor: 0x2b2b2e },
+  { facadeMaterial: 'plasterBlue',  podiumMaterial: 'stoneRough',   crownMaterial: 'metalRoofDark', balconyType: 'perUnit', corePosition: 'rear-left',   mirror: true,  trimColor: 0xC9A227, metalColor: 0x33343a },
+  { facadeMaterial: 'concreteRock', podiumMaterial: 'stoneDark',    crownMaterial: 'metalRoofDark', balconyType: 'corner',  corePosition: 'rear-right',  mirror: false, trimColor: 0xB8B8C0, metalColor: 0x2b2b2e },
+];
+
+function _buildHighDensityList(sizeKey, variants, seedBase) {
+  const dims = HIGH_DENSITY_SIZE_DIMS[sizeKey];
+  return variants.map((v, i) => ({
+    id: `high_${sizeKey}_${String(i + 1).padStart(2, '0')}`,
+    sizeKey,
+    floors: dims.floors,
+    facadeMaterial: v.facadeMaterial,
+    podiumMaterial: v.podiumMaterial,
+    crownMaterial: v.crownMaterial,
+    balconyType: v.balconyType,
+    corePosition: v.corePosition,
+    mirror: !!v.mirror,
+    trimColor: v.trimColor,
+    metalColor: v.metalColor,
+    households: dims.households,
+    population: dims.population,
+    seed: seedBase + i,
+  }));
+}
+
+/** 高密度住宅（res_high）専用データ。MEDIUM_DENSITY_HOUSES とは別管理。8x6ロット専用（向き固定、非対称）。 */
+export const HIGH_DENSITY_HOUSES = _buildHighDensityList('8x6', HIGH_DENSITY_VARIANTS, 5000);
+
+/** そのセルサイズ(w=8, d=6 固定・向き入れ替え不可)で高密度住宅が建築可能か。 */
+export function isHighDensityHouseSizeAvailable(w, d) { return w === 8 && d === 6; }
+/** variantIndexは配列長で丸める。 */
+export function getHighDensityHouseConfigForCell(w, d, variantIndex = 0) {
+  if (!isHighDensityHouseSizeAvailable(w, d)) return null;
+  const arr = HIGH_DENSITY_HOUSES;
+  const idx = ((variantIndex % arr.length) + arr.length) % arr.length;
+  return arr[idx];
+}
+
+// ---- 11.3 レイアウト計算 ---------------------------------------------------------------------
+function _highDensityLayout(config, w, d) {
+  const dims = HIGH_DENSITY_SIZE_DIMS[config.sizeKey];
+  const floors = config.floors || dims.floors;
+  const podiumFloors = Math.min(floors - 1, dims.podiumFloors);
+  const towerFloors = floors - podiumFloors;
+  const podiumD = dims.podiumD, towerD = dims.towerD;
+  const width = w;
+  const floorH = HIGH_DENSITY_FLOOR_H;
+  const podiumH = floorH * podiumFloors * 1.18; // ロビー／低層階は天井高め（高級感）
+  const towerWallH = floorH * towerFloors;
+  const baseY = 0.35, crownH = 1.7;
+
+  const cols = Math.max(3, Math.min(6, Math.round(width / 1.5)));
+  const bayW = width / cols;
+  const mirrorSign = config.mirror ? -1 : 1;
+  const colXs = Array.from({ length: cols }, (_, i) => (-width / 2 + bayW * (i + 0.5)) * mirrorSign).sort((a, b) => a - b);
+
+  const winW = Math.min(bayW * 0.82, bayW - 0.1), winH = floorH * 0.62;
+  const balcW = Math.min(1.8, bayW * 0.8), balcD = 1.1, balcH = 1.05;
+  const entranceW = Math.min(3.2, width * 0.4);
+  const coreW = Math.min(2.0, width * 0.2), coreD = 1.1;
+  let coreX;
+  if (config.corePosition === 'rear-left') coreX = -width / 2 + coreW / 2 + 0.2;
+  else if (config.corePosition === 'rear-right') coreX = width / 2 - coreW / 2 - 0.2;
+  else coreX = 0;
+  coreX *= mirrorSign;
+
+  return {
+    width, podiumD, towerD, floors, podiumFloors, towerFloors, floorH, podiumH, towerWallH, baseY, crownH,
+    cols, bayW, colXs, winW, winH, balcW, balcD, balcH, entranceW, coreW, coreD, coreX, mirrorSign,
+    yardW: width, yardD: 0, // 側庭/奥庭なし（低層部がロット全面を占める、高級タワーの前提）
+  };
+}
+
+// ---- 11.4 マテリアル解決 ---------------------------------------------------------------------
+function _highMatInfo(refs, role) {
+  switch (role) {
+    case 'facade': case 'podium': case 'crown': case 'foundation':
+      return { matKey: `pbr:${refs[role]}`, material: getSharedPBRMaterial(refs[role]) };
+    case 'trim': return { matKey: `solid:${refs.trim}`, material: _solid(refs.trim, { roughness: 0.3, metalness: 0.55 }) }; // ゴールド/プラチナ/ブロンズの金属トリム
+    case 'metal': return { matKey: `solid:${refs.metal}`, material: _solid(refs.metal, { roughness: 0.4, metalness: 0.4 }) };
+    case 'glass': return { matKey: 'glass', material: _glassMaterial() };
+    case 'pool': return { matKey: 'poolwater', material: _poolWaterMaterial() };
+    default: return { matKey: `pbr:${refs.facade}`, material: getSharedPBRMaterial(refs.facade) };
+  }
+}
+
+// ---- 11.5 LOD0: 詳細kit-of-parts ------------------------------------------------------------
+// 座標系はres_midと同じ: 原点=建物フットプリント中心, +Z=道路側。fz(ロット前端)はポディウム・
+// タワー共通で、どちらも絶対にfzより前方向(+Z)へは張り出さない。タワーだけがfzから見て
+// -Z方向(道路と反対側)へさらに(towerD-podiumD)mだけ深く伸びる＝ロット背後へのカンチレバー。
+function _highLod0Parts(arch) {
+  const L = arch.layout, refs = arch.materialRefs, list = [];
+  const add = (part, g, role, local, tinted) => list.push({ part, geoKey: g.key, geometry: g.geometry, ..._highMatInfo(refs, role), local, tinted: !!tinted });
+  const U = _unitBox();
+  const unit = (part, role, x, y, z, sx, sy, sz, yaw) => add(part, U, role, _local(x, y, z, sx, sy, sz, yaw), false);
+  const { width, podiumD, towerD, podiumFloors, towerFloors, floorH, podiumH, towerWallH, baseY, crownH, cols, colXs, winW, winH, balcW, balcD, balcH, entranceW, coreW, coreD, coreX } = L;
+  const fz = podiumD / 2, bzT = fz - towerD; // タワー背面（ポディウムより奥まで伸びる）
+  const topPodiumY = baseY + podiumH, topTowerY = topPodiumY + towerWallH, topCrownY = topTowerY + crownH;
+
+  // --- 基礎
+  add('foundation', _boxMod(width + 0.3, baseY, podiumD + 0.3, Math.max(width, 1) / 2, 0.5), 'foundation', _local(0, baseY / 2, 0), true);
+
+  // --- 低層部（ポディウム）: 石張り仕上げ＋列柱、ロットに正確にフィット（張り出しゼロ）
+  add('podium', _boxMod(width, podiumH, podiumD, Math.max(width, 1) / 2, Math.max(podiumH, 1) / 2), 'podium', _local(0, baseY + podiumH / 2, 0), true);
+  for (let c = 0; c <= cols; c++) {
+    const px = -width / 2 + (width / cols) * c;
+    add('pier', _boxMod(0.2, podiumH, podiumD + 0.02, 0.2, Math.max(podiumH, 1) / 2), 'trim', _local(px, baseY + podiumH / 2, 0), true);
+  }
+  add('lobbyglass', _boxMod(width - 0.6, floorH * 0.85, 0.08, Math.max(width, 1) / 2, 1), 'glass', _local(0, baseY + floorH * 0.5, fz + 0.02), false);
+
+  // --- グランドエントランス（大庇＋列柱＋車寄せ）。庇・柱・車寄せ舗装は全てfz以内(前方には出ない)
+  const doorW = Math.min(entranceW, width * 0.35), doorH = floorH * 0.85;
+  unit('doorframe', 'trim', 0, baseY + doorH / 2, fz - 0.02, doorW + 0.2, doorH + 0.14, 0.06);
+  unit('door', 'glass', 0, baseY + doorH / 2, fz + 0.01, doorW, doorH, 0.06);
+  add('canopy', _boxMod(doorW + 2.4, 0.18, 1.8, (doorW + 2.4) / 1.5, 1), 'trim', _local(0, baseY + doorH + 0.4, fz - 0.9), true);
+  [-1, 1].forEach((s) => unit('canopypost', 'metal', s * (doorW / 2 + 0.9), baseY + (doorH + 0.4) * 0.5, fz - 1.6, 0.1, doorH + 0.4, 0.1));
+  [-1, 1].forEach((s) => unit('planter', 'podium', s * (doorW / 2 + 1.7), baseY + 0.25, fz - 0.4, 0.6, 0.5, 0.6));
+
+  // --- タワー本体: ガラスカーテンウォール＋各階リボン窓。正面(fz)はポディウムと面一、
+  //     背面だけがbzT(=fz-towerD)まで奥へ伸びる＝「88サイズ」のカンチレバー部分
+  add('tower', _boxMod(width, towerWallH, towerD, Math.max(width, 1) / 2, Math.max(towerWallH, 1) / 3), 'facade', _local(0, topPodiumY + towerWallH / 2, bzT + towerD / 2), true);
+  for (let f = 0; f < towerFloors; f++) {
+    const wy = topPodiumY + floorH * f + floorH * 0.55;
+    const isTopBand = f >= towerFloors - 3; // 最上部はペントハウス階（コーナーテラス）
+    colXs.forEach((x, ci) => {
+      unit('winframe', 'trim', x, wy, fz, winW, winH, 0.05);
+      unit('glass', 'glass', x, wy, fz + 0.02, winW - 0.08, winH - 0.08, 0.07);
+      unit('mullion', 'trim', x, wy, fz + 0.055, 0.025, winH - 0.08, 0.025);
+      const wantBalc = (arch.balconyType === 'perUnit' && f % 2 === 1) || (arch.balconyType === 'corner' && isTopBand && (ci === 0 || ci === cols - 1));
+      if (wantBalc) {
+        const slabY = topPodiumY + floorH * f - 0.05, railY = slabY + balcH / 2 + 0.05;
+        add('balcslab', _boxMod(balcW, 0.1, balcD, balcW / 1.2, 1), 'foundation', _local(x, slabY, fz + balcD / 2), true);
+        unit('railing', 'metal', x, railY, fz + balcD - 0.03, balcW, balcH * 0.55, 0.04);
+      }
+    });
+  }
+
+  // --- コア（エレベーター／階段）: タワー背面にさらに張り出す（道路と反対側なので問題なし）
+  const coreH = towerWallH + crownH * 0.6;
+  add('core', _boxMod(coreW, coreH, coreD, coreW / 1.2, coreH / 3), 'podium', _local(coreX, topPodiumY + coreH / 2, bzT - coreD / 2), true);
+  for (let f = 2; f < towerFloors; f += 4) unit('glass', 'glass', coreX, topPodiumY + floorH * f + floorH * 0.5, bzT - coreD - 0.02, coreW * 0.5, 0.5, 0.05);
+
+  // --- クラウン（頂冠部）＋ルーフガーデン／インフィニティプール
+  add('crown', _boxMod(width + 0.15, crownH, towerD + 0.15, Math.max(width, 1) / 2, 1), 'crown', _local(0, topTowerY + crownH / 2, bzT + towerD / 2), true);
+  add('crowncap', _boxMod(width * 0.55, crownH * 0.5, towerD * 0.4, 1, 1), 'crown', _local(0, topCrownY + crownH * 0.25, bzT + towerD * 0.5), true);
+  add('roofdeck', _boxMod(width * 0.9, 0.04, towerD * 0.9, 1, 1), 'foundation', _local(0, topTowerY + 0.02, bzT + towerD / 2), true);
+  add('roofpool', _boxMod(width * 0.4, 0.12, towerD * 0.26, 1, 1), 'pool', _local(0, topTowerY + 0.06, bzT + towerD * 0.72), false);
+  unit('vent', 'metal', width / 2 - 0.8, topTowerY + 0.3, bzT + 0.6, 0.3, 0.5, 0.3); // 設備類は最小限（高級タワーは目立たせない）
+
+  return list;
+}
+
+// ---- 11.6 LOD1〜3: 簡略化kit-of-parts ---------------------------------------------------------
+function _highUnitParts(arch, lod) {
+  const L = arch.layout, refs = arch.materialRefs, list = [];
+  const add = (part, g, matInfo, local, tinted, extra) => list.push({ part, geoKey: g.key, geometry: g.geometry, ...matInfo, local, tinted, ...extra });
+  const pbr = (k) => ({ matKey: `pbr:${k}`, material: getSharedPBRMaterial(k) });
+  const lite = (k) => ({ matKey: `lite:${k}`, material: getSharedLiteMaterial(k) });
+  const flatFacade = { matKey: 'flat:white', material: _solid(0xd7d7d0, { roughness: 0.9 }) };
+  const { width, podiumD, towerD, towerFloors, floorH, podiumH, towerWallH, baseY, crownH } = L;
+  const fz = podiumD / 2, bzT = fz - towerD;
+  const topPodiumY = baseY + podiumH, topTowerY = topPodiumY + towerWallH;
+
+  const podiumMat = lod === 1 ? pbr(refs.podium) : lod === 2 ? lite(refs.podium) : flatFacade;
+  const towerMat = lod === 1 ? pbr(refs.facade) : lod === 2 ? lite(refs.facade) : flatFacade;
+  const crownMat = lod === 1 ? pbr(refs.crown) : lod === 2 ? lite(refs.crown) : flatFacade;
+  const podiumColor = lod === 3 ? { color: _flatRGB(refs.podium) } : null;
+  const towerColor = lod === 3 ? { color: _flatRGB(refs.facade) } : null;
+  const crownColor = lod === 3 ? { color: _flatRGB(refs.crown) } : null;
+
+  if (lod === 3) { // Billboard/簡略形: 3パーツのみ
+    add('podium', _unitBoxGeo(1, 1), podiumMat, _local(0, baseY + podiumH / 2, 0, width, podiumH, podiumD), true, podiumColor);
+    add('tower', _unitBoxGeo(1, 1), towerMat, _local(0, topPodiumY + towerWallH / 2, bzT + towerD / 2, width, towerWallH, towerD), true, towerColor);
+    add('crown', _unitBoxGeo(1, 1), crownMat, _local(0, topTowerY + crownH / 2, bzT + towerD / 2, width, crownH, towerD), true, crownColor);
+    return list;
+  }
+
+  add('foundation', _unitBoxGeo(2, 0.5), pbr('stoneDark'), _local(0, baseY / 2, 0, width + 0.3, baseY, podiumD + 0.3), true);
+  add('podium', _unitBoxGeo(2, 3), podiumMat, _local(0, baseY + podiumH / 2, 0, width, podiumH, podiumD), true, podiumColor);
+  add('tower', _unitBoxGeo(2, 3), towerMat, _local(0, topPodiumY + towerWallH / 2, bzT + towerD / 2, width, towerWallH, towerD), true, towerColor);
+  add('crown', _unitBoxGeo(2, 1), crownMat, _local(0, topTowerY + crownH / 2, bzT + towerD / 2, width + 0.1, crownH, towerD + 0.1), true, crownColor);
+
+  if (lod === 1) { // Mid: 窓は2階おきに間引いたリボン状
+    const U = _unitBox(), gm = { matKey: 'glass', material: _glassMaterial() };
+    for (let f = 1; f < towerFloors; f += 2) {
+      const wy = topPodiumY + floorH * f + floorH * 0.5;
+      add('glass', U, gm, _local(0, wy, fz + 0.02, width * 0.75, floorH * 0.4, 0.06), false);
+    }
+    add('entrance', U, gm, _local(0, baseY + floorH * 0.4, fz + 0.03, 2.4, floorH * 0.75, 0.06), false);
+  }
+  // lod===2: 窓なし。ポディウム＋タワー＋クラウンの塊のみ（Far）
+  return list;
+}
+
+// ---- 11.7 敷地まわり ------------------------------------------------------------------------
+// 低層部(ポディウム)がロット(8x6)全面をぴったり占めるため、側庭・奥庭は無い（yardD=0）。
+// エントランス前のわずかな装飾舗装のみ、fzより前(道路側)へは絶対に出ない位置に置く。
+function _highLotParts(arch, lod) {
+  const L = arch.layout, list = [];
+  const U = _unitBox();
+  const { podiumD, width } = L;
+  const fz = podiumD / 2;
+  if (lod >= 2) return list;
+  list.push({ part: 'plaza', geoKey: U.key, geometry: U.geometry, matKey: 'solid:plaza', material: _solid(0xb7b1a4, { roughness: 0.85 }), local: _local(0, -0.01, fz - 0.8, width * 0.5, 0.05, 1.6), tinted: false });
+  return list;
+}
+
+// ---- 11.8 Renderer連携用API（res_midと同じ形） -----------------------------------------------
+export const HIGH_DENSITY_ARCHETYPES = new Map();
+/** w=道路側の幅, d=奥行（メートル）。8x6（幅8・奥行6）でのみヒットする（向き固定）。 */
+export function getHighDensityArchetype(w, d, variantIndex = 0) {
+  const base = getHighDensityHouseConfigForCell(w, d, variantIndex);
+  if (!base) return null;
+  const id = `${base.id}@${w}x${d}`;
+  if (HIGH_DENSITY_ARCHETYPES.has(id)) return HIGH_DENSITY_ARCHETYPES.get(id);
+  const L = _highDensityLayout(base, w, d);
+  const arch = {
+    id, baseId: base.id, sizeClass: base.sizeKey, w, d, kind: 'res_high',
+    floors: base.floors, roofType: 'flat',
+    materialRefs: { facade: base.facadeMaterial, podium: base.podiumMaterial, crown: base.crownMaterial, foundation: 'stoneDark', trim: base.trimColor, metal: base.metalColor },
+    balconyType: base.balconyType, corePosition: base.corePosition, mirror: !!base.mirror,
+    households: base.households, population: base.population,
+    // 低層部はロット(8x6)にフラットに収まり、タワー部分だけがロット背後(道路と反対側)へ
+    // 2mカンチレバーして「実寸88」になる（§11冒頭コメント参照）。res_midと同様、独自の
+    // 実寸フットプリントを内蔵しているためHouseInstanceRendererの既定HOUSE_SCALE(0.6)は適用しない。
+    houseScale: { x: 1, y: 1, z: 1 },
+    layout: L, seed: base.seed, _lodParts: [null, null, null, null], _lotParts: null,
+  };
+  HIGH_DENSITY_ARCHETYPES.set(id, arch);
+  return arch;
+}
+/** Renderable module instances of a high-density archetype at one LOD (cached on the archetype). */
+export function getHighDensityLodParts(arch, lod) {
+  if (arch._lodParts[lod]) return arch._lodParts[lod];
+  return (arch._lodParts[lod] = lod === 0 ? _highLod0Parts(arch) : _highUnitParts(arch, lod));
+}
+/** Lot dressing (entrance plaza only — no yard) for a high-density archetype: cached per LOD. */
+export function getHighDensityLotParts(arch, lod) {
+  if (!arch._lotParts) arch._lotParts = new Map();
+  const key = `high|${lod}`;
+  let l = arch._lotParts.get(key);
+  if (!l) { l = _highLotParts(arch, lod); arch._lotParts.set(key, l); }
+  return l;
+}
+/** Build + cache every LOD of one archetype ahead of a bulk placement. */
+export function prewarmHighDensityArchetype(arch, lods = [0, 1, 2, 3]) { lods.forEach((l) => getHighDensityLodParts(arch, l)); getHighDensityLotParts(arch, 0); return arch; }
+export const HIGH_DENSITY_ARCHETYPE_COUNT = HIGH_DENSITY_HOUSES.length;

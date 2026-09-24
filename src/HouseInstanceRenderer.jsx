@@ -23,6 +23,7 @@ import * as THREE from 'three';
 import {
   getHouseArchetype, getHouseLodParts, getHouseLotParts,
   getMediumDensityArchetype, getMediumDensityLodParts, getMediumDensityLotParts,
+  getHighDensityArchetype, getHighDensityLodParts, getHighDensityLotParts,
   getHouseGeometryStats, getHouseMaterialStats, getSolidMaterial, disposeHouseSharedResources, HOUSE_STATS, HOUSE_SCALE,
 } from './HousingPBR.jsx';
 
@@ -35,13 +36,24 @@ import {
 // a `kind` tag ('res_low' default for legacy archetypes with none, 'res_terrace', 'res_mid'); that
 // tag is the ONLY thing that determines the dispatch below.
 const RES_MID = 'res_mid';
+const RES_HIGH = 'res_high';
 function _archKind(arch) { return (arch && arch.kind) || 'res_low'; }
 /** House body kit-of-parts for one archetype at one LOD, regardless of kind. */
-function _lodPartsFor(arch, lod) { return _archKind(arch) === RES_MID ? getMediumDensityLodParts(arch, lod) : getHouseLodParts(arch, lod); }
-/** Lot dressing (yard/fence) for one archetype. res_mid ignores yardDepth/rear — its yard size is
- * fixed by the archetype (4x6: 3m / 6x6: 2m behind the building) — but still gates on yardDepth>=0
+function _lodPartsFor(arch, lod) {
+  const kind = _archKind(arch);
+  if (kind === RES_MID) return getMediumDensityLodParts(arch, lod);
+  if (kind === RES_HIGH) return getHighDensityLodParts(arch, lod);
+  return getHouseLodParts(arch, lod);
+}
+/** Lot dressing (yard/fence) for one archetype. res_mid/res_high ignore yardDepth/rear — their yard
+ * (or, for res_high, lack of one) is fixed by the archetype itself — but still gate on yardDepth>=0
  * exactly like res_low/res_terrace, so the record shape (`{ ..., yardDepth, yardSign }`) stays uniform. */
-function _lotPartsFor(arch, yardDepth, lod, rear) { return _archKind(arch) === RES_MID ? getMediumDensityLotParts(arch, lod) : getHouseLotParts(arch, yardDepth, lod, rear); }
+function _lotPartsFor(arch, yardDepth, lod, rear) {
+  const kind = _archKind(arch);
+  if (kind === RES_MID) return getMediumDensityLotParts(arch, lod);
+  if (kind === RES_HIGH) return getHighDensityLotParts(arch, lod);
+  return getHouseLotParts(arch, yardDepth, lod, rear);
+}
 
 // World-space sector size per LOD. Near LODs use small sectors (tight frustum culling); far LODs use big
 // ones (everything is on screen when zoomed out anyway) so far houses collapse into a handful of buckets.
@@ -62,18 +74,21 @@ const INITIAL_CAPACITY = 16;
 // trims (winframe/glass/mullion/sill/railing/baluster/doorframe/door/canopypost/column/acunit/vent/
 // pier/winsurround/recess) never do, and nothing casts past Mid (LOD2/3), matching CAST[2]/[3] below.
 const CAST = [
-  { wall: 1, roof: 1, porchroof: 1, chimney: 1, dormerwall: 1, dormerroof: 1, parapet: 1, roofdeck: 1, core: 1, balcslab: 1, canopy: 1 },
-  { wall: 1, roof: 1, parapet: 1, core: 1 }, { roof: 1, parapet: 1 }, {},
+  { wall: 1, roof: 1, porchroof: 1, chimney: 1, dormerwall: 1, dormerroof: 1, parapet: 1, roofdeck: 1, core: 1, balcslab: 1, canopy: 1,
+    podium: 1, tower: 1, crown: 1, crowncap: 1 },
+  { wall: 1, roof: 1, parapet: 1, core: 1, podium: 1, tower: 1, crown: 1 }, { roof: 1, parapet: 1, podium: 1, tower: 1, crown: 1 }, {},
 ];
 // Note: lot-dressing parts (lawn, fence, path, and the yard furniture/pool added in HousingPBR.jsx's
-// _lotParts, or hedge/planting added in its res_mid _midLotParts) are attached via _attachParts'
-// second loop below, which hardcodes cast=false for all of them (same treatment as the lawn) — only
-// RECV matters here for 'furniture'/'pool'/'hedge'/'planting'.
+// _lotParts, or hedge/planting added in its res_mid _midLotParts, or the entrance plaza added in its
+// res_high _highLotParts) are attached via _attachParts' second loop below, which hardcodes cast=false
+// for all of them (same treatment as the lawn) — only RECV matters here for 'furniture'/'pool'/
+// 'hedge'/'planting'/'plaza'.
 const RECV = [
   { wall: 1, roof: 1, porchroof: 1, foundation: 1, deck: 1, steps: 1, chimney: 1, door: 1, dormerwall: 1, dormerroof: 1, lawn: 1, path: 1, furniture: 1, pool: 1,
-    parapet: 1, roofdeck: 1, core: 1, balcslab: 1, canopy: 1, stepdeck: 1, watertank: 1, hedge: 1, planting: 1 },
-  { wall: 1, roof: 1, foundation: 1, lawn: 1, parapet: 1, core: 1, hedge: 1 },
-  { wall: 1, roof: 1, porchroof: 1, lawn: 1, parapet: 1, core: 1 },
+    parapet: 1, roofdeck: 1, core: 1, balcslab: 1, canopy: 1, stepdeck: 1, watertank: 1, hedge: 1, planting: 1,
+    podium: 1, tower: 1, crown: 1, crowncap: 1, lobbyglass: 1, roofpool: 1, plaza: 1 },
+  { wall: 1, roof: 1, foundation: 1, lawn: 1, parapet: 1, core: 1, hedge: 1, podium: 1, tower: 1, crown: 1 },
+  { wall: 1, roof: 1, porchroof: 1, lawn: 1, parapet: 1, core: 1, podium: 1, tower: 1, crown: 1 },
   { lawn: 1 },
 ];
 
@@ -261,10 +276,14 @@ export function createHouseInstanceRenderer(scene) {
   function _buildRecord(rec, existing) {
     const a = rec.archetype;
     // a.id present = caller already resolved the archetype (getHouseArchetype / getTerraceArchetype /
-    // getMediumDensityArchetype) and just hands the object through — this already works for any kind,
-    // unchanged. a.kind === 'res_mid' is the shorthand form, mirroring the existing {w,d,variantIndex}
-    // convenience for res_low, so callers don't have to import getMediumDensityArchetype themselves.
-    const arch = a.id ? a : (a.kind === 'res_mid' ? getMediumDensityArchetype(a.w, a.d, a.variantIndex || 0) : getHouseArchetype(a.w, a.d, a.variantIndex || 0));
+    // getMediumDensityArchetype / getHighDensityArchetype) and just hands the object through — this
+    // already works for any kind, unchanged. a.kind === 'res_mid' / 'res_high' are shorthand forms,
+    // mirroring the existing {w,d,variantIndex} convenience for res_low, so callers don't have to
+    // import getMediumDensityArchetype/getHighDensityArchetype themselves.
+    const arch = a.id ? a
+      : a.kind === 'res_mid' ? getMediumDensityArchetype(a.w, a.d, a.variantIndex || 0)
+      : a.kind === 'res_high' ? getHighDensityArchetype(a.w, a.d, a.variantIndex || 0)
+      : getHouseArchetype(a.w, a.d, a.variantIndex || 0);
     if (!arch) throw new Error(`no ${a.kind || 'res_low'} house archetype for ${a.w}x${a.d}`);
     const rnd = _rng(rec.seed == null ? 1 : rec.seed);
     const v = 0.9 + rnd() * 0.13; // subtle per-house tint (seed-driven; NOT per-house geometry)
