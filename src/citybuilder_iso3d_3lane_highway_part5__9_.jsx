@@ -16882,11 +16882,25 @@ export default function CityGridIso() {
     // everything (their far plane + fog already limit it and shadows from behind the camera must not vanish).
     const cullMeshes = [..._collectInstanced()].filter((m) => !_instBefore.has(m));
     const viewCull = (() => {
-      const entries = cullMeshes.map((mesh) => ({ mesh, full: new Float32Array(16), fullCount: 0 }));
+      const entries = cullMeshes.map((mesh) => ({ mesh, full: new Float32Array(16), fullCount: 0, vis: new Int32Array(0), visCount: -1, tmp: new Int32Array(0) }));
       const CULL_PAD = 30, CULL_PAD_TALL = 45; // m: footprint + shadow reach / tallest building (its top may be on screen while its base is not)
-      const lastVP = new Float64Array(16);
+      // Prompt 41A: the cull is no longer re-run every frame the camera matrix changes. It runs when the camera has moved a
+      // meaningful amount since the LAST cull (measured against that pose, so slow drift accumulates), rate-limited:
+      //   * zoom / projection change (wheel, resize)  -> immediately
+      //   * city edit / region change (snapshot())     -> immediately (haveLast = false)
+      //   * look-at point moved > CULL_MOVE_BIG (4 m) or view turned > rotBig (<= 3 deg) -> at most every CULL_MIN_MS_BIG (~30 Hz)
+      //   * any smaller move (> 0.25 m / rotBig/12)    -> at most every CULL_MIN_MS (~15 Hz)
+      // "moved" is the look-at focus point (apply()'s 3rd arg), NOT camera.position: orbiting with Z/X swings the camera
+      // through hundreds of metres while the focus stays put, and rotation is judged by angle instead. rotBig shrinks with
+      // the visible radius so that at any zoom the screen-edge shift caused by the lag stays well inside CULL_PAD (30 m).
+      const CULL_MOVE_EPS = 0.25, CULL_MOVE_BIG = 4, CULL_ROT_MAX = 3 * Math.PI / 180, CULL_ROT_MIN = 0.4 * Math.PI / 180, CULL_EDGE_SHIFT = 18;
+      const CULL_MIN_MS = 66, CULL_MIN_MS_BIG = 33;
       const vp = new THREE.Matrix4();
+      const lastPos = new THREE.Vector3(), lastFocus = new THREE.Vector3(), lastQuat = new THREE.Quaternion();
+      let lastP0 = NaN, lastP5 = NaN, lastRunMs = -1e9;
       let lastCam = null, haveLast = false, culled = false;
+      const perf = { calls: 0, applies: 0, cpuMs: 0, scanned: 0, repacked: 0, unchanged: 0 };
+      const _now = () => (typeof performance !== 'undefined' ? performance.now() : Date.now());
       const flag = (mesh, n) => {
         const attr = mesh.instanceMatrix;
         const len = Math.max(16, n * 16);
@@ -16896,6 +16910,7 @@ export default function CityGridIso() {
       };
       const restore = () => {
         for (const e of entries) {
+          e.visCount = -1; // buffer content is replaced below -> the remembered visible set is void
           if (e.mesh.count === e.fullCount) continue;
           e.mesh.instanceMatrix.array.set(e.full.subarray(0, e.fullCount * 16), 0);
           e.mesh.count = e.fullCount;
@@ -16903,17 +16918,33 @@ export default function CityGridIso() {
         }
         culled = false; haveLast = false;
       };
-      const apply = (cam) => {
+      const apply = (cam, force = false, focus = null) => {
         if (!cam) { if (culled) restore(); lastCam = null; return; }
         lastCam = cam;
+        perf.calls++;
+        // ---- cheap early-out (no matrix work): decide from the camera's own pose whether a re-cull is worth it ----
+        const now = _now();
+        if (haveLast && !force) {
+          const P0 = cam.projectionMatrix.elements[0], P5 = cam.projectionMatrix.elements[5];
+          const projChanged = Math.abs(P0 - lastP0) > 1e-9 || Math.abs(P5 - lastP5) > 1e-9; // zoom / resize
+          if (!projChanged) {
+            const ref = focus || cam.position;
+            const dist = ref.distanceTo(focus ? lastFocus : lastPos), ang = cam.quaternion.angleTo(lastQuat);
+            const rVis = Math.hypot(1 / (Math.abs(P0) || 1e-6), 1.4 / (Math.abs(P5) || 1e-6)); // ~ visible ground radius (m)
+            const rotBig = Math.min(CULL_ROT_MAX, Math.max(CULL_ROT_MIN, CULL_EDGE_SHIFT / rVis));
+            if (dist <= CULL_MOVE_EPS && ang <= rotBig / 12) return;                 // same view: nothing to do
+            const big = dist > CULL_MOVE_BIG || ang > rotBig;
+            if (now - lastRunMs < (big ? CULL_MIN_MS_BIG : CULL_MIN_MS)) return;      // keep camera motion 60 fps, cull at 15-30 Hz
+          }
+        }
+        const t0 = now;
+        lastRunMs = now; lastPos.copy(cam.position); if (focus) lastFocus.copy(focus); lastQuat.copy(cam.quaternion);
+        lastP0 = cam.projectionMatrix.elements[0]; lastP5 = cam.projectionMatrix.elements[5];
         cam.updateMatrixWorld();
         vp.multiplyMatrices(cam.projectionMatrix, cam.matrixWorldInverse);
         const el = vp.elements;
-        let same = haveLast;
-        if (same) for (let i = 0; i < 16; i++) if (el[i] !== lastVP[i]) { same = false; break; }
-        if (same) return;
-        for (let i = 0; i < 16; i++) lastVP[i] = el[i];
         haveLast = true; culled = true;
+        perf.applies++;
         const P = cam.projectionMatrix.elements;
         const persp = P[11] === -1;
         const px = Math.abs(P[0]) * CULL_PAD, py = Math.abs(P[5]) * CULL_PAD, pyLow = Math.abs(P[5]) * (CULL_PAD + CULL_PAD_TALL);
@@ -16922,7 +16953,10 @@ export default function CityGridIso() {
         for (const e of entries) {
           const n = e.fullCount;
           if (!n) continue;
-          const src = e.full, dst = e.mesh.instanceMatrix.array;
+          const src = e.full;
+          if (e.tmp.length < n) e.tmp = new Int32Array(Math.max(n, 64));
+          const idx = e.tmp;
+          // pass 1: which instances are inside the padded view? (indices only - no buffer writes yet)
           let out = 0;
           for (let i = 0, s = 0; i < n; i++, s += 16) {
             const x = src[s + 12], y = src[s + 13], z = src[s + 14];
@@ -16931,12 +16965,23 @@ export default function CityGridIso() {
             const cy = e1 * x + e5 * y + e9 * z + e13;
             if (cx < -(w + px) || cx > w + px || cy < -(w + pyLow) || cy > w + py) continue;
             if (persp && (w < -CULL_PAD || w > farLim)) continue;
-            const o = out * 16;
-            for (let k = 0; k < 16; k++) dst[o + k] = src[s + k];
-            out++;
+            idx[out++] = i;
           }
-          if (out !== e.mesh.count || true) { e.mesh.count = out; flag(e.mesh, out); }
+          perf.scanned += n;
+          // pass 2: identical visible set as last time -> the GPU buffer already holds exactly this; do not repack / re-upload
+          let same = out === e.visCount && e.mesh.count === out;
+          if (same) { const pv = e.vis; for (let k = 0; k < out; k++) if (pv[k] !== idx[k]) { same = false; break; } }
+          if (same) { perf.unchanged++; continue; }
+          const dst = e.mesh.instanceMatrix.array;
+          for (let k = 0; k < out; k++) {
+            const s = idx[k] * 16, o = k * 16;
+            for (let q = 0; q < 16; q++) dst[o + q] = src[s + q];
+          }
+          e.mesh.count = out; flag(e.mesh, out);
+          const t = e.vis; e.vis = idx; e.tmp = t; e.visCount = out; // remember this set (swap buffers, no allocation)
+          perf.repacked++;
         }
+        perf.cpuMs += _now() - t0;
       };
       // called at the end of syncInstances(): copy the freshly written full lists, then re-cull for the current view
       const snapshot = () => {
@@ -16944,12 +16989,13 @@ export default function CityGridIso() {
           const n = e.mesh.count;
           if (e.full.length < n * 16) e.full = new Float32Array(n * 16);
           if (n) e.full.set(e.mesh.instanceMatrix.array.subarray(0, n * 16), 0);
-          e.fullCount = n;
+          e.fullCount = n; e.visCount = -1; // buffer now holds the FULL list -> must be re-packed
         }
         culled = false; haveLast = false;
-        if (lastCam) apply(lastCam);
+        if (lastCam) apply(lastCam, true, lastFocus.lengthSq() ? lastFocus : null); // city edit / region change: immediate
       };
-      return { apply, snapshot };
+      const getPerf = (reset = true) => { const p = { ...perf }; if (reset) { perf.calls = perf.applies = perf.scanned = perf.repacked = perf.unchanged = 0; perf.cpuMs = 0; } return p; };
+      return { apply, snapshot, getPerf };
     })();
 
     const markerGeo = new THREE.PlaneGeometry(TILE * 0.98, TILE * 0.98);
@@ -18739,9 +18785,21 @@ export default function CityGridIso() {
     renderer.shadowMap.autoUpdate = false;
     let _shadowFrameCounter = 0;
     const SHADOW_UPDATE_EVERY_N_FRAMES = 3;
+    // ---- Prompt 41A: camera dirty state ----------------------------------------------------------------------
+    // Input (WASD / ZX / drag / wheel) and the render call still run every frame, but the camera's pose/projection
+    // work (position, lookAt, updateProjectionMatrix) only runs when the pose actually differs from what was last
+    // applied (epsilon compare - float noise never counts), and the heavy consumers of the camera (viewCull,
+    // HouseInstanceRenderer) throttle themselves off the resulting pose (see viewCull / houseRenderer.update).
+    const CAM_EPS_POS = 0.01, CAM_EPS_AZ = 0.0002, CAM_EPS_GY = 0.002, CAM_EPS_ZOOM = 1e-6;
+    const _cullFocus = new THREE.Vector3();
+    const _applied = { tx: NaN, tz: NaN, gy: NaN, az: NaN, zoom: NaN }; // NaN = never applied -> first frame is dirty
+    // Dev profiling (window.__cityPerf / window.__cameraPerf): counters are only touched while a flag is set.
+    const _pf = { t0: 0, frames: 0, camMs: 0, camUpdates: 0, projUpdates: 0, camDirtyPos: 0, camDirtyRot: 0, camDirtyZoom: 0 };
     const animate = () => {
       if (_shadowFrameCounter % SHADOW_UPDATE_EVERY_N_FRAMES === 0) renderer.shadowMap.needsUpdate = true;
       _shadowFrameCounter++;
+      const _pOn = typeof window !== 'undefined' && (window.__cityPerf === true || window.__cameraPerf === true);
+      let _pT = _pOn ? performance.now() : 0;
       const dt = Math.min(clock.getDelta(), 0.1);
       const elapsed = clock.getElapsedTime();
       const keys = keysRef.current;
@@ -18768,14 +18826,22 @@ export default function CityGridIso() {
       }
       const target = camTargetRef.current;
       const groundAtTarget = Math.max(WATER_LEVEL, terrainHeight(target.x, target.z));
-      camGroundY += (groundAtTarget - camGroundY) * Math.min(1, dt * 4);
-      const horiz = Math.cos(CAM_ELEV);
-      const offset = new THREE.Vector3(Math.sin(az) * horiz, Math.sin(CAM_ELEV), Math.cos(az) * horiz).multiplyScalar(CAM_DIST);
-      camera.position.set(target.x + offset.x, camGroundY + offset.y, target.z + offset.z);
-      camera.up.set(0, 1, 0);
-      camera.lookAt(target.x, camGroundY, target.z);
-      camera.zoom = zoomRef.current;
-      camera.updateProjectionMatrix();
+      const _gDiff = groundAtTarget - camGroundY;
+      camGroundY = Math.abs(_gDiff) < 5e-4 ? groundAtTarget : camGroundY + _gDiff * Math.min(1, dt * 4); // snap the last 0.5 mm so the smoothing can settle (no endless dirty)
+      const _zoom = zoomRef.current;
+      const _posDirty = Math.abs(target.x - _applied.tx) > CAM_EPS_POS || Math.abs(target.z - _applied.tz) > CAM_EPS_POS || Math.abs(camGroundY - _applied.gy) > CAM_EPS_GY;
+      const _rotDirty = !(Math.abs(az - _applied.az) <= CAM_EPS_AZ);
+      const _zoomDirty = !(Math.abs(_zoom - _applied.zoom) <= CAM_EPS_ZOOM);
+      if (_posDirty || _rotDirty || _zoomDirty) {
+        const horiz = Math.cos(CAM_ELEV);
+        camera.position.set(target.x + Math.sin(az) * horiz * CAM_DIST, camGroundY + Math.sin(CAM_ELEV) * CAM_DIST, target.z + Math.cos(az) * horiz * CAM_DIST);
+        camera.up.set(0, 1, 0);
+        camera.lookAt(target.x, camGroundY, target.z);
+        if (_zoomDirty) { camera.zoom = _zoom; camera.updateProjectionMatrix(); } // projection only changes with zoom (resize has its own path)
+        _applied.tx = target.x; _applied.tz = target.z; _applied.gy = camGroundY; _applied.az = az; _applied.zoom = _zoom;
+        if (_pOn) { _pf.camUpdates++; if (_zoomDirty) _pf.projUpdates++; if (_posDirty) _pf.camDirtyPos++; if (_rotDirty) _pf.camDirtyRot++; if (_zoomDirty) _pf.camDirtyZoom++; }
+      }
+      if (_pOn) { const _n = performance.now(); _pf.camMs += _n - _pT; _pT = _n; }
       // Prompt 29 — first-person views (driver car / pedestrian): the shadow frustum follows the rider, not the
       // (possibly far away) iso camera target, and shrinks to the 100 m draw distance.
       const _fpCar = selectedCarRef.current, _fpPed = selectedPedRef.current;
@@ -18848,7 +18914,8 @@ export default function CityGridIso() {
       }
 
       updateAgents(dt, elapsed);
-      viewCull.apply(fpMode ? null : camera); // Prompt 30: iso view draws only the instances inside the view
+      _cullFocus.set(target.x, camGroundY, target.z);
+      viewCull.apply(fpMode ? null : camera, false, _cullFocus); // Prompt 30: iso view draws only the instances inside the view (Prompt 41A: self-throttled, see viewCull)
 
       const selCar = selectedCarRef.current;
       if (selCar && selCar.active) {
@@ -18897,10 +18964,30 @@ export default function CityGridIso() {
         houseRenderer.update(camera, { focus: target });
         renderer.render(scene, camera);
       }
-      // Prompt 29 — opt-in profiling: run `window.__cityPerf = true` in the console to log renderer.info every ~2 s.
-      if (typeof window !== 'undefined' && window.__cityPerf && (_shadowFrameCounter % 120 === 0)) {
-        const inf = renderer.info;
-        console.log('[perf] calls', inf.render.calls, 'tris', inf.render.triangles, 'geometries', inf.memory.geometries, 'textures', inf.memory.textures, 'fp', fpMode);
+      // Prompt 29 / 41A — opt-in dev profiling, OFF unless the console sets a flag (never set in production):
+      //   window.__cityPerf = true    -> every ~2 s: fps, draw calls, triangles, viewCull / HouseInstanceRenderer / camera CPU, LOD re-evaluations
+      //   window.__cameraPerf = true  -> every ~2 s: camera updates/s, viewCull applies/s, houseRenderer updates/s
+      if (_pOn) {
+        _pf.frames++;
+        const _nowP = performance.now();
+        if (!_pf.t0) { _pf.t0 = _nowP; viewCull.getPerf(true); houseRenderer.getPerf(true); }
+        else if (_nowP - _pf.t0 >= 2000) {
+          const sec = (_nowP - _pf.t0) / 1000;
+          const vc = viewCull.getPerf(true), hr = houseRenderer.getPerf(true), inf = renderer.info;
+          const f1 = (v) => +v.toFixed(1), f2 = (v) => +v.toFixed(2);
+          if (window.__cityPerf === true) {
+            console.log('[cityPerf]', {
+              fps: f1(_pf.frames / sec), calls: inf.render.calls, triangles: inf.render.triangles, fp: fpMode,
+              viewCull: { applies: vc.applies, repacked: vc.repacked, unchangedSets: vc.unchanged, cpuMs: f2(vc.cpuMs), msPerApply: f2(vc.applies ? vc.cpuMs / vc.applies : 0) },
+              houseRenderer: { updates: hr.calls, evals: hr.evals, sectorCulls: hr.cullRuns, cpuMs: f2(hr.cpuMs), lodSteps: hr.lodSteps, lodExamined: hr.lodExamined, lodMoves: hr.lodMoves },
+              camera: { updates: _pf.camUpdates, projectionUpdates: _pf.projUpdates, cpuMs: f2(_pf.camMs) },
+            });
+          }
+          if (window.__cameraPerf === true) {
+            console.log('[cameraPerf]', { cameraUpdatesPerSec: f1(_pf.camUpdates / sec), viewCullAppliesPerSec: f1(vc.applies / sec), houseRendererUpdatesPerSec: f1(hr.calls / sec), houseRendererEvalsPerSec: f1(hr.evals / sec), frameRate: f1(_pf.frames / sec) });
+          }
+          _pf.t0 = _nowP; _pf.frames = 0; _pf.camMs = 0; _pf.camUpdates = 0; _pf.projUpdates = 0; _pf.camDirtyPos = 0; _pf.camDirtyRot = 0; _pf.camDirtyZoom = 0;
+        }
       }
       raf = requestAnimationFrame(animate);
     };

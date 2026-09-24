@@ -2041,7 +2041,7 @@ export function prewarmLowrentArchetype(arch, lods = [0, 1, 2, 3]) { lods.forEac
 export const LOWRENT_ARCHETYPE_COUNT = LOWRENT_HOUSES.length;
 
 // ============================================================================
-// 11. 高密度住宅（res_high）— 高級タワーマンション 1種（8x6ロット / 40階建て）
+// 11. 高密度住宅（res_high）— 高級タワーマンション（8x6ロット / 40階建て / 8バリエーション）— Prompt 42 で作り直し
 // ----------------------------------------------------------------------------
 // 区画指定は 8(幅) x 6(奥行) だが、実際の建物本体は 8x8 の大きさになる：低層部（ポディウム、
 // 4階分）はロットぴったり(8x6, 道路側フラット)に収まり、その上のタワー部分だけが奥行を
@@ -2057,14 +2057,21 @@ const HIGH_DENSITY_SIZE_DIMS = {
   '8x6': { podiumD: 6, towerD: 8, podiumFloors: 4, floors: 40, households: '140-200', population: '320-560' },
 };
 
-// バリエーション: 外装(タワー/ポディウム)・冠部・バルコニー配置・コア位置・トリム(ゴールド/
-// プラチナ/ブロンズ)・ミラーの組み合わせ。全て同じ 8x6 サイズクラスのみ対応。
+// ---- 11.2 バリエーション（Prompt 42: res_mid と同じく「外装材 + アクセント材 + バルコニー配置 + 窓スタイル +
+// 玄関形式 + コア位置 + スカイテラス有無 + ミラー」を組み合わせて 8 種）。全て同じ 8x6 サイズクラス専用。
+//   facadeMaterial : タワー壁 / podiumMaterial : 低層部（石）/ accentMaterial : フィン・スパンドレル帯 / crownMaterial : 頂冠部
+//   balconyType    : 'perUnit' | 'alternating' | 'corner'（_highHasBalcony）
+//   windowStyle    : 'framed'(縁取り) | 'ribbon'(横長・縁なし) | 'tall'(縦長・縁取り)
+//   entranceType   : 'canopy'(大庇+2本柱) | 'colonnade'(大庇+4本柱)
 const HIGH_DENSITY_VARIANTS = [
-  { facadeMaterial: 'plasterBlue',  podiumMaterial: 'stoneDark',    crownMaterial: 'metalRoofDark', balconyType: 'corner',  corePosition: 'rear-left',   mirror: false, trimColor: 0xC9A227, metalColor: 0x2b2b2e },
-  { facadeMaterial: 'concrete',     podiumMaterial: 'stoneRough',   crownMaterial: 'metalRoofDark', balconyType: 'perUnit', corePosition: 'rear-right',  mirror: true,  trimColor: 0xB8B8C0, metalColor: 0x33343a },
-  { facadeMaterial: 'plasterWhite', podiumMaterial: 'concreteRock', crownMaterial: 'metalRoofDark', balconyType: 'corner',  corePosition: 'rear-center', mirror: false, trimColor: 0x8a5a2b, metalColor: 0x2b2b2e },
-  { facadeMaterial: 'plasterBlue',  podiumMaterial: 'stoneRough',   crownMaterial: 'metalRoofDark', balconyType: 'perUnit', corePosition: 'rear-left',   mirror: true,  trimColor: 0xC9A227, metalColor: 0x33343a },
-  { facadeMaterial: 'concreteRock', podiumMaterial: 'stoneDark',    crownMaterial: 'metalRoofDark', balconyType: 'corner',  corePosition: 'rear-right',  mirror: false, trimColor: 0xB8B8C0, metalColor: 0x2b2b2e },
+  { facadeMaterial: 'plasterBlue',  podiumMaterial: 'stoneDark',    accentMaterial: 'concrete',     crownMaterial: 'metalRoofDark', balconyType: 'alternating', windowStyle: 'framed', entranceType: 'canopy',    skyBand: true,  corePosition: 'rear-left',   mirror: false, trimColor: 0xC9A227, metalColor: 0x2b2b2e },
+  { facadeMaterial: 'concrete',     podiumMaterial: 'stoneRough',   accentMaterial: 'plasterWhite', crownMaterial: 'metalRoofDark', balconyType: 'perUnit',     windowStyle: 'ribbon', entranceType: 'colonnade', skyBand: false, corePosition: 'rear-right',  mirror: true,  trimColor: 0xB8B8C0, metalColor: 0x33343a },
+  { facadeMaterial: 'plasterWhite', podiumMaterial: 'concreteRock', accentMaterial: 'stoneRough',   crownMaterial: 'metalRoofDark', balconyType: 'corner',      windowStyle: 'tall',   entranceType: 'canopy',    skyBand: true,  corePosition: 'rear-center', mirror: false, trimColor: 0x8a5a2b, metalColor: 0x2b2b2e },
+  { facadeMaterial: 'plasterBlue',  podiumMaterial: 'stoneRough',   accentMaterial: 'plasterWhite', crownMaterial: 'metalRoofDark', balconyType: 'perUnit',     windowStyle: 'framed', entranceType: 'colonnade', skyBand: true,  corePosition: 'rear-left',   mirror: true,  trimColor: 0xC9A227, metalColor: 0x33343a },
+  { facadeMaterial: 'concreteRock', podiumMaterial: 'stoneDark',    accentMaterial: 'concrete',     crownMaterial: 'metalRoofDark', balconyType: 'alternating', windowStyle: 'ribbon', entranceType: 'canopy',    skyBand: false, corePosition: 'rear-right',  mirror: false, trimColor: 0xB8B8C0, metalColor: 0x2b2b2e },
+  { facadeMaterial: 'plasterCream', podiumMaterial: 'stoneRough',   accentMaterial: 'stoneDark',    crownMaterial: 'metalRoofDark', balconyType: 'corner',      windowStyle: 'tall',   entranceType: 'colonnade', skyBand: true,  corePosition: 'rear-center', mirror: true,  trimColor: 0x8a5a2b, metalColor: 0x33343a },
+  { facadeMaterial: 'brickRed',     podiumMaterial: 'stoneDark',    accentMaterial: 'plasterWhite', crownMaterial: 'metalRoofDark', balconyType: 'alternating', windowStyle: 'framed', entranceType: 'canopy',    skyBand: false, corePosition: 'rear-left',   mirror: false, trimColor: 0xC9A227, metalColor: 0x2b2b2e },
+  { facadeMaterial: 'plasterWhite', podiumMaterial: 'concreteRock', accentMaterial: 'concrete',     crownMaterial: 'metalRoofDark', balconyType: 'perUnit',     windowStyle: 'tall',   entranceType: 'colonnade', skyBand: true,  corePosition: 'rear-right',  mirror: true,  trimColor: 0xB8B8C0, metalColor: 0x33343a },
 ];
 
 function _buildHighDensityList(sizeKey, variants, seedBase) {
@@ -2075,8 +2082,12 @@ function _buildHighDensityList(sizeKey, variants, seedBase) {
     floors: dims.floors,
     facadeMaterial: v.facadeMaterial,
     podiumMaterial: v.podiumMaterial,
+    accentMaterial: v.accentMaterial,
     crownMaterial: v.crownMaterial,
     balconyType: v.balconyType,
+    windowStyle: v.windowStyle,
+    entranceType: v.entranceType,
+    skyBand: !!v.skyBand,
     corePosition: v.corePosition,
     mirror: !!v.mirror,
     trimColor: v.trimColor,
@@ -2101,26 +2112,48 @@ export function getHighDensityHouseConfigForCell(w, d, variantIndex = 0) {
 }
 
 // ---- 11.3 レイアウト計算 ---------------------------------------------------------------------
+// Prompt 42 の設計（res_mid と同じ「壁 + 窓 + 枠 + まぐさ/窓台 + バルコニー + 柱」の kit-of-parts を
+// タワー規模に拡大）:
+//   * タワー壁面は道路側ロット前端 fz から relief(=0.8m) だけ奥(zW)に置く。その手前 0.8m の帯が「凹凸ゾーン」で、
+//     縦フィン・各階スパンドレル帯・バルコニー床がここに入る（＝窓は常にフィンの奥に凹んで見える）。
+//     凹凸ゾーンの部品は全て fz 以内 → 道路側へは絶対にはみ出さない。
+//   * 上部 tierFloors 階はセットバック（四方 0.8m 内側）した塔頂部（tier）。その上にルーフテラス+頂冠。
+//   * テクスチャは全 LOD で 2m x 2m/タイル（_texBox）。以前は LOD1/2 で 4m x 36m に引き伸ばされていた。
 function _highDensityLayout(config, w, d) {
   const dims = HIGH_DENSITY_SIZE_DIMS[config.sizeKey];
   const floors = config.floors || dims.floors;
   const podiumFloors = Math.min(floors - 1, dims.podiumFloors);
   const towerFloors = floors - podiumFloors;
+  const tierFloors = Math.max(0, Math.min(4, towerFloors - 2));
+  const mainFloors = towerFloors - tierFloors;
   const podiumD = dims.podiumD, towerD = dims.towerD;
   const width = w;
   const floorH = HIGH_DENSITY_FLOOR_H;
-  const podiumH = floorH * podiumFloors * 1.18; // ロビー／低層階は天井高め（高級感）
-  const towerWallH = floorH * towerFloors;
+  const podiumFloorH = floorH * 1.18; // ロビー／低層階は天井高め（高級感）
+  const podiumH = podiumFloorH * podiumFloors;
+  const mainH = floorH * mainFloors, tierH = floorH * tierFloors;
+  const towerWallH = mainH + tierH;
   const baseY = 0.35, crownH = 1.7;
+
+  const relief = 0.8;
+  const fz = podiumD / 2, bzT = fz - towerD, zW = fz - relief;
+  const bodyD = towerD - relief, bodyZ = (bzT + zW) / 2;
+  const tierInset = 0.8, tierW = width - tierInset * 2, tierD = bodyD - tierInset * 2, tierZ = bodyZ;
+  const tierCols = 4, tierBayW = tierW / tierCols;
 
   const cols = Math.max(3, Math.min(6, Math.round(width / 1.5)));
   const bayW = width / cols;
   const mirrorSign = config.mirror ? -1 : 1;
   const colXs = Array.from({ length: cols }, (_, i) => (-width / 2 + bayW * (i + 0.5)) * mirrorSign).sort((a, b) => a - b);
 
-  const winW = Math.min(bayW * 0.82, bayW - 0.1), winH = floorH * 0.62;
-  const balcW = Math.min(1.8, bayW * 0.8), balcD = 1.1, balcH = 1.05;
-  const entranceW = Math.min(3.2, width * 0.4);
+  const finW = 0.28, edgeFinW = 0.4, spH = 0.42;
+  const style = config.windowStyle || 'framed';
+  const winW = style === 'ribbon' ? bayW - finW - 0.08 : bayW - finW - 0.28;
+  const winH = style === 'tall' ? floorH * 0.7 : floorH * 0.58;
+  const balcW = bayW - finW - 0.04, balcH = 0.55; // 手すりは res_mid と同じ低さ（窓を隠さない）
+  const skyF = config.skyBand ? Math.round(mainFloors * 0.55) : -1;
+
+  const entranceW = Math.min(1.3, bayW * 0.8);
   const coreW = Math.min(2.0, width * 0.2), coreD = 1.1;
   let coreX;
   if (config.corePosition === 'rear-left') coreX = -width / 2 + coreW / 2 + 0.2;
@@ -2129,130 +2162,235 @@ function _highDensityLayout(config, w, d) {
   coreX *= mirrorSign;
 
   return {
-    width, podiumD, towerD, floors, podiumFloors, towerFloors, floorH, podiumH, towerWallH, baseY, crownH,
-    cols, bayW, colXs, winW, winH, balcW, balcD, balcH, entranceW, coreW, coreD, coreX, mirrorSign,
+    width, podiumD, towerD, floors, podiumFloors, towerFloors, mainFloors, tierFloors, floorH, podiumFloorH, podiumH,
+    mainH, tierH, towerWallH, baseY, crownH, relief, fz, bzT, zW, bodyD, bodyZ,
+    tierW, tierD, tierZ, tierCols, tierBayW, cols, bayW, colXs, finW, edgeFinW, spH, winW, winH, balcW, balcH, skyF,
+    entranceW, coreW, coreD, coreX, mirrorSign,
     yardW: width, yardD: 0, // 側庭/奥庭なし（低層部がロット全面を占める、高級タワーの前提）
   };
 }
 
+/** バルコニー配置（フィンの間の1バイ単位）。f = タワー内の階(0=ポディウム直上)、ci = 左からのバイ番号。 */
+function _highHasBalcony(f, ci, L, type, mirror) {
+  if (f < 1 || f === L.skyF) return false;
+  const c = mirror ? L.cols - 1 - ci : ci;
+  switch (type) {
+    case 'perUnit': return f % 2 === 1 && c % 2 === 1;
+    case 'alternating': return f % 2 === 1 ? c % 2 === 0 : (f % 4 === 0 && c % 2 === 1);
+    case 'corner': return (c === 0 || c === L.cols - 1) && (f % 4 === 2 || f >= L.mainFloors - 3);
+    default: return false;
+  }
+}
+
 // ---- 11.4 マテリアル解決 ---------------------------------------------------------------------
+// このシーンには環境マップが無く、metalness>0 は黒く潰れる（上の METAL_PRESETS のコメント参照）。以前のタワーは
+// trim を metalness 0.55 にしていたため、金/プラチナの枠・柱・庇が暗く沈んでいた → 0.1 に抑えて色を出す。
 function _highMatInfo(refs, role) {
   switch (role) {
-    case 'facade': case 'podium': case 'crown': case 'foundation':
+    case 'facade': case 'podium': case 'crown': case 'foundation': case 'accent':
       return { matKey: `pbr:${refs[role]}`, material: getSharedPBRMaterial(refs[role]) };
-    case 'trim': return { matKey: `solid:${refs.trim}`, material: _solid(refs.trim, { roughness: 0.3, metalness: 0.55 }) }; // ゴールド/プラチナ/ブロンズの金属トリム
-    case 'metal': return { matKey: `solid:${refs.metal}`, material: _solid(refs.metal, { roughness: 0.4, metalness: 0.4 }) };
+    case 'trim': return { matKey: `solid:${refs.trim}:hi`, material: _solid(refs.trim, { roughness: 0.35, metalness: 0.1 }) }; // ゴールド/プラチナ/ブロンズのトリム
+    case 'metal': return { matKey: `solid:${refs.metal}:hi`, material: _solid(refs.metal, { roughness: 0.45, metalness: 0.12 }) };
     case 'glass': return { matKey: 'glass', material: _glassMaterial() };
     case 'pool': return { matKey: 'poolwater', material: _poolWaterMaterial() };
     default: return { matKey: `pbr:${refs.facade}`, material: getSharedPBRMaterial(refs.facade) };
   }
 }
+// 実寸ベースのUV: 全ての面で 2m = 1タイル（縦横同じ密度）。単位ボックスを引き伸ばす方式(_unitBoxGeo)は
+// 高い建物で縦に数十mも引き伸ばされるため、壁面には使わない。
+const _texBox = (w, h, d) => _boxMod(w, h, d, Math.max(w, d, 0.5) / 2, Math.max(h, 0.5) / 2);
 
 // ---- 11.5 LOD0: 詳細kit-of-parts ------------------------------------------------------------
-// 座標系はres_midと同じ: 原点=建物フットプリント中心, +Z=道路側。fz(ロット前端)はポディウム・
-// タワー共通で、どちらも絶対にfzより前方向(+Z)へは張り出さない。タワーだけがfzから見て
-// -Z方向(道路と反対側)へさらに(towerD-podiumD)mだけ深く伸びる＝ロット背後へのカンチレバー。
+// 座標系はres_midと同じ: 原点=建物フットプリント中心, +Z=道路側。fz(ロット前端)より前(+Z)へは何も出ない。
 function _highLod0Parts(arch) {
   const L = arch.layout, refs = arch.materialRefs, list = [];
   const add = (part, g, role, local, tinted) => list.push({ part, geoKey: g.key, geometry: g.geometry, ..._highMatInfo(refs, role), local, tinted: !!tinted });
   const U = _unitBox();
   const unit = (part, role, x, y, z, sx, sy, sz, yaw) => add(part, U, role, _local(x, y, z, sx, sy, sz, yaw), false);
-  const { width, podiumD, towerD, podiumFloors, towerFloors, floorH, podiumH, towerWallH, baseY, crownH, cols, colXs, winW, winH, balcW, balcD, balcH, entranceW, coreW, coreD, coreX } = L;
-  const fz = podiumD / 2, bzT = fz - towerD; // タワー背面（ポディウムより奥まで伸びる）
-  const topPodiumY = baseY + podiumH, topTowerY = topPodiumY + towerWallH, topCrownY = topTowerY + crownH;
+  const { width, podiumD, podiumFloors, mainFloors, tierFloors, floorH, podiumFloorH, podiumH, mainH, tierH, baseY, crownH, relief: R, fz, bzT, zW, bodyD, bodyZ,
+    tierW, tierD, tierZ, tierCols, tierBayW, cols, bayW, colXs, finW, edgeFinW, spH, winW, winH, balcW, skyF, entranceW, coreW, coreD, coreX } = L;
+  const topPodiumY = baseY + podiumH, topMainY = topPodiumY + mainH, topTierY = topMainY + tierH;
+  const midCi = Math.floor((cols - 1) / 2); // 玄関バイ（cols=5 -> 中央）
 
-  // --- 基礎
-  add('foundation', _boxMod(width + 0.3, baseY, podiumD + 0.3, Math.max(width, 1) / 2, 0.5), 'foundation', _local(0, baseY / 2, 0), true);
+  // --- 基礎（ロット内にぴったり）
+  add('foundation', _texBox(width, baseY, podiumD), 'foundation', _local(0, baseY / 2, 0), true);
 
-  // --- 低層部（ポディウム）: 石張り仕上げ＋列柱、ロットに正確にフィット（張り出しゼロ）
-  add('podium', _boxMod(width, podiumH, podiumD, Math.max(width, 1) / 2, Math.max(podiumH, 1) / 2), 'podium', _local(0, baseY + podiumH / 2, 0), true);
+  // --- 低層部（ポディウム）: 石張りの壁 + 前面に 0.3m の柱・各階の帯（凹凸ゾーン）
+  const pR = 0.3;
+  add('podium', _texBox(width, podiumH, podiumD - pR), 'podium', _local(0, baseY + podiumH / 2, -pR / 2), true);
   for (let c = 0; c <= cols; c++) {
-    const px = -width / 2 + (width / cols) * c;
-    add('pier', _boxMod(0.2, podiumH, podiumD + 0.02, 0.2, Math.max(podiumH, 1) / 2), 'trim', _local(px, baseY + podiumH / 2, 0), true);
+    const edge = c === 0 || c === cols, pw = edge ? 0.5 : 0.4;
+    const px = edge ? (c === 0 ? -width / 2 + pw / 2 : width / 2 - pw / 2) : -width / 2 + bayW * c;
+    add('pier', _texBox(pw, podiumH, pR), 'accent', _local(px, baseY + podiumH / 2, fz - pR / 2), true);
   }
-  add('lobbyglass', _boxMod(width - 0.6, floorH * 0.85, 0.08, Math.max(width, 1) / 2, 1), 'glass', _local(0, baseY + floorH * 0.5, fz + 0.02), false);
+  for (let f = 1; f <= podiumFloors; f++) { // 各階の帯（最上段は軒のコーニス）
+    const top = f === podiumFloors, bh = top ? 0.6 : 0.42, by = baseY + podiumFloorH * f - (top ? 0.3 : 0);
+    add('spandrel', _texBox(width - 0.9, bh, pR - 0.04), 'accent', _local(0, by, fz - (pR - 0.04) / 2), true);
+  }
+  // 1階: ロビーの大きなガラス面（玄関バイ以外）/ 2〜4階: 窓（枠・ガラス・窓台）
+  const gH = podiumFloorH * 0.66, gW = bayW - 0.5;
+  colXs.forEach((x, ci) => {
+    if (ci !== midCi) {
+      const gy = baseY + podiumFloorH * 0.5;
+      unit('winframe', 'trim', x, gy, fz - pR - 0.02, gW + 0.14, gH + 0.14, 0.08);
+      unit('lobbyglass', 'glass', x, gy, fz - pR + 0.01, gW, gH, 0.07);
+    }
+    for (let f = 1; f < podiumFloors; f++) {
+      const wy = baseY + podiumFloorH * f + podiumFloorH * 0.5, pw = bayW - 0.62, ph = podiumFloorH * 0.5;
+      unit('winframe', 'trim', x, wy, fz - pR - 0.02, pw + 0.14, ph + 0.14, 0.08);
+      unit('glass', 'glass', x, wy, fz - pR + 0.01, pw, ph, 0.07);
+      unit('sill', 'accent', x, wy - ph / 2 - 0.09, fz - pR + 0.03, pw + 0.3, 0.09, 0.18);
+    }
+  });
 
-  // --- グランドエントランス（大庇＋列柱＋車寄せ）。庇・柱・車寄せ舗装は全てfz以内(前方には出ない)
-  const doorW = Math.min(entranceW, width * 0.35), doorH = floorH * 0.85;
-  unit('doorframe', 'trim', 0, baseY + doorH / 2, fz - 0.02, doorW + 0.2, doorH + 0.14, 0.06);
-  unit('door', 'glass', 0, baseY + doorH / 2, fz + 0.01, doorW, doorH, 0.06);
-  add('canopy', _boxMod(doorW + 2.4, 0.18, 1.8, (doorW + 2.4) / 1.5, 1), 'trim', _local(0, baseY + doorH + 0.4, fz - 0.9), true);
-  [-1, 1].forEach((s) => unit('canopypost', 'metal', s * (doorW / 2 + 0.9), baseY + (doorH + 0.4) * 0.5, fz - 1.6, 0.1, doorH + 0.4, 0.1));
-  [-1, 1].forEach((s) => unit('planter', 'podium', s * (doorW / 2 + 1.7), baseY + 0.25, fz - 0.4, 0.6, 0.5, 0.6));
+  // --- グランドエントランス（大庇 + 柱 + 植栽）。庇・柱は全て fz 以内
+  const doorW = entranceW, doorH = podiumFloorH * 0.78;
+  unit('doorframe', 'trim', 0, baseY + doorH / 2, fz - pR - 0.02, doorW + 0.2, doorH + 0.12, 0.08);
+  unit('door', 'glass', 0, baseY + doorH / 2, fz - pR + 0.01, doorW, doorH, 0.07);
+  const colonnade = arch.entranceType === 'colonnade';
+  const canW = doorW + (colonnade ? 3.4 : 2.6), canD = colonnade ? 1.7 : 1.4;
+  add('canopy', _boxMod(canW, 0.16, canD, canW / 1.5, 1), 'trim', _local(0, baseY + doorH + 0.35, fz - canD / 2), true);
+  const postXs = colonnade ? [-(doorW / 2 + 1.6), -(doorW / 2 + 0.6), doorW / 2 + 0.6, doorW / 2 + 1.6] : [-(doorW / 2 + 1.1), doorW / 2 + 1.1];
+  postXs.forEach((px) => unit('canopypost', 'metal', px, baseY + (doorH + 0.35) / 2, fz - canD + 0.15, 0.1, doorH + 0.35, 0.1));
+  [-1, 1].forEach((s) => unit('planter', 'podium', s * bayW, baseY + 0.25, fz - pR - 0.4, 0.7, 0.5, 0.7));
 
-  // --- タワー本体: ガラスカーテンウォール＋各階リボン窓。正面(fz)はポディウムと面一、
-  //     背面だけがbzT(=fz-towerD)まで奥へ伸びる＝「88サイズ」のカンチレバー部分
-  add('tower', _boxMod(width, towerWallH, towerD, Math.max(width, 1) / 2, Math.max(towerWallH, 1) / 3), 'facade', _local(0, topPodiumY + towerWallH / 2, bzT + towerD / 2), true);
-  for (let f = 0; f < towerFloors; f++) {
-    const wy = topPodiumY + floorH * f + floorH * 0.55;
-    const isTopBand = f >= towerFloors - 3; // 最上部はペントハウス階（コーナーテラス）
+  // --- タワー本体（main）: 壁面は zW(=fz-0.8) の面。前 0.8m は凹凸ゾーン（フィン・帯・バルコニー）
+  add('tower', _texBox(width, mainH, bodyD), 'facade', _local(0, topPodiumY + mainH / 2, bodyZ), true);
+  // 縦フィン（両端は太め）。壁面(zW)から fz までの深いフィン → 窓は常にフィンの奥
+  for (let c = 0; c <= cols; c++) {
+    const edge = c === 0 || c === cols;
+    const fw = edge ? edgeFinW : finW;
+    const fx = edge ? (c === 0 ? -width / 2 + fw / 2 : width / 2 - fw / 2) : -width / 2 + bayW * c;
+    add('pier', _texBox(fw, mainH, R), 'accent', _local(fx, topPodiumY + mainH / 2, zW + R / 2), true);
+  }
+  // 各階スパンドレル帯（スラブ端）。バルコニー床はこれより 0.15m 手前(fz)まで出る
+  const spD = R - 0.15;
+  for (let f = 0; f <= mainFloors; f++) add('spandrel', _texBox(width - edgeFinW * 2, spH, spD), 'accent', _local(0, topPodiumY + floorH * f, zW + spD / 2), true);
+  // 各階・各バイの窓 + バルコニー
+  const framed = arch.windowStyle !== 'ribbon';
+  for (let f = 0; f < mainFloors; f++) {
+    const y0 = topPodiumY + floorH * f;
+    if (f === skyF) { // スカイテラス階: 全面ガラス + 通しのテラス床/手すり + プランター
+      const tgH = floorH - spH - 0.2;
+      colXs.forEach((x) => {
+        unit('glass', 'glass', x, y0 + spH / 2 + 0.1 + tgH / 2, zW + 0.06, bayW - finW - 0.1, tgH, 0.08);
+        unit('planter', 'podium', x, y0 + 0.28, fz - 0.4, bayW - 0.7, 0.5, 0.45);
+      });
+      add('balcslab', _boxMod(width - edgeFinW * 2, 0.14, R, 2, 1), 'foundation', _local(0, y0 - 0.02, zW + R / 2), true);
+      unit('railing', 'metal', 0, y0 + 0.5, fz - 0.04, width - edgeFinW * 2, 0.9, 0.04); // スカイテラスは通しの高い手すり
+      continue;
+    }
+    const wy = y0 + floorH * 0.56;
     colXs.forEach((x, ci) => {
-      unit('winframe', 'trim', x, wy, fz, winW, winH, 0.05);
-      unit('glass', 'glass', x, wy, fz + 0.02, winW - 0.08, winH - 0.08, 0.07);
-      unit('mullion', 'trim', x, wy, fz + 0.055, 0.025, winH - 0.08, 0.025);
-      const wantBalc = (arch.balconyType === 'perUnit' && f % 2 === 1) || (arch.balconyType === 'corner' && isTopBand && (ci === 0 || ci === cols - 1));
-      if (wantBalc) {
-        const slabY = topPodiumY + floorH * f - 0.05, railY = slabY + balcH / 2 + 0.05;
-        add('balcslab', _boxMod(balcW, 0.1, balcD, balcW / 1.2, 1), 'foundation', _local(x, slabY, fz + balcD / 2), true);
-        unit('railing', 'metal', x, railY, fz + balcD - 0.03, balcW, balcH * 0.55, 0.04);
+      if (framed) unit('winframe', 'trim', x, wy, zW + 0.05, winW + 0.14, winH + 0.14, 0.1);
+      unit('glass', 'glass', x, wy, zW + 0.07, winW, winH, 0.08);
+      unit('sill', 'accent', x, wy - winH / 2 - 0.08, zW + 0.11, winW + 0.26, 0.08, 0.22);
+      if (_highHasBalcony(f, ci, L, arch.balconyType, arch.mirror)) {
+        add('balcslab', _boxMod(L.balcW, 0.12, R, L.balcW / 1.5, 1), 'foundation', _local(x, y0 - 0.02, zW + R / 2), true);
+        unit('railing', 'metal', x, y0 + L.balcH / 2 + 0.06, fz - 0.04, L.balcW, L.balcH, 0.04);
       }
     });
   }
+  // メインルーフ(セットバックのテラス)の低い手すり壁
+  const prH = 0.9, prT = 0.18;
+  add('parapet', _texBox(width, prH, prT), 'accent', _local(0, topMainY + prH / 2, zW + prT / 2), true);
+  add('parapet', _texBox(width, prH, prT), 'accent', _local(0, topMainY + prH / 2, bzT + prT / 2), true);
+  [-1, 1].forEach((s) => add('parapet', _texBox(prT, prH, bodyD), 'accent', _local(s * (width / 2 - prT / 2), topMainY + prH / 2, bodyZ), true));
+  add('roofdeck', _boxMod(width - 0.5, 0.06, bodyD - 0.5, 2, 2), 'foundation', _local(0, topMainY + 0.03, bodyZ), true);
+
+  // --- 塔頂部（tier）: 四方 0.8m セットバック。各階に 4 バイの窓 + 帯
+  if (tierFloors > 0) {
+    add('tower', _texBox(tierW, tierH, tierD), 'facade', _local(0, topMainY + tierH / 2, tierZ), true);
+    const tf = tierZ + tierD / 2;
+    for (let f = 0; f < tierFloors; f++) {
+      const y0 = topMainY + floorH * f, wy = y0 + floorH * 0.56;
+      add('spandrel', _texBox(tierW, spH, 0.24), 'accent', _local(0, y0 + (f === 0 ? 0.3 : 0), tf + 0.12), true);
+      for (let ti = 0; ti < tierCols; ti++) {
+        const x = -tierW / 2 + tierBayW * (ti + 0.5), tw = tierBayW - 0.5;
+        if (framed) unit('winframe', 'trim', x, wy, tf + 0.05, tw + 0.14, winH + 0.14, 0.1);
+        unit('glass', 'glass', x, wy, tf + 0.07, tw, winH, 0.08);
+        unit('sill', 'accent', x, wy - winH / 2 - 0.08, tf + 0.11, tw + 0.26, 0.08, 0.22);
+      }
+    }
+  }
 
   // --- コア（エレベーター／階段）: タワー背面にさらに張り出す（道路と反対側なので問題なし）
-  const coreH = towerWallH + crownH * 0.6;
-  add('core', _boxMod(coreW, coreH, coreD, coreW / 1.2, coreH / 3), 'podium', _local(coreX, topPodiumY + coreH / 2, bzT - coreD / 2), true);
-  for (let f = 2; f < towerFloors; f += 4) unit('glass', 'glass', coreX, topPodiumY + floorH * f + floorH * 0.5, bzT - coreD - 0.02, coreW * 0.5, 0.5, 0.05);
+  const coreH = mainH + tierH + crownH * 0.6;
+  add('core', _boxMod(coreW, coreH, coreD, coreW / 1.2, coreH / 2), 'podium', _local(coreX, topPodiumY + coreH / 2, bzT - coreD / 2), true);
+  for (let f = 2; f < mainFloors + tierFloors; f += 4) unit('glass', 'glass', coreX, topPodiumY + floorH * f + floorH * 0.5, bzT - coreD - 0.02, coreW * 0.5, 0.5, 0.05);
 
-  // --- クラウン（頂冠部）＋ルーフガーデン／インフィニティプール
-  add('crown', _boxMod(width + 0.15, crownH, towerD + 0.15, Math.max(width, 1) / 2, 1), 'crown', _local(0, topTowerY + crownH / 2, bzT + towerD / 2), true);
-  add('crowncap', _boxMod(width * 0.55, crownH * 0.5, towerD * 0.4, 1, 1), 'crown', _local(0, topCrownY + crownH * 0.25, bzT + towerD * 0.5), true);
-  add('roofdeck', _boxMod(width * 0.9, 0.04, towerD * 0.9, 1, 1), 'foundation', _local(0, topTowerY + 0.02, bzT + towerD / 2), true);
-  add('roofpool', _boxMod(width * 0.4, 0.12, towerD * 0.26, 1, 1), 'pool', _local(0, topTowerY + 0.06, bzT + towerD * 0.72), false);
-  unit('vent', 'metal', width / 2 - 0.8, topTowerY + 0.3, bzT + 0.6, 0.3, 0.5, 0.3); // 設備類は最小限（高級タワーは目立たせない）
-
+  // --- 頂冠部: ルーフテラス（デッキ+プール）を見せる開放型。以前は中身の詰まった箱で、デッキとプールが箱の内側に隠れていた
+  const tW = tierFloors > 0 ? tierW : width, tD = tierFloors > 0 ? tierD : bodyD, tZ = tierFloors > 0 ? tierZ : bodyZ;
+  const tFront = tZ + tD / 2, tBack = tZ - tD / 2;
+  add('roofdeck', _boxMod(tW - 0.3, 0.06, tD - 0.3, 2, 2), 'foundation', _local(0, topTierY + 0.03, tZ), true);
+  add('roofpool', _boxMod(tW * 0.5, 0.12, tD * 0.26, 1, 1), 'pool', _local(0, topTierY + 0.06, tFront - tD * 0.3), false);
+  const cpH = crownH - 0.6, cpT = 0.2;
+  add('parapet', _texBox(tW, cpH, cpT), 'crown', _local(0, topTierY + cpH / 2, tFront - cpT / 2), true);
+  add('parapet', _texBox(tW, cpH, cpT), 'crown', _local(0, topTierY + cpH / 2, tBack + cpT / 2), true);
+  [-1, 1].forEach((s) => add('parapet', _texBox(cpT, cpH, tD), 'crown', _local(s * (tW / 2 - cpT / 2), topTierY + cpH / 2, tZ), true));
+  [-1, 1].forEach((sx) => [-1, 1].forEach((sz) => add('crown', _texBox(0.55, crownH + 0.9, 0.55), 'crown', _local(sx * (tW / 2 - 0.275), topTierY + (crownH + 0.9) / 2, sz > 0 ? tFront - 0.275 : tBack + 0.275), true)));
+  add('crowncap', _texBox(tW * 0.45, 1.8, tD * 0.3), 'crown', _local(0, topTierY + 0.9, tBack + tD * 0.3), true);
+  unit('spire', 'metal', 0, topTierY + 1.8 + 3.2, tBack + tD * 0.3, 0.14, 6.4, 0.14);
   return list;
 }
 
 // ---- 11.6 LOD1〜3: 簡略化kit-of-parts ---------------------------------------------------------
+// 壁は全 LOD で _texBox（2m/タイル）。LOD1 は「フィン + 隔階の帯 + 隔階のバイ別ガラス」で窓の縦横リズムを残し、
+// LOD2 は「フィン + バイ別の縦通しガラスリボン」だけ（窓の個別描画なし）。LOD3 は単色の塊。
 function _highUnitParts(arch, lod) {
   const L = arch.layout, refs = arch.materialRefs, list = [];
   const add = (part, g, matInfo, local, tinted, extra) => list.push({ part, geoKey: g.key, geometry: g.geometry, ...matInfo, local, tinted, ...extra });
   const pbr = (k) => ({ matKey: `pbr:${k}`, material: getSharedPBRMaterial(k) });
   const lite = (k) => ({ matKey: `lite:${k}`, material: getSharedLiteMaterial(k) });
   const flatFacade = { matKey: 'flat:white', material: _solid(0xd7d7d0, { roughness: 0.9 }) };
-  const { width, podiumD, towerD, towerFloors, floorH, podiumH, towerWallH, baseY, crownH } = L;
-  const fz = podiumD / 2, bzT = fz - towerD;
-  const topPodiumY = baseY + podiumH, topTowerY = topPodiumY + towerWallH;
+  const { width, podiumD, mainFloors, tierFloors, floorH, podiumH, mainH, tierH, baseY, crownH, relief: R, fz, zW, bodyD, bodyZ,
+    tierW, tierD, tierZ, cols, bayW, colXs, finW, edgeFinW, spH, podiumFloorH } = L;
+  const topPodiumY = baseY + podiumH, topMainY = topPodiumY + mainH, topTierY = topMainY + tierH;
 
   const podiumMat = lod === 1 ? pbr(refs.podium) : lod === 2 ? lite(refs.podium) : flatFacade;
   const towerMat = lod === 1 ? pbr(refs.facade) : lod === 2 ? lite(refs.facade) : flatFacade;
   const crownMat = lod === 1 ? pbr(refs.crown) : lod === 2 ? lite(refs.crown) : flatFacade;
+  const accentMat = lod === 1 ? pbr(refs.accent) : lite(refs.accent);
   const podiumColor = lod === 3 ? { color: _flatRGB(refs.podium) } : null;
   const towerColor = lod === 3 ? { color: _flatRGB(refs.facade) } : null;
   const crownColor = lod === 3 ? { color: _flatRGB(refs.crown) } : null;
+  const tW = tierFloors > 0 ? tierW : width, tD = tierFloors > 0 ? tierD : bodyD, tZ = tierFloors > 0 ? tierZ : bodyZ;
 
-  if (lod === 3) { // Billboard/簡略形: 3パーツのみ
-    add('podium', _unitBoxGeo(1, 1), podiumMat, _local(0, baseY + podiumH / 2, 0, width, podiumH, podiumD), true, podiumColor);
-    add('tower', _unitBoxGeo(1, 1), towerMat, _local(0, topPodiumY + towerWallH / 2, bzT + towerD / 2, width, towerWallH, towerD), true, towerColor);
-    add('crown', _unitBoxGeo(1, 1), crownMat, _local(0, topTowerY + crownH / 2, bzT + towerD / 2, width, crownH, towerD), true, crownColor);
+  if (lod === 3) { // 簡略形: ポディウム + 本体 + 塔頂部 + 頂冠
+    add('podium', _texBox(width, podiumH, podiumD), podiumMat, _local(0, baseY + podiumH / 2, 0), true, podiumColor);
+    add('tower', _texBox(width, mainH, bodyD + R), towerMat, _local(0, topPodiumY + mainH / 2, bodyZ + R / 2), true, towerColor);
+    if (tierFloors > 0) add('tower', _texBox(tW, tierH, tD), towerMat, _local(0, topMainY + tierH / 2, tZ), true, towerColor);
+    add('crown', _texBox(tW, crownH, tD), crownMat, _local(0, topTierY + crownH / 2, tZ), true, crownColor);
     return list;
   }
 
-  add('foundation', _unitBoxGeo(2, 0.5), pbr('stoneDark'), _local(0, baseY / 2, 0, width + 0.3, baseY, podiumD + 0.3), true);
-  add('podium', _unitBoxGeo(2, 3), podiumMat, _local(0, baseY + podiumH / 2, 0, width, podiumH, podiumD), true, podiumColor);
-  add('tower', _unitBoxGeo(2, 3), towerMat, _local(0, topPodiumY + towerWallH / 2, bzT + towerD / 2, width, towerWallH, towerD), true, towerColor);
-  add('crown', _unitBoxGeo(2, 1), crownMat, _local(0, topTowerY + crownH / 2, bzT + towerD / 2, width + 0.1, crownH, towerD + 0.1), true, crownColor);
-
-  if (lod === 1) { // Mid: 窓は2階おきに間引いたリボン状
-    const U = _unitBox(), gm = { matKey: 'glass', material: _glassMaterial() };
-    for (let f = 1; f < towerFloors; f += 2) {
-      const wy = topPodiumY + floorH * f + floorH * 0.5;
-      add('glass', U, gm, _local(0, wy, fz + 0.02, width * 0.75, floorH * 0.4, 0.06), false);
-    }
-    add('entrance', U, gm, _local(0, baseY + floorH * 0.4, fz + 0.03, 2.4, floorH * 0.75, 0.06), false);
+  const pIn = 0.06; // ポディウム前面を fz より 0.06m 奥に置き、ガラス板（厚 0.06）が fz を越えないようにする
+  add('foundation', _texBox(width, baseY, podiumD), pbr('stoneDark'), _local(0, baseY / 2, 0), true);
+  add('podium', _texBox(width, podiumH, podiumD - pIn), podiumMat, _local(0, baseY + podiumH / 2, -pIn / 2), true, podiumColor);
+  add('tower', _texBox(width, mainH, bodyD), towerMat, _local(0, topPodiumY + mainH / 2, bodyZ), true, towerColor);
+  for (let c = 0; c <= cols; c++) { // 縦フィン（LOD1/2 とも残す: 凹凸のシルエットと縦のリズム）
+    const edge = c === 0 || c === cols, fw = edge ? edgeFinW : finW;
+    const fx = edge ? (c === 0 ? -width / 2 + fw / 2 : width / 2 - fw / 2) : -width / 2 + bayW * c;
+    add('pier', _texBox(fw, mainH, R), accentMat, _local(fx, topPodiumY + mainH / 2, zW + R / 2), true);
   }
-  // lod===2: 窓なし。ポディウム＋タワー＋クラウンの塊のみ（Far）
+  if (tierFloors > 0) add('tower', _texBox(tW, tierH, tD), towerMat, _local(0, topMainY + tierH / 2, tZ), true, towerColor);
+  add('crown', _texBox(tW, crownH, tD), crownMat, _local(0, topTierY + crownH / 2, tZ), true, crownColor);
+
+  const U = _unitBox(), gm = { matKey: 'glass', material: _glassMaterial() };
+  if (lod === 1) {
+    for (let f = 1; f < mainFloors; f += 2) { // 隔階: 帯 + バイ別ガラス
+      const y0 = topPodiumY + floorH * f;
+      add('spandrel', U, accentMat, _local(0, y0, zW + (R - 0.15) / 2, width - edgeFinW * 2, spH, R - 0.15), true);
+      colXs.forEach((x) => add('glass', U, gm, _local(x, y0 + floorH * 0.56, zW + 0.06, L.winW, L.winH, 0.08), false));
+    }
+    for (let f = 0; f < tierFloors; f++) add('glass', U, gm, _local(0, topMainY + floorH * f + floorH * 0.56, tZ + tD / 2 + 0.05, tW - 0.8, L.winH, 0.08), false);
+    add('entrance', U, gm, _local(0, baseY + podiumFloorH * 0.4, fz - pIn + 0.03, 1.4, podiumFloorH * 0.75, 0.06), false);
+    for (let f = 0; f < L.podiumFloors; f++) { // ポディウム: 階ごとの窓帯（1階はロビーのガラス面）
+      add('glass', U, gm, _local(0, baseY + podiumFloorH * f + podiumFloorH * (f === 0 ? 0.5 : 0.5), fz - pIn + 0.03, width - 1.2, podiumFloorH * (f === 0 ? 0.66 : 0.5), 0.06), false);
+    }
+  } else {
+    colXs.forEach((x) => add('glass', U, gm, _local(x, topPodiumY + mainH / 2, zW + 0.05, L.winW * 0.85, mainH - 3, 0.06), false)); // 縦通しのガラスリボン
+  }
   return list;
 }
 
@@ -2281,8 +2419,9 @@ export function getHighDensityArchetype(w, d, variantIndex = 0) {
   const arch = {
     id, baseId: base.id, sizeClass: base.sizeKey, w, d, kind: 'res_high',
     floors: base.floors, roofType: 'flat',
-    materialRefs: { facade: base.facadeMaterial, podium: base.podiumMaterial, crown: base.crownMaterial, foundation: 'stoneDark', trim: base.trimColor, metal: base.metalColor },
-    balconyType: base.balconyType, corePosition: base.corePosition, mirror: !!base.mirror,
+    materialRefs: { facade: base.facadeMaterial, podium: base.podiumMaterial, accent: base.accentMaterial, crown: base.crownMaterial, foundation: 'stoneDark', trim: base.trimColor, metal: base.metalColor },
+    balconyType: base.balconyType, windowStyle: base.windowStyle, entranceType: base.entranceType, skyBand: !!base.skyBand,
+    corePosition: base.corePosition, mirror: !!base.mirror,
     households: base.households, population: base.population,
     // 低層部はロット(8x6)にフラットに収まり、タワー部分だけがロット背後(道路と反対側)へ
     // 2mカンチレバーして「実寸88」になる（§11冒頭コメント参照）。res_midと同様、独自の

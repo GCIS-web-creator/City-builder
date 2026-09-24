@@ -65,8 +65,14 @@ const SECTOR_SIZE_BY_LOD = [48, 96, 192, 384, 96]; // index 4 = terrain skirts
 const SECTOR_CULL_MARGIN = 26;          // keep shadow casters just outside the view alive
 const ORTHO_T = [70, 140, 300];         // LOD thresholds on (view height + 0.5*dist-to-focus), metres
 const PERSP_T = [45, 100, 200];         // LOD thresholds on camera distance, metres (driver / ped cams)
-const LOD_EXAM_PER_FRAME = 800;         // houses re-evaluated per frame after a view change
-const LOD_MOVES_PER_FRAME = 64;         // max LOD bucket moves per frame
+const LOD_EXAM_PER_FRAME = 800;         // houses re-evaluated per step after a view change (burst mode = every frame, see update())
+const LOD_MOVES_PER_FRAME = 64;         // max LOD bucket moves per step (burst mode)
+// Prompt 41A: update() is called every frame but the heavy view work (sector frustum culling, LOD sweep) is event-driven:
+// it runs at most ~15 Hz and only when the view actually changed (or houses were added / removed / re-levelled).
+// The round-robin LOD sweep keeps its per-step caps and hysteresis; steady panning/rotating just gets fewer, larger steps.
+const EVAL_INTERVAL_MS = 66;            // ~15 Hz: sector culling + LOD sweep step
+const LOD_EXAM_PER_STEP = 1600;         // throttled steps are ~4x rarer than frames, so each examines more houses ...
+const LOD_MOVES_PER_STEP = 96;          // ... and may move a few more (still bounded -> no single-step hitch)
 const PENDING_PER_FRAME = 96;           // queued (bulk) houses placed per frame
 const PENDING_BUDGET_MS = 5;
 const INITIAL_CAPACITY = 16;
@@ -125,6 +131,15 @@ export function createHouseInstanceRenderer(scene) {
   let lastCamera = null;
   let emptyBuckets = 0;               // buckets currently holding 0 instances (pruned in batches)
   let forcedLod = null;               // dev/stress: force every house to one LOD
+  // Prompt 41A: event-driven update state
+  const _lastVP = new Array(16).fill(0);
+  let _haveVP = false;                // _lastVP holds the view the sectors were last culled against
+  let _evalCam = null;                // camera of the last evaluation (a camera switch = immediate re-evaluation)
+  let _lastViewH = NaN;               // ortho view height of the last evaluation (zoom change = immediate re-evaluation)
+  let _lastEvalMs = -1e9;
+  let _evalDirty = true;              // houses added / removed / re-levelled, LOD forced -> re-cull on the next tick
+  let _lodBurst = false;              // zoom change / camera switch: LOD sweep runs every frame (old behaviour) until settled
+  const perf = { calls: 0, evals: 0, cullRuns: 0, lodSteps: 0, lodExamined: 0, lodMoves: 0, cpuMs: 0 };
 
   // ---------- sectors / buckets ----------
   function _sector(x, z, lodIdx) {
@@ -321,6 +336,7 @@ export function createHouseInstanceRenderer(scene) {
     const h = _buildRecord(rec, null);
     houses.set(h.id, h); h.listIndex = houseList.push(h) - 1;
     archUse.set(h.arch.id, (archUse.get(h.arch.id) || 0) + 1);
+    _evalDirty = true;
     if (opts.immediate === false) pending.push(h);
     else {
       try { _place(h); }
@@ -336,6 +352,7 @@ export function createHouseInstanceRenderer(scene) {
     if (h.placed) { _detachParts(h); _detachSkirt(h); }
     else { const i = pending.indexOf(h); if (i >= 0) pending.splice(i, 1); }
     _unregister(h);
+    _evalDirty = true;
     return true;
   }
   /** Re-sync an existing house after a level / grading / archetype change. No geometry is created or disposed. */
@@ -343,6 +360,7 @@ export function createHouseInstanceRenderer(scene) {
     const h = houses.get(rec.id); if (!h) return addHouse(rec);
     const prevArch = h.arch.id;
     const wasPlaced = h.placed;
+    _evalDirty = true;
     if (wasPlaced) { _detachParts(h); _detachSkirt(h); }
     _buildRecord(rec, h);
     if (h.arch.id !== prevArch) {
@@ -352,12 +370,13 @@ export function createHouseInstanceRenderer(scene) {
     if (wasPlaced) _place(h); // level / skirt / transform change = remove instances + add instances (slot bookkeeping only)
     return h.id;
   }
-  const setLevel = (id, level) => { const h = houses.get(id); if (!h || h.level === level) return; h.level = level; if (levelStyle(level) !== h.style) { h.style = levelStyle(level); if (h.placed) { _detachParts(h); _attachParts(h, h.lod); } } };
+  const setLevel = (id, level) => { const h = houses.get(id); if (!h || h.level === level) return; h.level = level; _evalDirty = true; if (levelStyle(level) !== h.style) { h.style = levelStyle(level); if (h.placed) { _detachParts(h); _attachParts(h, h.lod); } } };
   const hasHouse = (id) => houses.has(id);
 
   function flushPending(budgetMs = PENDING_BUDGET_MS) {
     const t0 = _now(); let n = 0;
     while (pending.length && n < PENDING_PER_FRAME && _now() - t0 < budgetMs) { _place(pending.shift()); n++; }
+    if (n) _evalDirty = true;
     return n;
   }
 
@@ -367,37 +386,76 @@ export function createHouseInstanceRenderer(scene) {
     return { ortho: false, cx: camera.position.x, cy: camera.position.y, cz: camera.position.z };
   }
 
-  /** Call once per frame with the camera that is about to render. */
+  /** LOD sweep step: bucket moves only (cached kits -> no geometry generation), capped per step. */
+  function _lodStep(examCap, moveCap) {
+    const exam = Math.min(examCap, lodRemaining); let done = 0, moves = 0;
+    while (done < exam && moves < moveCap) {
+      if (lodCursor >= houseList.length) lodCursor = 0;
+      const h = houseList[lodCursor++]; done++;
+      if (!h.placed) continue;
+      const nl = _lodFor(h, ctx, h.lod);
+      if (nl !== h.lod) { _detachParts(h); _attachParts(h, nl); moves++; }
+    }
+    lodRemaining -= done;
+    perf.lodSteps++; perf.lodExamined += done; perf.lodMoves += moves;
+    if (lodRemaining <= 0) _lodBurst = false;
+  }
+
+  /**
+   * Call once per frame with the camera that is about to render.
+   * Prompt 41A: cheap when nothing happened. Pending placement is drained every frame (only if something is queued);
+   * sector frustum culling + the LOD sweep run at <= ~15 Hz and only if the view matrix changed / houses were edited;
+   * a zoom change, a camera switch (iso <-> driver/ped) or opts.force re-evaluates immediately.
+   */
   function update(camera, opts = {}) {
     const t0 = _now();
+    perf.calls++;
     lastCamera = camera;
-    flushPending();
-    ctx = _makeCtx(camera, opts);
-    const sig = ctx.ortho ? `o|${Math.round(ctx.viewH * 4)}|${Math.round(ctx.fx / 6)}|${Math.round(ctx.fz / 6)}` : `p|${Math.round(ctx.cx / 3)}|${Math.round(ctx.cy / 3)}|${Math.round(ctx.cz / 3)}`;
-    if (sig !== viewSig) { viewSig = sig; lodRemaining = houseList.length; }
-    // per-sector frustum culling (InstancedMesh.frustumCulled is off: one instanced mesh spans many houses)
-    camera.updateMatrixWorld();
-    _pv.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse); _frustum.setFromProjectionMatrix(_pv);
-    sectors.forEach((s) => {
-      const vis = _frustum.intersectsBox(s.box);
-      if (vis !== s.visible) { s.visible = vis; s.buckets.forEach((b) => { b.mesh.visible = vis && b.count > 0; }); }
-    });
-    // batched LOD pass: bucket moves only (cached kits -> no geometry generation), capped per frame
-    if (lodRemaining > 0 && houseList.length) {
-      const exam = Math.min(LOD_EXAM_PER_FRAME, lodRemaining); let done = 0, moves = 0;
-      while (done < exam && moves < LOD_MOVES_PER_FRAME) {
-        if (lodCursor >= houseList.length) lodCursor = 0;
-        const h = houseList[lodCursor++]; done++;
-        if (!h.placed) continue;
-        const nl = _lodFor(h, ctx, h.lod);
-        if (nl !== h.lod) { _detachParts(h); _attachParts(h, nl); moves++; }
+    if (pending.length) flushPending();
+    const ortho = !!camera.isOrthographicCamera;
+    const viewH = ortho ? (camera.top - camera.bottom) / (camera.zoom || 1) : 0;
+    const zoomChanged = ortho && Math.abs(viewH - _lastViewH) > 1e-4 * (viewH || 1);
+    const immediate = opts.force === true || camera !== _evalCam || zoomChanged || !_haveVP;
+    const due = immediate || (t0 - _lastEvalMs >= EVAL_INTERVAL_MS);
+    if (due) {
+      _lastEvalMs = t0; perf.evals++;
+      if (immediate) _lodBurst = true;
+      camera.updateMatrixWorld();
+      _pv.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
+      const el = _pv.elements;
+      let vpChanged = !_haveVP || immediate;
+      if (!vpChanged) for (let i = 0; i < 16; i++) if (el[i] !== _lastVP[i]) { vpChanged = true; break; }
+      if (vpChanged || _evalDirty) {
+        for (let i = 0; i < 16; i++) _lastVP[i] = el[i];
+        _haveVP = true; _evalCam = camera; _lastViewH = viewH; _evalDirty = false;
+        perf.cullRuns++;
+        ctx = _makeCtx(camera, opts);
+        const sig = ctx.ortho ? `o|${Math.round(ctx.viewH * 4)}|${Math.round(ctx.fx / 6)}|${Math.round(ctx.fz / 6)}` : `p|${Math.round(ctx.cx / 3)}|${Math.round(ctx.cy / 3)}|${Math.round(ctx.cz / 3)}`;
+        if (sig !== viewSig) { viewSig = sig; lodRemaining = houseList.length; }
+        // per-sector frustum culling (InstancedMesh.frustumCulled is off: one instanced mesh spans many houses)
+        _frustum.setFromProjectionMatrix(_pv);
+        sectors.forEach((s) => {
+          const vis = _frustum.intersectsBox(s.box);
+          if (vis !== s.visible) { s.visible = vis; s.buckets.forEach((b) => { b.mesh.visible = vis && b.count > 0; }); }
+        });
       }
-      lodRemaining -= done;
+      if (lodRemaining > 0 && houseList.length) _lodStep(_lodBurst ? LOD_EXAM_PER_FRAME : LOD_EXAM_PER_STEP, _lodBurst ? LOD_MOVES_PER_FRAME : LOD_MOVES_PER_STEP);
+      else _lodBurst = false;
+    } else if (_lodBurst && lodRemaining > 0 && houseList.length) {
+      _lodStep(LOD_EXAM_PER_FRAME, LOD_MOVES_PER_FRAME); // settle a zoom / camera-switch quickly, frame by frame, exactly as before
     }
     if (emptyBuckets > 48) _prune();
     stats.updateMs = _now() - t0;
     stats.instanceUpdateMs = stats.updateMs;
+    perf.cpuMs += stats.updateMs;
     if (typeof window !== 'undefined' && (++stats.frame % 30) === 0) window.__HOUSE_RENDER_STATS__ = getStats(); // cheap: a few loops every 30 frames
+  }
+
+  /** Prompt 41A profiling: counters since the last reset (calls = update() calls, evals = throttled ticks, cullRuns = sector culls actually done). */
+  function getPerf(reset = true) {
+    const p = { ...perf };
+    if (reset) { perf.calls = perf.evals = perf.cullRuns = perf.lodSteps = perf.lodExamined = perf.lodMoves = 0; perf.cpuMs = 0; }
+    return p;
   }
 
   function _prune() { // drop empty buckets (their instance buffers only) so the scene graph does not accumulate dead meshes
@@ -449,7 +507,7 @@ export function createHouseInstanceRenderer(scene) {
     if (opts.disposeShared) { disposeHouseSharedResources(); if (_skirtGeo) { _skirtGeo.dispose(); _skirtGeo = null; } }
   }
 
-  const setForcedLod = (l) => { forcedLod = l; viewSig = ''; lodRemaining = houseList.length; };
+  const setForcedLod = (l) => { forcedLod = l; viewSig = ''; lodRemaining = houseList.length; _lodBurst = true; _evalDirty = true; };
 
   /** Dev benchmark: places N synthetic houses (all 11 sizes, both orientations), measures placement + LOD settle. */
   function benchmark(counts = [1, 2, 10, 100, 500, 1000], camera = lastCamera, keep = false) {
@@ -463,7 +521,7 @@ export function createHouseInstanceRenderer(scene) {
         addHouse({ id, archetype: { w, d, variantIndex: i % 10 }, position: { x: -180 + gx * 5, y: 0, z: -180 + gz * 8 }, rotationY: (i % 8) * 0.4, level: 1, seed: i, yardDepth: i % 4 === 3 ? 0 : Math.min(3, 6 - d), skirt: i % 9 === 0 ? { height: 0.6, retaining: false, width: w * 0.97, depth: d * 0.97, yaw: (i % 8) * 0.4 } : null }, { immediate: true });
       }
       const placeMs = _now() - t0;
-      let updMs = 0; if (camera) { viewSig = ''; for (let f = 0; f < 200 && (f === 0 || lodRemaining > 0); f++) { const u0 = _now(); update(camera, { focus: { x: 0, z: 0 } }); updMs += _now() - u0; } }
+      let updMs = 0; if (camera) { viewSig = ''; for (let f = 0; f < 200 && (f === 0 || lodRemaining > 0); f++) { const u0 = _now(); update(camera, { focus: { x: 0, z: 0 }, force: true }); updMs += _now() - u0; } }
       const s = getStats();
       rows.push({ houses: n, placementMs: +placeMs.toFixed(2), msPerHouse: +(placeMs / n).toFixed(4), lodSettleUpdateMs: +updMs.toFixed(2), newGeometries: s.geometryCount - w0.geometryCount, ...s });
       if (!keep) { ids.forEach(removeHouse); _prune(); }
@@ -471,7 +529,7 @@ export function createHouseInstanceRenderer(scene) {
     return rows;
   }
 
-  const api = { addHouse, addHouses, removeHouse, updateHouse, setLevel, hasHouse, flushPending, update, getStats, verify, dispose, benchmark, setForcedLod };
+  const api = { addHouse, addHouses, removeHouse, updateHouse, setLevel, hasHouse, flushPending, update, getStats, getPerf, verify, dispose, benchmark, setForcedLod };
   if (typeof window !== 'undefined') {
     window.__HOUSE_RENDERER__ = api;
     window.__HOUSE_BENCH__ = (counts, keep) => { const r = benchmark(counts, lastCamera, keep); console.table(r); return r; };
