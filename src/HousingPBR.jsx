@@ -1638,8 +1638,9 @@ export function getHouseGeometryStats() {
 
 // ---- 10.1 サイズクラス定義（幅×奥行、建物本体＋奥庭の内訳、階数、想定収容） -----------------
 const MEDIUM_DENSITY_SIZE_DIMS = {
-  '4x6': { plotW: 4, plotD: 6, bodyD: 3, yardD: 3, floors: 5, households: '40-55', population: '60-180' },
-  '6x6': { plotW: 6, plotD: 6, bodyD: 4, yardD: 2, floors: 10, households: '65-90', population: '150-300' },
+  // Prompt 41: 1棟 = 300人（情報用。実際の人口は本体側 RES_LOT_TYPES.res_mid.pop = [300, 300]）。世帯数は 300人 / 平均世帯人数2.5。
+  '4x6': { plotW: 4, plotD: 6, bodyD: 3, yardD: 3, floors: 5, households: 120, population: 300 },
+  '6x6': { plotW: 6, plotD: 6, bodyD: 4, yardD: 2, floors: 10, households: 120, population: 300 },
 };
 const MEDIUM_DENSITY_FLOOR_H = 2.9;
 
@@ -1721,7 +1722,8 @@ function _midDensityLayout(config, w, d) {
   const width = w, depth = bodyD;
   const floorH = MEDIUM_DENSITY_FLOOR_H, wallHeight = floorH * floors, baseY = 0.3, parapetH = 0.55;
 
-  const cols = Math.max(2, Math.min(4, Math.round(width / 1.35)));
+  // Prompt 41: config.cols (res_lowrent = 6) overrides the automatic 2..4 bay count; res_mid configs have no `cols` -> unchanged.
+  const cols = config.cols ? config.cols : Math.max(2, Math.min(4, Math.round(width / 1.35)));
   const bayW = width / cols;
   const mirrorSign = config.mirror ? -1 : 1;
   const colXs = Array.from({ length: cols }, (_, i) => (-width / 2 + bayW * (i + 0.5)) * mirrorSign).sort((a, b) => a - b);
@@ -1901,7 +1903,11 @@ function _midUnitParts(arch, lod) {
     const U = _unitBox(), gm = { matKey: 'glass', material: _glassMaterial() };
     for (let f = 1; f < floors; f += 2) {
       const wy = baseY + floorH * f + floorH * 0.5;
-      add('glass', U, gm, _local(0, wy, fz + 0.02, width * 0.7, floorH * 0.35, 0.06), false);
+      if (arch.kind === 'res_lowrent') { // Prompt 41: one pane per bay (6 per floor) — the wider strip would hide the extra windows
+        L.colXs.forEach((x) => add('glass', U, gm, _local(x, wy, fz + 0.02, L.bayW * 0.62, floorH * 0.35, 0.06), false));
+      } else {
+        add('glass', U, gm, _local(0, wy, fz + 0.02, width * 0.7, floorH * 0.35, 0.06), false);
+      }
     }
     if (arch.balconyType !== 'recessed') {
       for (let f = 2; f < floors; f += 2) {
@@ -1983,6 +1989,56 @@ export function getMediumDensityLotParts(arch, lod) {
 /** Build + cache every LOD of one archetype ahead of a bulk placement. */
 export function prewarmMediumDensityArchetype(arch, lods = [0, 1, 2, 3]) { lods.forEach((l) => getMediumDensityLodParts(arch, l)); getMediumDensityLotParts(arch, 0); return arch; }
 export const MEDIUM_DENSITY_ARCHETYPE_COUNT = MEDIUM_DENSITY_HOUSES.length;
+
+// ============================================================================
+// 10b. 低家賃住宅（res_lowrent）― Prompt 41
+// ----------------------------------------------------------------------------
+// 6x6 ロット（建物6x4 + 奥庭6x2）のみ / 12階建て / 400人。
+// 外観は中密度住宅(6x6)と同じ kit-of-parts（同じ variant パレット・コア・バルコニー・玄関・屋上設備・
+// LOD構成）をそのまま使う。違いは次の2点だけ:
+//   * 1フロアの窓（=バイ）数が中密度(4)より2つ多い 6  （config.cols = 6 -> _midDensityLayout）
+//   * 階数 10 -> 12
+// パーツ生成は res_mid と同じ関数（getMediumDensityLodParts / getMediumDensityLotParts）を共有する。
+// ============================================================================
+export const LOWRENT_FLOORS = 12;
+export const LOWRENT_COLS = 6;          // 窓の数 / 階（中密度6x6は4）
+export const LOWRENT_POPULATION = 400;
+export const LOWRENT_HOUSEHOLDS = 160;  // 400人 / 平均世帯人数2.5（情報用）
+export const LOWRENT_HOUSES = _buildMidDensityList('6x6', MID_6X6_VARIANTS, 4200).map((h) => ({
+  ...h,
+  id: h.id.replace('mid_', 'lowrent_'),
+  floors: LOWRENT_FLOORS,
+  cols: LOWRENT_COLS,
+  households: LOWRENT_HOUSEHOLDS,
+  population: LOWRENT_POPULATION,
+}));
+/** 低家賃住宅は 6x6（幅6 × 奥行6 = 建物6x4 + 奥庭6x2）のみ。 */
+export function isLowrentHouseSizeAvailable(w, d) { return w === 6 && d === 6; }
+export const LOWRENT_ARCHETYPES = new Map();
+/** w=道路側の幅, d=奥行（庭込みの区画奥行, メートル）。6x6 以外は null。 */
+export function getLowrentArchetype(w, d, variantIndex = 0) {
+  if (!isLowrentHouseSizeAvailable(w, d)) return null;
+  const idx = ((variantIndex % LOWRENT_HOUSES.length) + LOWRENT_HOUSES.length) % LOWRENT_HOUSES.length;
+  const base = LOWRENT_HOUSES[idx];
+  const id = `${base.id}@${w}x${d}`;
+  if (LOWRENT_ARCHETYPES.has(id)) return LOWRENT_ARCHETYPES.get(id);
+  const L = _midDensityLayout(base, w, d);
+  const arch = {
+    id, baseId: base.id, sizeClass: base.sizeKey, w, d, kind: 'res_lowrent',
+    floors: base.floors, roofType: 'flat',
+    materialRefs: { facade: base.facadeMaterial, accent: base.accentMaterial, roof: base.roofMaterial, foundation: 'concrete', trim: 0xe8e4da, metal: 0x3d3d3d },
+    balconyType: base.balconyType, windowPattern: base.windowPattern, entranceType: base.entranceType,
+    corePosition: base.corePosition, roofEquipment: base.roofEquipment || [], mirror: !!base.mirror, segmentation: base.segmentation,
+    households: base.households, population: base.population,
+    houseScale: { x: 1, y: 1, z: 1 }, // res_mid と同じ: 部品座標が実ロットサイズそのもの（HOUSE_SCALE を掛けない）
+    layout: L, seed: base.seed, _lodParts: [null, null, null, null], _lotParts: null,
+  };
+  LOWRENT_ARCHETYPES.set(id, arch);
+  return arch;
+}
+/** Build + cache every LOD of one low-rent archetype ahead of a bulk placement. */
+export function prewarmLowrentArchetype(arch, lods = [0, 1, 2, 3]) { lods.forEach((l) => getMediumDensityLodParts(arch, l)); getMediumDensityLotParts(arch, 0); return arch; }
+export const LOWRENT_ARCHETYPE_COUNT = LOWRENT_HOUSES.length;
 
 // ============================================================================
 // 11. 高密度住宅（res_high）— 高級タワーマンション 1種（8x6ロット / 40階建て）

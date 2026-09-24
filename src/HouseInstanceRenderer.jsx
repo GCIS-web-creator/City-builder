@@ -24,6 +24,7 @@ import {
   getHouseArchetype, getHouseLodParts, getHouseLotParts,
   getMediumDensityArchetype, getMediumDensityLodParts, getMediumDensityLotParts,
   getHighDensityArchetype, getHighDensityLodParts, getHighDensityLotParts,
+  getLowrentArchetype,
   getHouseGeometryStats, getHouseMaterialStats, getSolidMaterial, disposeHouseSharedResources, HOUSE_STATS, HOUSE_SCALE,
 } from './HousingPBR.jsx';
 
@@ -37,11 +38,14 @@ import {
 // tag is the ONLY thing that determines the dispatch below.
 const RES_MID = 'res_mid';
 const RES_HIGH = 'res_high';
+// Prompt 41: res_lowrent shares res_mid's kit-of-parts generators (same part names / layout shape, only more bays + floors),
+// so it dispatches to the SAME getMediumDensity* functions — no separate rendering path.
+const RES_LOWRENT = 'res_lowrent';
 function _archKind(arch) { return (arch && arch.kind) || 'res_low'; }
 /** House body kit-of-parts for one archetype at one LOD, regardless of kind. */
 function _lodPartsFor(arch, lod) {
   const kind = _archKind(arch);
-  if (kind === RES_MID) return getMediumDensityLodParts(arch, lod);
+  if (kind === RES_MID || kind === RES_LOWRENT) return getMediumDensityLodParts(arch, lod);
   if (kind === RES_HIGH) return getHighDensityLodParts(arch, lod);
   return getHouseLodParts(arch, lod);
 }
@@ -50,7 +54,7 @@ function _lodPartsFor(arch, lod) {
  * exactly like res_low/res_terrace, so the record shape (`{ ..., yardDepth, yardSign }`) stays uniform. */
 function _lotPartsFor(arch, yardDepth, lod, rear) {
   const kind = _archKind(arch);
-  if (kind === RES_MID) return getMediumDensityLotParts(arch, lod);
+  if (kind === RES_MID || kind === RES_LOWRENT) return getMediumDensityLotParts(arch, lod);
   if (kind === RES_HIGH) return getHighDensityLotParts(arch, lod);
   return getHouseLotParts(arch, yardDepth, lod, rear);
 }
@@ -283,6 +287,7 @@ export function createHouseInstanceRenderer(scene) {
     const arch = a.id ? a
       : a.kind === 'res_mid' ? getMediumDensityArchetype(a.w, a.d, a.variantIndex || 0)
       : a.kind === 'res_high' ? getHighDensityArchetype(a.w, a.d, a.variantIndex || 0)
+      : a.kind === 'res_lowrent' ? getLowrentArchetype(a.w, a.d, a.variantIndex || 0)
       : getHouseArchetype(a.w, a.d, a.variantIndex || 0);
     if (!arch) throw new Error(`no ${a.kind || 'res_low'} house archetype for ${a.w}x${a.d}`);
     const rnd = _rng(rec.seed == null ? 1 : rec.seed);
